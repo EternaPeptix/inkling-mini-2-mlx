@@ -6,12 +6,13 @@ of the decode graph), `bench/loop_a.py` + macOS `sample` (where the main thread 
 
 ## Verdict
 
-**Decode is CPU-bound on graph dispatch, not GPU-bound.** The GPU executes tiny kernels and idles waiting for the
-encoder. The main thread spends ~85% of wall time inside `mx.async_eval` (encoding ~12,000 primitives per token at 3
-passes, ~1.9 us each); the per-token CPU time (35 ms, multi-threaded) exceeds the wall time (27 ms) and the weights
-stream (~60 MB per layer visit, ~0.08 ms at 800 GB/s) is 6-7x faster than the measured 0.45-0.55 ms per layer visit.
-Therefore: **per-token time ~ number of MLX primitives**, not bytes moved. The levers are fewer primitives (fusion,
-merging matmuls, removing no-op casts / aranges / gathers) and less Python.
+**Decode is bound by the number of tiny kernels (dispatch/launch latency), not by bytes moved.** The weights stream
+(~60 MB per layer visit, ~0.08 ms at 800 GB/s) is 6-7x faster than the measured 0.45-0.55 ms per layer visit. The main
+thread spends ~85% of wall time inside `mx.async_eval` (encoding ~12,000 primitives per token at 3 passes, ~1.9 us
+each; per-token CPU time 35 ms > wall 27 ms), and only ~15% waiting in `item()`, so CPU encode and GPU execution of
+the small dependent kernels are nearly balanced: both scale with the primitive count. Per-token time ~ number of MLX
+primitives. Python graph construction is only 4.6 of 27 ms. Levers: fewer / fused primitives and compiled (cached)
+graph pieces. `MLX_MAX_OPS_PER_BUFFER` 20..1000 changes nothing (20.5-21.9 ms).
 
 ## Per-token cost (reference path, 3 passes, ctx 512)
 
@@ -64,6 +65,30 @@ not the problem; the sampler is argmax of log-softmax (0.3 ms). `stream_generate
 thread, which is on the critical path because the main thread is also the encoder (bench.py 38.8 vs 37.1 tok/s for a
 bare loop shows it is small).
 
-## Results of the lane-A levers
+## Results of the lane-A levers (all exact: tokens identical to runs/baseline.json, 256 tokens x 3 prompts x passes 1/3/5)
 
-See the table at the bottom (filled in when the final bench completes).
+Same session on 512S1, `bench/bench.py --prefill '' --reps 3`, medians over prompts of per-prompt medians
+(tok/s; runs in `~/loopling-opt/runs/a/{off,c1,c1conv,c2}.json`). Max |logit| diff vs reference over 40-300 decode steps
+(`bench/fastcheck_a.py`, incl. 1100- and 2100-token contexts that wrap the 1024 window / grow the full cache): 0.0.
+
+| config (env) | p1 | p3 | p5 | exact gate |
+|---|---|---|---|---|
+| off (reference) | 91.7 | 38.0 | 24.1 | PASS |
+| `LOOPLING_COMPILE_DECODE=2` (segmented path, hoisted masks, no compile) | 97.2 (+5.4%) | 39.6 (+2.4%) | 24.9 (+2.3%) | PASS |
+| `LOOPLING_COMPILE_DECODE=1` (segments in mx.compile) | 116.8 (+26.7%) | 50.0 (+29.4%) | 31.5 (+30.0%) | PASS |
+| `LOOPLING_COMPILE_DECODE=1 LOOPLING_FUSED_CONV=1` | 123.7 (+34.2%) | 53.7 (+38.9%) | 33.9 (+39.8%) | PASS |
+| `LOOPLING_FUSE_QKV=1` (+COMPILE=1) | profile only: 26.1 ms/token vs 20.7 (slower; split adds slices/copies) | | | exact, not kept |
+
+Graph nodes at p3: 12,190 -> 7,755 (compile) -> 7,019 (+fused conv).
+
+What the flags do (`vendor/mlx_lm/models/inkling2/fastdecode.py`, hook in `DecoderLayer.__call__`, B=1, L=1, no padding):
+the layer is split into S1 (norms, depth attention, projections, short convs, l2 clips) / cache update + attention core
+(shapes vary with the cache, not compiled; mask pieces `clip/use_bias/fill` hoisted and shared by all visits of a step;
+`tau` hoisted) / S2 (o_proj, MoE, convs, residual). S1/S2 are `mx.compile`d per layer (fixed shapes; one trace per
+distinct input shape). `LOOPLING_FUSED_CONV` replaces cast+concat+cast+conv1d+cast/add/div of each decode
+`ShortConvolution` by one Metal kernel, bit-identical to the reference (`bench/convtest_a.py`: 5,400 random cases on real
+weights, 0 mismatches). Falls back to the reference path for batch > 1, prefill, padded/`lengths` caches.
+
+Not done / ideas with measurable headroom: merge S2 of layer i with S1 of layer i+1 (one compile replay per layer and
+fuse the residual cast into the next norm input); batch the four `MessageGate`s of looped passes (~35 kernels per
+looped visit); fused kernels for `DynamicShortConvolution` (4 full layers); compile the lm_head softcap.

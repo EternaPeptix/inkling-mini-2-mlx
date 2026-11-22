@@ -12,3 +12,10 @@ __all__ = [
     "Model",
     "ModelArgs",
 ]
+
+import os as _os
+
+if _os.environ.get("LOOPLING_BATCH_INVARIANT") == "1":  # lane D, default off
+    from mlx_lm.models.inkling2 import batch_invariant as _bi
+
+    _bi.install()

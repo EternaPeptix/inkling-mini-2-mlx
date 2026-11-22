@@ -669,6 +669,8 @@ class DecoderLayer(nn.Module):
 
         if conv is not None:
             n = self.post_mlp_convolution.kernel_size - 1
+            if getattr(conv, "record", False) and block_residual.shape[1] > 1:
+                conv.windows = list(conv_states)  # LOOPLING_SELFSPEC: windows to roll back to
             for i, window in enumerate(conv_states):
                 conv[i] = _conv_state(window, conv.lengths, n)
             conv.advance(block_residual.shape[1])

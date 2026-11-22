@@ -724,7 +724,21 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
+    _ss = None
     if draft_model is None:
+        from mlx_lm import selfspec
+
+        _ss = selfspec.parse_env()
+        if _ss is not None and not selfspec.applicable(model, *_ss):
+            _ss = None
+    if _ss is not None:
+        # LOOPLING_SELFSPEC=<draft_passes>:<k>: greedy self-speculative decoding
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        token_generator = selfspec.selfspec_generate_step(
+            prompt, model, _ss[0], _ss[1], stream, **kwargs
+        )
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation

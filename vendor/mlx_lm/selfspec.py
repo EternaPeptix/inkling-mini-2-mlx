@@ -73,7 +73,31 @@ def _rollback_target(caches, r, m, S):
             conv.cache[i] = w[:, m : m + n, :]
 
 
+def _bi_on():
+    return os.environ.get("LOOPLING_BATCH_INVARIANT") == "1"
+
+
+def _rollback_target_bi(caches, snap, r, m, S):
+    """LOOPLING_BATCH_INVARIANT: the verify forward wrote its rows with 1-token in-place cache updates. Rotating caches go
+    back to the pre-verify snapshot and replay the m kept rows (exactly the writes sequential decode would have made)."""
+    for c, (s, _conv) in zip(caches, snap):
+        kv, conv = c[0], c[1]
+        if isinstance(kv, RotatingKVCache):
+            rows = kv._bi_rows
+            kv.keys, kv.values, kv.offset, kv._idx = _alias(s[1]), _alias(s[2]), s[3], s[4]
+            for j in range(m):
+                kv.update_and_fetch(*rows[j])
+        else:
+            kv.trim(r)
+        for i, w in enumerate(conv.windows):
+            n = w.shape[1] - S
+            conv.cache[i] = w[:, m : m + n, :]
+
+
 def _lp_argmax(logits):
+    if _bi_on() and logits.shape[0] > 1:  # per-row reductions, as the 1-token path does them
+        parts = [_lp_argmax(logits[j : j + 1]) for j in range(logits.shape[0])]
+        return mx.concatenate([p[0] for p in parts]), mx.concatenate([p[1] for p in parts])
     lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     return lp, mx.argmax(lp, axis=-1)
 
@@ -130,7 +154,14 @@ def selfspec_generate_step(prompt, model, d, k, stream, *, max_tokens=256, prefi
                 dcat = mx.concatenate(ys)
                 vin = mx.concatenate([pending, dcat])
                 S = ke + 1
-                lp, g = _lp_argmax(fwd(tcache, vin, T)[0])
+                if _bi_on():
+                    from mlx_lm.models.inkling2 import batch_invariant as bi
+                    tsnap = _snap(tcache)
+                    with bi.active():
+                        lg_v = fwd(tcache, vin, T)[0]
+                else:
+                    lg_v = fwd(tcache, vin, T)[0]
+                lp, g = _lp_argmax(lg_v)
                 mx.eval(g, dcat)
                 gl, dl = g.tolist(), dcat.tolist()
                 n = 0
@@ -145,7 +176,10 @@ def selfspec_generate_step(prompt, model, d, k, stream, *, max_tokens=256, prefi
                     return
                 pending = g[n : n + 1].astype(mx.uint32)
                 if n < ke:
-                    _rollback_target(tcache, ke - n, n + 1, S)
+                    if _bi_on():
+                        _rollback_target_bi(tcache, tsnap, ke - n, n + 1, S)
+                    else:
+                        _rollback_target(tcache, ke - n, n + 1, S)
                     if n + 1 < ke:
                         _restore(dcache, snaps[n + 1])
                     draft_in = pending

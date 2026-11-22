@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -731,7 +732,18 @@ def stream_generate(
         _ss = selfspec.parse_env()
         if _ss is not None and not selfspec.applicable(model, *_ss):
             _ss = None
-    if _ss is not None:
+    if draft_model is None and os.environ.get("LOOPLING_MTP") == "1":
+        # official multi-token-prediction drafter (docs/MTP.md); default OFF
+        if _ss is not None:
+            raise ValueError("LOOPLING_MTP and LOOPLING_SELFSPEC cannot be combined")
+        from mlx_lm.models.inkling2.mtp import mtp_generate_step
+
+        kwargs.pop("num_draft_tokens", None)
+        token_generator = mtp_generate_step(prompt, model, **kwargs)
+        token_generator = (
+            (token, logprobs, fd) for token, logprobs, fd in token_generator
+        )
+    elif _ss is not None:
         # LOOPLING_SELFSPEC=<draft_passes>:<k>: greedy self-speculative decoding
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)

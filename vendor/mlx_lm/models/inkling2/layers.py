@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import math
+import os
 from functools import partial
 from typing import Any
 
@@ -13,6 +14,7 @@ from mlx_lm.layers.moe import SwitchLinear, _gather_sort, _scatter_unsort
 from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 from mlx_lm.models.inkling2.config import TextArgs
 from mlx_lm.models.inkling2.kernels import depth_attention, relative_attention
+from mlx_lm.models.inkling2 import fastdecode
 
 __all__ = [
     "Attention",
@@ -38,6 +40,8 @@ __all__ = [
 
 
 _ROUTER_SCORE_EPS = 1e-20
+_REF_ATTN = bool(__import__("os").environ.get("LOOPLING_REF_ATTN"))  # diagnostics: multi-token attention via the reference path
+_FAST_ON = os.environ.get("LOOPLING_COMPILE_DECODE", "0") not in ("0", "")
 
 
 def _use_kernels() -> bool:
@@ -266,19 +270,21 @@ class Attention(nn.Module):
         )
         self.eps = args.rms_norm_eps
 
-    def _attend(
+    def _attend_pre(
         self,
         hidden_states: mx.array,
         query_states: mx.array,
         key_states: mx.array,
         value_states: mx.array,
         relative_states: mx.array,
-        cache: Any | None,
         tau: mx.array | None = None,
-    ) -> mx.array:
+        gate: mx.array | None = None,
+        sinks: mx.array | None = None,
+    ):
         B, L, _ = hidden_states.shape
-        gate = self.gate_proj(hidden_states)
-        sinks = self.sink_proj(hidden_states)
+        if gate is None:
+            gate = self.gate_proj(hidden_states)
+            sinks = self.sink_proj(hidden_states)
 
         query_states = query_states.reshape(B, L, self.num_heads, -1)
         key_states = key_states.reshape(B, L, self.num_key_value_heads, -1)
@@ -302,22 +308,47 @@ class Attention(nn.Module):
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
         value_states = value_states.transpose(0, 2, 1, 3)
+        return query_states, key_states, value_states, position_bias, sinks, gate
+
+    def _attend_post(self, attn_output: mx.array, gate: mx.array) -> mx.array:
+        B, L = gate.shape[0], gate.shape[1]
+        attn_output = attn_output.reshape(B, L, -1).astype(mx.float32)
+        attn_output = attn_output * mx.sigmoid(gate.astype(mx.float32))
+        return self.o_proj(attn_output.astype(gate.dtype))
+
+    def _attend(
+        self,
+        hidden_states: mx.array,
+        query_states: mx.array,
+        key_states: mx.array,
+        value_states: mx.array,
+        relative_states: mx.array,
+        cache: Any | None,
+        tau: mx.array | None = None,
+    ) -> mx.array:
+        query_states, key_states, value_states, position_bias, sinks, gate = (
+            self._attend_pre(
+                hidden_states,
+                query_states,
+                key_states,
+                value_states,
+                relative_states,
+                tau,
+            )
+        )
         if cache is not None:
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
         attn_output = self._attention(
             query_states, key_states, value_states, position_bias, sinks, cache
         )
-
-        attn_output = attn_output.reshape(B, L, -1).astype(mx.float32)
-        attn_output = attn_output * mx.sigmoid(gate.astype(mx.float32))
-        return self.o_proj(attn_output.astype(gate.dtype))
+        return self._attend_post(attn_output, gate)
 
     def _attention(self, query, key, value, position_bias, sinks, cache) -> mx.array:
         B, _, L, _ = query.shape
         S = key.shape[2]
         end = cache.offset if cache is not None else L
         bf16 = query.dtype == key.dtype == value.dtype == mx.bfloat16
-        if L > 1 and _use_kernels() and bf16:
+        if L > 1 and _use_kernels() and bf16 and not _REF_ATTN:
             key_start = mx.broadcast_to(S - end, (B,))
             return relative_attention(
                 query,
@@ -630,6 +661,8 @@ class DecoderLayer(nn.Module):
         conv_mask: mx.array | None = None,
         messages: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
+        if _FAST_ON and fastdecode.eligible(hidden_states, cache, conv_mask):
+            return fastdecode.decode_layer(self, hidden_states, block_states, cache, messages)
         dtype = hidden_states.dtype
         conv = cache[1] if cache is not None else None
         conv_states = list(conv.cache) if conv is not None else [None] * 4
@@ -668,6 +701,8 @@ class DecoderLayer(nn.Module):
         )
 
         if conv is not None:
+            if getattr(conv, "record", False):  # LOOPLING_MTP: keep full windows for rollback
+                conv.windows = list(conv_states)
             n = self.post_mlp_convolution.kernel_size - 1
             if getattr(conv, "record", False) and block_residual.shape[1] > 1:
                 conv.windows = list(conv_states)  # LOOPLING_SELFSPEC: windows to roll back to

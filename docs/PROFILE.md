@@ -77,7 +77,7 @@ Same session on 512S1, `bench/bench.py --prefill '' --reps 3`, medians over prom
 | `LOOPLING_COMPILE_DECODE=2` (segmented path, hoisted masks, no compile) | 97.2 (+5.4%) | 39.6 (+2.4%) | 24.9 (+2.3%) | PASS |
 | `LOOPLING_COMPILE_DECODE=1` (segments in mx.compile) | 116.8 (+26.7%) | 50.0 (+29.4%) | 31.5 (+30.0%) | PASS |
 | `LOOPLING_COMPILE_DECODE=1 LOOPLING_FUSED_CONV=1` | 123.7 (+34.2%) | 53.7 (+38.9%) | 33.9 (+39.8%) | PASS |
-| `LOOPLING_FUSE_QKV=1` (+COMPILE=1) | profile only: 26.1 ms/token vs 20.7 (slower; split adds slices/copies) | | | exact, not kept |
+| `LOOPLING_FUSE_QKV=1` (+COMPILE=1) | profile only: 26.1 ms/token vs 20.7 (slower; split adds slices/copies) | | | exact, not kept (code removed by lane A2: it froze concatenated weights) |
 
 Graph nodes at p3: 12,190 -> 7,755 (compile) -> 7,019 (+fused conv).
 

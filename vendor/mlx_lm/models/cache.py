@@ -594,6 +594,8 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    _zero_pad = False
+
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         self.left_padding = mx.array(left_padding) if left_padding else None
@@ -703,6 +705,7 @@ class ArraysCache(_BaseCache):
         # All caches are empty so return early
         if all(c.empty() for c in caches):
             cache.left_padding = mx.array([0] * B)
+            cache._zero_pad = B == 1  # fastdecode: the conv mask of this cache is all True
             return cache
 
         for e in range(n_state):
@@ -904,6 +907,8 @@ class BatchKVCache(_BaseCache):
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-l for l in left_padding])
         self._idx = 0
+        # fastdecode: a single unpadded sequence behaves exactly like a plain KVCache whose host offset is _idx + 0
+        self._fd_delta = 0 if (len(left_padding) == 1 and left_padding[0] == 0) else None
 
         self._right_padding = None
 
@@ -1112,6 +1117,8 @@ class BatchRotatingKVCache(_BaseCache):
         self._idx = 0
         self._offset = 0
         self.rotated = False
+        # fastdecode: host offset of a single unpadded sequence is _offset + _fd_delta (None = not eligible)
+        self._fd_delta = 0 if (len(left_padding) == 1 and left_padding[0] == 0) else None
 
         # Lengths for right_padded inputs to make sure that padding tokens do
         # not evict valid tokens.
@@ -1443,6 +1450,8 @@ class BatchRotatingKVCache(_BaseCache):
         cache.offset = mx.array(offsets)
         cache._idx = keys.shape[2]
         cache._offset = keys.shape[2]
+        if cache._fd_delta is not None:
+            cache._fd_delta = int(offsets[0]) - keys.shape[2]
 
         return cache
 
@@ -1457,6 +1466,33 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+def _drop_fd_flag(cls, attr, value, names):
+    """fastdecode eligibility flags describe a freshly merged single unpadded sequence; anything that can add padding
+    or change the batch (prepare/extend/filter/state assignment) drops them, which sends decode to the reference path."""
+
+    def wrap(f):
+        def w(self, *a, **k):
+            # filter([0]) of a single sequence keeps the batch as is (the server's prompt -> generation split)
+            if not (f.__name__ == "filter" and a and list(a[0]) == [0]):
+                setattr(self, attr, value)
+            return f(self, *a, **k)
+
+        w.__name__, w.__doc__ = f.__name__, f.__doc__
+        return w
+
+    for n in names:
+        m = cls.__dict__[n]
+        if isinstance(m, property):
+            setattr(cls, n, m.setter(wrap(m.fset)))
+        else:
+            setattr(cls, n, wrap(m))
+
+
+for _c in (BatchKVCache, BatchRotatingKVCache):
+    _drop_fd_flag(_c, "_fd_delta", None, ("prepare", "filter", "extend", "state"))
+_drop_fd_flag(ArraysCache, "_zero_pad", False, ("prepare", "filter", "extend", "state"))
 
 
 class TokenBuffer:

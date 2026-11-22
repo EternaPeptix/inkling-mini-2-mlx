@@ -47,6 +47,8 @@ class TextModel(PipelineMixin, nn.Module):
         ]
         self.final_input = BlockAttentionResidual(args.hidden_size)
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.tap_visits = None  # set of visit indices to capture (LOOPLING_MTP), else off
+        self.tap_buf = {}
         if args.loop_config is not None:
             self.message_input = MessageInput(args.hidden_size, len(args.loop_core))
 
@@ -75,8 +77,15 @@ class TextModel(PipelineMixin, nn.Module):
         core = self.args.loop_core
         caches = iter(cache)
 
+        tap = getattr(self, "tap_visits", None)  # LOOPLING_MTP: visit-input capture
+        self._visit = 0
+
         def run(layers, hidden_states, block_states, bank=None):
             for i, layer in enumerate(layers):
+                if tap is not None:
+                    if self._visit in tap:
+                        self.tap_buf[self._visit] = hidden_states
+                    self._visit += 1
                 messages = None if bank is None else self.message_input(bank, i)
                 hidden_states, block_states = layer(
                     hidden_states,
@@ -100,7 +109,10 @@ class TextModel(PipelineMixin, nn.Module):
             hidden_states, block_states = run(
                 self.layers[core.start : core.stop], hidden_states, block_states, bank
             )
-        return run(self.layers[core.stop :], hidden_states, block_states)
+        out = run(self.layers[core.stop :], hidden_states, block_states)
+        if tap is not None:
+            self.tap_buf["o"] = out[0]  # output of the last visit (pre final_input)
+        return out
 
     def __call__(
         self,
@@ -151,7 +163,11 @@ class TextModel(PipelineMixin, nn.Module):
         else:
             normed_states = unweighted_rms_norm(hidden_states.astype(mx.float32))
             hidden_states = self.final_input(block_states, normed_states)[..., 0, :]
+            if getattr(self, "tap_visits", None) is not None:
+                self.tap_buf["f"] = hidden_states.astype(dtype)
             hidden_states = self.norm(hidden_states).astype(dtype)
+            if getattr(self, "tap_visits", None) is not None:
+                self.tap_buf["F"] = hidden_states
 
         if size > 1:
             batch = hidden_states.shape[0]

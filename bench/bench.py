@@ -26,7 +26,8 @@ for p in map(int, a.passes.split(",")):
             if r: runs.append(gen_tps)
         out["decode"]["p%d/%s" % (p, name)] = {"tok_s_median": statistics.median(runs), "tok_s_runs": [round(x, 2) for x in runs],
             "n": len(toks), "digest": hashlib.sha256(json.dumps(toks).encode()).hexdigest()[:16], "tokens": toks}
-        print("p%d %-5s decode %.2f tok/s %s digest %s" % (p, name, statistics.median(runs), [round(x, 1) for x in runs], out["decode"]["p%d/%s" % (p, name)]["digest"]), flush=True)
+        if getattr(model, "mtp_stats", None): out["decode"]["p%d/%s" % (p, name)]["mtp"] = dict(model.mtp_stats)
+        print("p%d %-5s decode %.2f tok/s %s digest %s %s" % (p, name, statistics.median(runs), [round(x, 1) for x in runs], out["decode"]["p%d/%s" % (p, name)]["digest"], model.mtp_stats if getattr(model, "mtp_stats", None) else ""), flush=True)
     if p == 3:
         for n in map(int, filter(None, a.prefill.split(","))):
             ids = [(17 * i * i + 3 * i) % 40000 + 1000 for i in range(n)]; ts = []

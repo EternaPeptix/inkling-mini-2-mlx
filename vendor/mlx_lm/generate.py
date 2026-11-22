@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -724,7 +725,16 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is None and os.environ.get("LOOPLING_MTP") == "1":
+        # official multi-token-prediction drafter (docs/MTP.md); default OFF
+        from mlx_lm.models.inkling2.mtp import mtp_generate_step
+
+        kwargs.pop("num_draft_tokens", None)
+        token_generator = mtp_generate_step(prompt, model, **kwargs)
+        token_generator = (
+            (token, logprobs, fd) for token, logprobs, fd in token_generator
+        )
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation

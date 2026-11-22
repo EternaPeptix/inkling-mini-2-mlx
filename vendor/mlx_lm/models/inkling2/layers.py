@@ -41,7 +41,7 @@ __all__ = [
 
 _ROUTER_SCORE_EPS = 1e-20
 _REF_ATTN = bool(__import__("os").environ.get("LOOPLING_REF_ATTN"))  # diagnostics: multi-token attention via the reference path
-_FAST_ON = os.environ.get("LOOPLING_COMPILE_DECODE", "0") not in ("0", "")
+_FAST_ON = os.environ.get("LOOPLING_COMPILE_DECODE", "1") not in ("0", "")  # default ON; =0 disables
 
 
 def _use_kernels() -> bool:

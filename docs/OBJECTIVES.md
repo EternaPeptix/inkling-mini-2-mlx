@@ -23,3 +23,12 @@ B. self-speculative decoding: draft with fewer passes of the same weights, verif
 C. MTP head: the official checkpoint ships `mtp.safetensors` (3-layer drafter, block 8) that the MLX build dropped
 D. MoE expert matmul at decode sizes (custom Metal kernels; exact only if the summation order is kept)
 E. prefill: chunking, attention kernels
+
+## Defaults that are ON (exact; `=0` disables)
+* `LOOPLING_COMPILE_DECODE` (default `1`): compiled B=1 L=1 decode path of lane A (`inkling2/fastdecode.py`). `0` = reference path,
+  `2` = same segmentation without `mx.compile`. Weights are graph inputs (reassign / `load_weights` / `update` / adapter fuse are
+  picked up on the next step); eligible for plain caches and for a fresh single, unpadded request in `BatchGenerator`/server
+  (any second request, padding, `prepare`/`extend`/`filter` falls back to the reference path).
+* `LOOPLING_FUSED_CONV` (default `1`): one Metal kernel per decode `ShortConvolution` (kernel size 4, bf16 only; otherwise reference conv).
+  Only active together with the compiled/segmented decode path.
+* Exact gate with both defaults on and with both `=0`: `bench/exact.py` vs `runs/baseline.json`, passes 1/3/5; tests in `bench/a2_tests.py`.

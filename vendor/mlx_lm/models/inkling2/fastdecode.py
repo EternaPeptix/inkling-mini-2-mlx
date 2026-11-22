@@ -1,45 +1,95 @@
-"""Lane A: low-overhead decode path (B=1, L=1) for Inkling2 decoder layers. Flag: LOOPLING_COMPILE_DECODE.
+"""Lane A: low-overhead decode path (B=1, L=1) for Inkling2 decoder layers. Flags (default ON, `=0` disables):
 
-  unset/0  off (reference path)
-  2        same segmentation + hoisted attention masks, but no mx.compile (isolates the compile effect)
-  1        segments compiled with mx.compile (fixed shapes, one trace per distinct input shape)
+  LOOPLING_COMPILE_DECODE   1 (default) segments compiled with mx.compile (fixed shapes, one trace per distinct input shape)
+                            2 same segmentation + hoisted attention masks, but no mx.compile (isolates the compile effect)
+                            0 off (reference path)
+  LOOPLING_FUSED_CONV       1 (default) one Metal kernel per decode ShortConvolution; 0 reference conv
 
 The math is the reference math: the layer is split in S1 (norms, attention-input mix, projections, short convs, l2 clips),
 the cache update + attention core (shapes vary with the cache, never compiled), and S2 (output projection, MLP/MoE,
 convs, residual). Elementwise chains are fused by mx.compile; everything else is the same primitive as the reference.
+
+Weights are never frozen into a compiled closure: the layer module itself is an argument of every compiled call, so
+its arrays are graph inputs (reassigning / load_weights / update / adapter fuse take effect on the next decode step).
+Compiled state lives in a registry keyed by id(layer) and holds only a weakref to the layer (no reference cycle).
 """
 import os
+import weakref
 
 import mlx.core as mx
 
-_MODE = os.environ.get("LOOPLING_COMPILE_DECODE", "0")
+_MODE = os.environ.get("LOOPLING_COMPILE_DECODE", "1")
 _COMPILE = _MODE == "1"
-_FUSE = os.environ.get("LOOPLING_FUSE_QKV", "0") not in ("0", "")
-_FCONV = os.environ.get("LOOPLING_FUSED_CONV", "0") not in ("0", "")
+_FCONV = os.environ.get("LOOPLING_FUSED_CONV", "1") not in ("0", "")
 _ctx: dict = {}
 _tau: dict = {}
+_fds: dict = {}  # id(layer) -> compiled segments; the entry is removed when the layer dies
 
 
 def eligible(h, cache, conv_mask) -> bool:
-    if cache is None or conv_mask is not None or h.shape[0] != 1 or h.shape[1] != 1:
+    if cache is None or h.shape[0] != 1 or h.shape[1] != 1:
         return False
     conv = cache[1]
-    if conv.lengths is not None or conv.left_padding is not None:
+    if conv.lengths is not None:
         return False
+    if conv.left_padding is not None or conv_mask is not None:
+        # B=1 batch caches (server path): left_padding starts at [0] and is decremented per token, so the conv mask is
+        # all True (an identity `where`). cache.py flags such caches; any prepare/extend/filter drops the flag.
+        if not getattr(conv, "_zero_pad", False):
+            return False
     if any(c is None for c in conv.cache):
         return False
-    return cache[0].keys is not None
+    kv = cache[0]
+    if isinstance(kv.offset, mx.array) and getattr(kv, "_fd_delta", None) is None:
+        return False
+    return kv.keys is not None
 
 
-def _fn(f):
-    return mx.compile(f) if _COMPILE else f
+def _end(kv):
+    """Host-int token count (the `offset` of a plain KV/Rotating cache), also for flagged B=1 batch caches."""
+    d = getattr(kv, "_fd_delta", None)
+    if d is None:
+        return kv.offset
+    return (kv._offset if hasattr(kv, "_offset") else kv._idx) + d
+
+
+def _swap(dst, src, saved):
+    items = src.items() if isinstance(src, dict) else enumerate(src)
+    for k, v in items:
+        if isinstance(v, (dict, list)):
+            _swap(dst[k], v, saved)
+        else:
+            saved.append((dst, k, dst[k]))
+            dst[k] = v
+
+
+def _fn(ref, body):
+    """body(layer, *args). Compiled: the layer module is passed as an argument, so all its arrays are graph inputs
+    (read at every call); during tracing they are swapped into the real module and restored afterwards."""
+    if not _COMPILE:
+        return lambda *a: body(ref(), *a)
+
+    def traced(tree, *a):
+        layer = ref()
+        saved = []
+        _swap(layer, tree, saved)
+        try:
+            return body(layer, *a)
+        finally:
+            for d, k, v in reversed(saved):
+                d[k] = v
+
+    cf = mx.compile(traced)
+    return lambda *a: cf(ref(), *a)
 
 
 _CONV_SRC = """
     uint c = thread_position_in_grid.x;
     if (c >= C) return;
     float x0 = float(x[c]);
-    float s0 = st[c], s1 = st[C + c], s2 = st[2 * C + c];
+    float r1 = st[C + c], r2 = st[2 * C + c];
+    // the reference casts the (f32) conv state to the weight dtype before the conv
+    float s0 = float(T(st[c])), s1 = float(T(r1)), s2 = float(T(r2));
     float acc = 0.0f;
     acc = fma(float(w[c * 4 + 0]), s0, acc);
     acc = fma(float(w[c * 4 + 1]), s1, acc);
@@ -47,8 +97,8 @@ _CONV_SRC = """
     acc = fma(float(w[c * 4 + 3]), x0, acc);
     float conv = float(T(acc));
     out[c] = T((conv + x0) / SCALE);
-    nst[c] = s1;
-    nst[C + c] = s2;
+    nst[c] = r1;
+    nst[C + c] = r2;
     nst[2 * C + c] = x0;
 """
 _conv_kernels: dict = {}
@@ -78,7 +128,7 @@ def short_conv_decode(mod, x, state):
 
 
 def _conv_ok(mod, x):
-    return _FCONV and x.dtype == mx.bfloat16 and mod.conv1d.weight.dtype == mx.bfloat16
+    return _FCONV and mod.kernel_size == 4 and x.dtype == mx.bfloat16 and mod.conv1d.weight.dtype == mx.bfloat16
 
 
 def _sc(mod, x, st):
@@ -94,49 +144,17 @@ def _dsc(mod, x, dyn, st):
     return o, w[:, w.shape[1] - 3 :, :]
 
 
-class _Fused:
-    """Several quantized projections of one input as a single quantized matmul (rows are independent, so the result
-    is bit-identical to the separate matmuls)."""
-
-    def __init__(self, mods):
-        from mlx import nn
-
-        m0 = mods[0]
-        assert all(isinstance(m, nn.QuantizedLinear) for m in mods)
-        assert all((m.group_size, m.bits, m.mode) == (m0.group_size, m0.bits, m0.mode) for m in mods)
-        assert all(("biases" in m) == ("biases" in m0) for m in mods)
-        self.w = mx.concatenate([m["weight"] for m in mods], axis=0)
-        self.s = mx.concatenate([m["scales"] for m in mods], axis=0)
-        self.b = mx.concatenate([m["biases"] for m in mods], axis=0) if "biases" in m0 else None
-        self.cfg = (m0.group_size, m0.bits, m0.mode)
-        self.splits = []
-        o = 0
-        for m in mods[:-1]:
-            o += m["weight"].shape[0]
-            self.splits.append(o)
-        mx.eval([x for x in (self.w, self.s, self.b) if x is not None])
-
-    def __call__(self, x):
-        g, b, mode = self.cfg
-        y = mx.quantized_matmul(x, self.w, scales=self.s, biases=self.b, transpose=True, group_size=g, bits=b, mode=mode)
-        return mx.split(y, self.splits, axis=-1)
-
-
 def _build(layer):
     from mlx_lm.models.inkling2 import layers as L
 
     f32 = mx.float32
     sliding = isinstance(layer, L.SlidingDecoderLayer)
-    a = layer.self_attn
+    ref = weakref.ref(layer)
     out = {}
-    fq = fqkv = fk = fv = None
-    if _FUSE:
-        fq = _Fused([a.q_proj, a.r_proj, a.gate_proj, a.sink_proj])
-        if sliding:
-            fqkv = _Fused([a.q_proj, a.r_proj, a.gate_proj, a.sink_proj, a.k_proj, a.v_proj])
 
     def make_s1(has_bs, has_msg):
-        def s1(h, *rest):
+        def s1(layer, h, *rest):
+            a = layer.self_attn
             rest = list(rest)
             bs = rest.pop(0) if has_bs else None
             msg = rest.pop(0) if has_msg else None
@@ -152,19 +170,9 @@ def _build(layer):
                 else:
                     st = layer._mix_messages((hs,) * 3, msg)
                     q_in, k_in, v_in = [layer.input_layernorm(s).astype(dtype) for s in st]
-                if fq is None:
-                    key, w0 = _sc(a.k_sconv, a.k_proj(k_in), cs0)
-                    value, w1 = _sc(a.v_sconv, a.v_proj(v_in), cs1)
-                    pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), None)
-                else:
-                    if msg is None:
-                        qp, rp, gp, sp, kp, vp = fqkv(q_in)
-                    else:
-                        qp, rp, gp, sp = fq(q_in)
-                        kp, vp = a.k_proj(k_in), a.v_proj(v_in)
-                    key, w0 = _sc(a.k_sconv, kp, cs0)
-                    value, w1 = _sc(a.v_sconv, vp, cs1)
-                    pre = a._attend_pre(q_in, qp, key, value, rp, None, gp, sp)
+                key, w0 = _sc(a.k_sconv, a.k_proj(k_in), cs0)
+                value, w1 = _sc(a.v_sconv, a.v_proj(v_in), cs1)
+                pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), None)
             else:
                 if ai is None:
                     qs = ks = vs = h
@@ -177,17 +185,14 @@ def _build(layer):
                 v_in = layer.v_input_layernorm(vs).astype(dtype)
                 key, w0 = _dsc(a.k_sconv, a.k_proj(k_in), k_in, cs0)
                 value, w1 = _dsc(a.v_sconv, a.v_proj(v_in), v_in, cs1)
-                if fq is None:
-                    pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), tau)
-                else:
-                    qp, rp, gp, sp = fq(q_in)
-                    pre = a._attend_pre(q_in, qp, key, value, rp, tau, gp, sp)
+                pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), tau)
             return (*pre, w0, w1, normed_residual)
 
-        return _fn(s1)
+        return _fn(ref, s1)
 
     def make_s2(has_bs, has_msg):
-        def s2(h, normed_residual, attn_out, gate, w0, w1, cs2, cs3, *rest):
+        def s2(layer, h, normed_residual, attn_out, gate, w0, w1, cs2, cs3, *rest):
+            a = layer.self_attn
             rest = list(rest)
             bs = rest.pop(0) if has_bs else None
             msg = rest.pop(0) if has_msg else None
@@ -210,7 +215,7 @@ def _build(layer):
             o = (residual + hidden.astype(f32)).astype(dtype)
             return (o, bs, *states)
 
-        return _fn(s2)
+        return _fn(ref, s2)
 
     out["s1"] = {}
     out["s2"] = {}
@@ -218,17 +223,26 @@ def _build(layer):
     return out
 
 
+def _get_fd(layer):
+    fd = _fds.get(id(layer))
+    if fd is None:
+        fd = _fds[id(layer)] = _build(layer)
+        weakref.finalize(layer, _fds.pop, id(layer), None)
+    return fd
+
+
 def _full_tau(layer, offset):
-    t = _tau.get(offset)
+    a = layer.self_attn
+    key = (offset, a.log_scaling_alpha, a.log_scaling_n_floor)
+    t = _tau.get(key)
     if t is None:
         if len(_tau) > 8:
             _tau.clear()
-        a = layer.self_attn
         pos = mx.arange(1) + offset
         pos = pos.astype(mx.float32)
         t = 1.0 + a.log_scaling_alpha * mx.log(mx.maximum((pos + 1) / a.log_scaling_n_floor, 1.0))
         t = t[..., None, None]
-        _tau[offset] = t
+        _tau[key] = t
     return t
 
 
@@ -238,9 +252,9 @@ def _core(layer, q, k, v, pb, sinks, kv):
     a = layer.self_attn
     k_all, v_all = kv.update_and_fetch(k, v)
     S = k_all.shape[2]
-    end = kv.offset
+    end = _end(kv)
     R = pb.shape[-1]
-    idx = getattr(kv, "_idx", None) if isinstance(kv, L.RotatingKVCache) else None
+    idx = getattr(kv, "_idx", None) if isinstance(kv, (L.RotatingKVCache, L.BatchRotatingKVCache)) else None
     key = (S, end, idx, R, a.sliding_window)
     c = _ctx.get(key)
     if c is None:
@@ -267,9 +281,7 @@ def _core(layer, q, k, v, pb, sinks, kv):
 
 
 def decode_layer(layer, h, bs, cache, messages):
-    fd = getattr(layer, "_fd", None)
-    if fd is None:
-        fd = layer._fd = _build(layer)
+    fd = _get_fd(layer)
     from mlx_lm.models.inkling2 import layers as L
 
     sliding = isinstance(layer, L.SlidingDecoderLayer)
@@ -289,7 +301,7 @@ def decode_layer(layer, h, bs, cache, messages):
     if has_msg:
         args.append(messages)
     if not sliding:
-        args.append(_full_tau(layer, kv.offset))
+        args.append(_full_tau(layer, _end(kv)))
     args += [cs[0], cs[1]]
     q, k, v, pb, sinks, gate, w0, w1, normed_residual = s1(*args)
     attn_out = _core(layer, q, k, v, pb, sinks, kv)

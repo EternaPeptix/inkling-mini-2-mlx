@@ -15,6 +15,7 @@ import mlx.core as mx
 _MODE = os.environ.get("LOOPLING_COMPILE_DECODE", "0")
 _COMPILE = _MODE == "1"
 _FUSE = os.environ.get("LOOPLING_FUSE_QKV", "0") not in ("0", "")
+_FCONV = os.environ.get("LOOPLING_FUSED_CONV", "0") not in ("0", "")
 _ctx: dict = {}
 _tau: dict = {}
 
@@ -32,6 +33,65 @@ def eligible(h, cache, conv_mask) -> bool:
 
 def _fn(f):
     return mx.compile(f) if _COMPILE else f
+
+
+_CONV_SRC = """
+    uint c = thread_position_in_grid.x;
+    if (c >= C) return;
+    float x0 = float(x[c]);
+    float s0 = st[c], s1 = st[C + c], s2 = st[2 * C + c];
+    float acc = 0.0f;
+    acc = fma(float(w[c * 4 + 0]), s0, acc);
+    acc = fma(float(w[c * 4 + 1]), s1, acc);
+    acc = fma(float(w[c * 4 + 2]), s2, acc);
+    acc = fma(float(w[c * 4 + 3]), x0, acc);
+    float conv = float(T(acc));
+    out[c] = T((conv + x0) / SCALE);
+    nst[c] = s1;
+    nst[C + c] = s2;
+    nst[2 * C + c] = x0;
+"""
+_conv_kernels: dict = {}
+
+
+def short_conv_decode(mod, x, state):
+    """ShortConvolution for one decode token: (out, new_state), bit-identical to the reference (checked by bench/convtest_a.py)."""
+    import math
+
+    import numpy as np
+
+    C = x.shape[-1]
+    K = mod.kernel_size
+    assert K == 4
+    scale = repr(float(np.float32(math.sqrt(K + 1)))) + "f"
+    k = _conv_kernels.get(scale)
+    if k is None:
+        k = _conv_kernels[scale] = mx.fast.metal_kernel(
+            name="short_conv_decode", input_names=["x", "st", "w"], output_names=["out", "nst"],
+            source=_CONV_SRC.replace("SCALE", scale),
+        )
+    out, nst = k(
+        inputs=[x, state, mod.conv1d.weight], template=[("T", x.dtype), ("C", C)], grid=(C, 1, 1),
+        threadgroup=(min(256, C), 1, 1), output_shapes=[x.shape, state.shape], output_dtypes=[x.dtype, mx.float32],
+    )
+    return out, nst
+
+
+def _conv_ok(mod, x):
+    return _FCONV and x.dtype == mx.bfloat16 and mod.conv1d.weight.dtype == mx.bfloat16
+
+
+def _sc(mod, x, st):
+    """ShortConvolution step returning (out, new 3-row state)."""
+    if _conv_ok(mod, x):
+        return short_conv_decode(mod, x, st)
+    o, w = mod(x, st, None)
+    return o, w[:, w.shape[1] - 3 :, :]
+
+
+def _dsc(mod, x, dyn, st):
+    o, w = mod(x, dyn, st, None)
+    return o, w[:, w.shape[1] - 3 :, :]
 
 
 class _Fused:
@@ -93,8 +153,8 @@ def _build(layer):
                     st = layer._mix_messages((hs,) * 3, msg)
                     q_in, k_in, v_in = [layer.input_layernorm(s).astype(dtype) for s in st]
                 if fq is None:
-                    key, w0 = a.k_sconv(a.k_proj(k_in), cs0, None)
-                    value, w1 = a.v_sconv(a.v_proj(v_in), cs1, None)
+                    key, w0 = _sc(a.k_sconv, a.k_proj(k_in), cs0)
+                    value, w1 = _sc(a.v_sconv, a.v_proj(v_in), cs1)
                     pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), None)
                 else:
                     if msg is None:
@@ -102,8 +162,8 @@ def _build(layer):
                     else:
                         qp, rp, gp, sp = fq(q_in)
                         kp, vp = a.k_proj(k_in), a.v_proj(v_in)
-                    key, w0 = a.k_sconv(kp, cs0, None)
-                    value, w1 = a.v_sconv(vp, cs1, None)
+                    key, w0 = _sc(a.k_sconv, kp, cs0)
+                    value, w1 = _sc(a.v_sconv, vp, cs1)
                     pre = a._attend_pre(q_in, qp, key, value, rp, None, gp, sp)
             else:
                 if ai is None:
@@ -115,8 +175,8 @@ def _build(layer):
                 q_in = layer.q_input_layernorm(qs).astype(dtype)
                 k_in = layer.k_input_layernorm(ks).astype(dtype)
                 v_in = layer.v_input_layernorm(vs).astype(dtype)
-                key, w0 = a.k_sconv(a.k_proj(k_in), k_in, cs0, None)
-                value, w1 = a.v_sconv(a.v_proj(v_in), v_in, cs1, None)
+                key, w0 = _dsc(a.k_sconv, a.k_proj(k_in), k_in, cs0)
+                value, w1 = _dsc(a.v_sconv, a.v_proj(v_in), v_in, cs1)
                 if fq is None:
                     pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), tau)
                 else:
@@ -133,7 +193,7 @@ def _build(layer):
             msg = rest.pop(0) if has_msg else None
             dtype = h.dtype
             attn = a._attend_post(attn_out, gate)
-            hidden, w2 = layer.post_attention_convolution(attn, cs2, None)
+            hidden, w2 = _sc(layer.post_attention_convolution, attn, cs2)
             residual = hidden = hidden.astype(f32)
             if layer.is_block_boundary:
                 block = normed_residual[None]
@@ -145,9 +205,8 @@ def _build(layer):
             if msg is not None:
                 hidden = layer.mlp_message_gate(hidden, msg[..., 3, :])
             hidden = layer.mlp(layer.post_attention_layernorm(hidden).astype(dtype))
-            hidden, w3 = layer.post_mlp_convolution(hidden, cs3, None)
-            n = layer.post_mlp_convolution.kernel_size - 1
-            states = [w[:, w.shape[1] - n :, :] for w in (w0, w1, w2, w3)]
+            hidden, w3 = _sc(layer.post_mlp_convolution, hidden, cs3)
+            states = [w0, w1, w2, w3]
             o = (residual + hidden.astype(f32)).astype(dtype)
             return (o, bs, *states)
 

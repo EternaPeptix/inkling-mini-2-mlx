@@ -27,7 +27,7 @@ VARIANTS = {
     "F i5,i23,i41,i47": ["i5", "i23", "i41", "i47"],
 }
 if os.environ.get("VARIANTS"):
-    VARIANTS = {v: v.split(",") for v in os.environ["VARIANTS"].split(";")}
+    VARIANTS = {v: v.split(",") for v in os.environ["VARIANTS"].split("+")}
 res = {k: [] for k in VARIANTS}
 for name, text in PROMPTS.items():
     key = "p%d/%s" % (passes, name)

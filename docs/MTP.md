@@ -81,3 +81,65 @@ checkpoint is a 3-pass model). The taps are the *inputs* of visit 5 (= end of th
 | no Markov bias (base logits only) | 0.58 | 0.23 | 1.16 | 0.65 |
 
 The reference convention wins on every prompt where it matters, and removing the Markov head costs 60%, so both are in use.
+
+## Spec loop (what runs with `LOOPLING_MTP=1`)
+
+Greedy only. Prefill (chunks of 2048, last prompt token alone as in `generate_step`) records the 4 taps for every prompt position and
+builds the drafter's context K/V. Each cycle: draft 7 tokens (one lazy MLX graph, ~4.8 ms incl. the 7 Markov steps), verify
+`[anchor, d1..d_{W-1}]` with ONE target forward (W<=8), accept the matching prefix, roll the caches back, append the accepted
+positions' taps to the drafter context. One host sync per cycle.
+
+* **Cache rollback** (no replay): `KVCache` -> `offset -= n`; `RotatingKVCache` after the multi-token concat update is in temporal
+  order, so slice the rejected tail and set `_idx`; the 4 conv windows per visit (k/v sconv, post-attn, post-mlp) are recorded in
+  `DecoderLayer.__call__` (`conv.record`, `conv.windows`, 2-line patch) and the state after `keep` tokens is `window[:, keep:keep+K-1]`.
+* **Adaptive verify width** (`LOOPLING_MTP_W=auto`): the verify forward costs ~28 ms for 1 token and ~47 ms for 8 (measured:
+  1/2/4/6/8 tokens = 27.9/33.4/38.3/43.2/47.1 ms, drafter 4.8 ms), so with low acceptance a full block loses to plain decode.
+  An online per-position acceptance estimate picks W in 1..8 to maximize expected tokens/ms; W=1 runs a pipelined plain-decode
+  burst of 8 tokens; every 64 tokens a full-width cycle re-measures acceptance. `LOOPLING_MTP_W=8` forces fixed width.
+
+## Results (512S1, p3 = native 3 passes, greedy, 256 tokens, median of 3 reps, same session as the baseline)
+
+| prompt | baseline tok/s | MTP tok/s | speedup | mean tokens / cycle (accept length) |
+|---|---|---|---|---|
+| code | 38.69 | 39.68 | +2.6% | 1.45 (stats from the last rep; mostly W<8 or plain bursts) |
+| prose | 38.19 | 36.66 | -4.0% | ~1.0 (acceptance too low; exploration cycles cost ~4%) |
+| math | 38.11 | 72.55 | +90.4% | 3.7 |
+| geomean | 38.33 | 47.26 | +23.3% | |
+
+Fixed full block (`LOOPLING_MTP_W=8`, first experiment, 1 rep): code 35.3 (accept length 1.9), prose 28.5 (1.5), math 73.4 (3.9):
+drafter acceptance is the lever, a block cycle costs 53 ms vs 26 ms per plain step, break-even accept length 2.05.
+Teacher-forced acceptance with the final taps (`bench/mtp_probe.py`, 3 passes): code 2.11, prose 1.40, math 4.55 tokens/cycle
+(accepted drafts + bonus), clearly above 1, so the port is correct (the bonus-only floor is 1.0).
+
+5 passes (taps stay the literal `5,23,41,F`; mapping variants at p5 are within 0.05 of each other, see `mtp_probe.py`):
+baseline 24.54 / 24.28 / 24.23 -> MTP 27.16 / 23.96 / 51.74 tok/s (+11% / -1% / +114%); teacher-forced accept length 3-pass 2.69 vs 5-pass 2.59 mean.
+The drafter was trained for 3 passes but still accepts at 5.
+
+## Exact gate: FAIL by near-ties (inherent to any batched verify here)
+
+`bench/exact.py` vs `runs/baseline.json`: every prompt diverges (p3: token 11 / 52 / 34; p5: 60 / 78 / 109). Evidence that this is
+numerical, not a port or rollback bug (`bench/mtp_diag.py`, `bench/mtp_consistency.py`):
+
+* The verify forward (L>1: relative-attention kernel, sorted MoE gathers) differs from the 1-token decode path by mean |logit| diff
+  0.09 - 0.21 and max 1.5 - 5.5 over the first 32 steps, for ANY block size 2..32 (B=2,4,8 are bit-identical to each other).
+  Changing only the *prefill* attention path (`LOOPLING_REF_ATTN=1`, multi-token reference attention instead of the kernel) moves
+  the subsequent decode-path logits by the same amount (mean 0.11 - 0.19), so the model is this sensitive to benign kernel changes;
+  a batched verify cannot be bit-exact against the L=1 path.
+* Teacher-forcing every MTP token through the 1-token decode path: positions where its argmax differs from the MTP token:
+  code 1 of 111 (gap 0.070), prose 11 of 256 (gaps 0.00 - 0.59, median 0.10), math 3 of 256 (0.12, 0.16, 0.64).
+  First flips: code tok 11 baseline 150131 vs MTP 150493, decode-path top-2 gap 0.0697 (logits 27.866 / 27.796);
+  prose tok 58 gap 0.0706; math tok 34 gap 0.160. Two flips (prose 62: 0.59 lead, math 92: 0.64) are larger than a rounding tie but
+  are within the measured max verify-vs-decode logit diffs (up to 5.5).
+* So the MTP stream is a valid greedy path up to numerical near-ties, not token-identical. It is therefore opt-in (lossy-class)
+  and stays default OFF; `LOOPLING_MTP=1` needs the user's OK per OBJECTIVES.md.
+
+## Open questions
+
+* `layers.0.dflare_norm` missing from the checkpoint (ones assumed; ablation says ones is better than layer 1's norm).
+* prose acceptance (1.40) is low even teacher-forced; code 2.11. Whether the reference-trained drafter is better on chat/prose
+  with the true bf16 rounding of its Markov gate, or whether Loopling's post-training will fix it, is unknown. A retrained
+  drafter for the post-trained checkpoint is the real lever; this port works unchanged once the checkpoint's `mtp.safetensors` is swapped.
+* Verify cost: 8 tokens cost 1.7x one token (MoE expert reads); lane D's expert matmul work compounds with this.
+* Tree/beam verification (reference `INKLING_TREE_SPEC`) and confidence-based width (reference `INKLING_VERIFY_W`) are not ported; the
+  adaptive width here is a simple online estimator.
+* The exact gate could only be met by verifying with the L=1 numerics (8 sequential decode steps), which removes the gain.

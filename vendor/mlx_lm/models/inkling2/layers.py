@@ -38,6 +38,7 @@ __all__ = [
 
 
 _ROUTER_SCORE_EPS = 1e-20
+_REF_ATTN = bool(__import__("os").environ.get("LOOPLING_REF_ATTN"))  # diagnostics: multi-token attention via the reference path
 
 
 def _use_kernels() -> bool:
@@ -317,7 +318,7 @@ class Attention(nn.Module):
         S = key.shape[2]
         end = cache.offset if cache is not None else L
         bf16 = query.dtype == key.dtype == value.dtype == mx.bfloat16
-        if L > 1 and _use_kernels() and bf16:
+        if L > 1 and _use_kernels() and bf16 and not _REF_ATTN:
             key_start = mx.broadcast_to(S - end, (B,))
             return relative_attention(
                 query,

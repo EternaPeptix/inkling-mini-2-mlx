@@ -198,7 +198,7 @@ def parse_taps(spec, passes):
 
 
 def default_taps(passes):
-    return "i5,i23,i%d,F" % (6 + 12 * passes - 1)
+    return "i5,i23,i41,F"  # literal target_layer_ids; also best at 5 passes (docs/MTP.md)
 
 
 def feats_from_buf(tm, taps):
@@ -248,11 +248,12 @@ def mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, prefill_st
     n = 0
     wmode = os.environ.get("LOOPLING_MTP_W", "auto")
     q = [0.6] * B  # q[j]: P(draft j accepted | drafts < j accepted), EMA; verify width chosen to maximize tokens/ms
-    cost = lambda L: float(np.interp(L, [1, 2, 4, 6, 8], [27.9, 33.4, 38.3, 43.2, 47.1])) + 7.0  # measured 512S1, p3 (ms)
+    fscale = (12 + 12 * passes) / 48.0  # target cost relative to 3 passes
+    cost = lambda L: fscale * float(np.interp(L, [1, 2, 4, 6, 8], [27.9, 33.4, 38.3, 43.2, 47.1])) + 7.0  # measured 512S1, p3 (ms)
 
     def pick():
         bw, p, acc = 1, 1.0, 1.0
-        best = 1.0 / (cost(1) - 5.0)  # plain decode: no drafter
+        best = 1.0 / (26.5 * fscale)  # plain pipelined decode: no drafter
         for W in range(2, B + 1):
             p *= q[W - 1]
             acc += p
@@ -261,17 +262,40 @@ def mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, prefill_st
                 best, bw = g, W
         return bw
 
-    cyc = 0
+    since = 1 << 30  # tokens since the last full-width exploration cycle (forces one at the start)
     while n < max_tokens:
-        W = B if wmode != "auto" else (B if cyc % 16 == 0 else pick())
-        if wmode.isdigit():
-            W = int(wmode)
-        cyc += 1
-        if W > 1:
-            d = dr.draft(anchor, last_feat)  # (7,) lazy
-            block = mx.concatenate([anchor, d[: W - 1]])
-        else:
-            d, block = mx.zeros((B - 1,), mx.int32), anchor
+        W = int(wmode) if wmode.isdigit() else (B if since >= 64 else pick())
+        if W == 1:
+            # plain pipelined decode burst (as generate_step); feeds the drafter's context afterwards
+            N = 8
+            lg, f = fwd(anchor)
+            y = mx.argmax(lg[:, -1], axis=-1)
+            mx.async_eval(y, f)
+            fs = [f]
+            for i in range(N):
+                if i < N - 1:
+                    lg, f = fwd(y)
+                    y2 = mx.argmax(lg[:, -1], axis=-1)
+                    mx.async_eval(y2, f)
+                    fs.append(f)
+                tok = int(y.item())
+                stats["cycles"] += 1
+                stats["tokens"] += 1
+                yield tok, None, False
+                n += 1
+                if i < N - 1:
+                    y = y2
+            since += N
+            anchor = y
+            ff = mx.concatenate(fs, axis=1)
+            dr.append_ctx(ff)
+            last_feat = ff[:, -1:]
+            mx.eval(dr.ck, dr.cv)
+            continue
+        if W == B:
+            since = 0
+        d = dr.draft(anchor, last_feat)  # (7,) lazy
+        block = mx.concatenate([anchor, d[: W - 1]])
         lg, f = fwd(block)
         t = mx.argmax(lg[0], axis=-1)  # (W,) greedy target after each block position
         mx.eval(d, t, f)
@@ -284,6 +308,7 @@ def mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, prefill_st
         stats["cycles"] += 1
         stats["accepted"] += a
         keep = a + 1
+        since += keep
         rollback(cache, W, keep)
         dr.append_ctx(f[:, :keep])
         last_feat = f[:, keep - 1 : keep]

@@ -86,6 +86,11 @@ for k, keep in ((4, 2), (6, 1), (3, 3)):
                 step(ca, [t], p)
             selfspec._restore(ca, snaps[keep])
         cb = fresh(p, P - 1); seq1(cb, toks[:5 + keep], p, ent)
+        if ent == "target":
+            ka, kb = ca[0][0], cb[0][0]; n = min(ka.keys.shape[2], kb.keys.shape[2], 1023)
+            print("  layer-0 cache: offset %d vs %d, _idx %d vs %d, max|dK| over last %d = %.2e, max|dV| = %.2e" % (
+                ka.offset, kb.offset, ka._idx, kb._idx, n, mx.abs(ka.keys[..., ka._idx - n:ka._idx, :].astype(mx.float32) - kb.keys[..., kb._idx - n:kb._idx, :].astype(mx.float32)).max().item(),
+                mx.abs(ka.values[..., ka._idx - n:ka._idx, :].astype(mx.float32) - kb.values[..., kb._idx - n:kb._idx, :].astype(mx.float32)).max().item()))
         nxt = toks[5 + keep]
         la = step(ca, [nxt], p)[-1]; lb = step(cb, [nxt], p)[-1]; mx.eval(la, lb)
         print("rollback %s k=%d keep=%d: next-step max|dlogit| vs reference %.4f (argmax %s)" % (

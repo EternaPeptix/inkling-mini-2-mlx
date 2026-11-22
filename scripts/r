@@ -1,0 +1,14 @@
+#!/bin/zsh
+# usage: [LANE=name] scripts/r [--gpu] <cmd...>   sync this repo to 512S1:~/loopling-opt/src-<lane>, run <cmd> there.
+# --gpu: hold the single GPU lock (any Metal work: model loads, benches, kernel tests). Never run Python on this Mac.
+if [ -z "${ZSH_VERSION:-}" ]; then echo "scripts/r must run under zsh; refusing" >&2; exit 2; fi
+set -e
+root=${0:A:h:h}
+[[ -n $root && -f $root/docs/OBJECTIVES.md && -d $root/vendor/mlx_lm ]] || { echo "bad repo root '$root'; refusing" >&2; exit 2; }
+gpu=0; [ "$1" = --gpu ] && { gpu=1; shift; }
+lane=${LANE:-main}
+sshc=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostName=100.116.244.105 -o HostKeyAlias=512s1.local)
+rsync -a --delete -e "${sshc[*]}" --exclude .git --exclude .claude --exclude /runs --exclude '__pycache__' "$root/" "512S1:loopling-opt/src-$lane/"
+pre="cd ~/loopling-opt/src-$lane && export PYTHONPATH=\$PWD/vendor:\$PWD HF_HUB_OFFLINE=1 PATH=~/loopling-opt/.venv/bin:\$PATH"
+if [ $gpu = 1 ]; then "${sshc[@]}" 512S1 "$pre && /usr/bin/lockf -k ~/loopling-opt/gpu.lock zsh -c ${(q)*}"
+else "${sshc[@]}" 512S1 "$pre && $*"; fi

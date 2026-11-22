@@ -62,12 +62,12 @@ def fresh():
     return c
 def fwd(c, toks):
     global REC
-    REC = []
+    REC = None if os.environ.get('LOOPLING_COMPILE_DECODE', '0') not in ('0', '') and len(toks) == 1 else []
     from mlx_lm.models.inkling2 import batch_invariant as bi
     with (bi.active() if len(toks) > 1 else __import__('contextlib').nullcontext()):
         lg = model(mx.array(toks, mx.uint32)[None], cache=c)
     recs = REC; REC = None
-    flat = [x for r in recs for x in r[1] + r[2]]
+    flat = [x for r in (recs or []) for x in r[1] + r[2]]
     mx.eval(lg, flat)
     return lg, recs
 
@@ -84,7 +84,9 @@ def rowaxis(sT, s1):
 def rowof(x, ax, j): return mx.take(x, mx.array([j]), axis=ax)
 def eq(x, y): return x.shape == y.shape and bool(mx.array_equal(x, y).item())
 
-nrec = len(recT); assert all(len(s[1]) == nrec for s in seq), "op trace length differs"
+nrec = len(recT); FASTSEQ = seq[0][1] is None
+if FASTSEQ: nrec = 0; print('(fast path on: 1-token ops are compiled, per-op trace skipped)')
+else: assert all(len(s[1]) == nrec for s in seq), "op trace length differs"
 first = collections.OrderedDict(); sources = collections.OrderedDict(); ndiff = collections.Counter(); nsrc = collections.Counter()
 for i in range(nrec):
     name, insT, outT = recT[i]; full = name; name = name.split()[0]

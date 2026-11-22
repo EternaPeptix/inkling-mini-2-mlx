@@ -55,7 +55,8 @@ def _linear(self, x):
     if not T or not _enabled("mm"):
         return _ORIG["L"](self, x)
     wt = self["weight"].T
-    y = mx.concatenate([x[:, j:j + 1] @ wt for j in range(T)], axis=1)  # M=1 gemv per row
+    # M=1 gemv per row (a batched bf16 or float32 matmul takes the M>1 gemm kernel: bench/bi_compare.py, message-gate down_proj)
+    y = mx.concatenate([x[:, j:j + 1] @ wt for j in range(T)], axis=1)
     if "bias" in self:
         y = y + self["bias"]
     return y.reshape(1, T, -1)
@@ -106,6 +107,7 @@ def _attend_bi(self, hidden_states, query_states, key_states, value_states, rela
     """Attention._attend for decode-verify: elementwise prologue on all T rows, then the cache write and the 1-query
     attention are done row by row exactly as in 1-token decode (same cache layout, same SDPA vector kernel)."""
     from mlx_lm.models.inkling2.layers import unweighted_rms_norm
+    from mlx_lm.models.inkling2 import fastdecode
     B, T, _ = hidden_states.shape
     gate = self.gate_proj(hidden_states)
     sinks = self.sink_proj(hidden_states)
@@ -126,11 +128,12 @@ def _attend_bi(self, hidden_states, query_states, key_states, value_states, rela
     value_states = value_states.transpose(0, 2, 1, 3)
     outs = []
     rows = []
+    shim = type("S", (), {"self_attn": self})()
     for j in range(T):
         kj, vj = key_states[:, :, j:j + 1], value_states[:, :, j:j + 1]
         rows.append((kj, vj))
-        k, v = cache.update_and_fetch(kj, vj)
-        outs.append(self._attention(query_states[:, :, j:j + 1], k, v, position_bias[:, j:j + 1], sinks[:, j:j + 1], cache))
+        # the 1-token decode attention core (cache write + SDPA vector kernel, masks cached per cache state)
+        outs.append(fastdecode._core(shim, query_states[:, :, j:j + 1], kj, vj, position_bias[:, j:j + 1], sinks[:, j:j + 1], cache))
     cache._bi_rows = rows  # for selfspec's rotating-cache rollback (replay of the kept rows)
     attn_output = mx.concatenate(outs, axis=1)  # each (B,1,H,D)
     attn_output = attn_output.reshape(B, T, -1).astype(mx.float32)

@@ -74,3 +74,16 @@ fix this by itself - the latency is on the GPU side - so we stay on MLX custom k
 Row kernels wired into inkling2/batchdecode.py (`LOOPLING_BD_ROWS`, default `qmv,gemv,sdpa`), exact 4/4:
 p3 C=1/2/4/8 = 57.5 / 92.5 / 135.9 / 173.6 tok/s aggregate (was 55.0 / 85.0 / 124.9 / 166.9). At C=8 the GPU time is
 ~25 ms, dominated by per-row expert reads (64 expert slots/visit, ~52 distinct) -> E2 dedups shared experts.
+
+## Status 2026-11-23 (512S2, one Studio, exact: every row bitwise = B=1 path)
+
+Single stream default path (bench/bench.py, LOOPLING_CMDBUF default on): p1/p3/p5 = 127 / 61 / 40 tok/s (start of lane: 123 / 52 / 32).
+Batched decoder (inkling2/batchdecode.py with row kernels qmv/gemv/sdpa/gather + cmdbuf), aggregate tok/s, all exact=True:
+
+| passes | C=1 | C=2 | C=4 | C=8 |
+|---|---|---|---|---|
+| 1 | 132.1 | 209.5 | 301.8 | 357.0 |
+| 3 | 64.2 | 103.5 | 151.3 | 185.8 |
+| 5 | 42.4 | 68.5 | 100.0 | 124.5 |
+
+Next: fused visit kernels (docs/FUSED.md, lanes f1-f5) to cut ~85 launches per visit to ~13.

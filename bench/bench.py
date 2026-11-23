@@ -1,5 +1,6 @@
 """Loopling bench: greedy decode tok/s + token digests per (prompt, passes); prefill tok/s. Writes JSON."""
 import argparse, hashlib, json, os, statistics, time
+import mlx_lm  # first: applies LOOPLING_CMDBUF before mlx.core initializes the device
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import stream_generate

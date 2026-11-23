@@ -5,6 +5,7 @@ every stream exactly like generate_step (all but the last prompt token, 2048-tok
 streams one token per forward. GATE: every stream's tokens identical to its reference."""
 import argparse, json, os, statistics, sys, time
 
+import mlx_lm  # first: applies LOOPLING_CMDBUF before mlx.core initializes the device
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import generate_step

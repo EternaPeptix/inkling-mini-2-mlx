@@ -15,7 +15,8 @@ PROMPTS = ["Write a Python function that parses an ISO-8601 duration like P3DT4H
  "Implement binary search in Rust and explain the off-by-one pitfalls.",
  "Describe the water cycle to a ten-year-old, then list three common misconceptions."]
 if a.worker >= 0:
-    import mlx.core as mx
+    import mlx_lm  # first: applies LOOPLING_CMDBUF before mlx.core initializes the device
+import mlx.core as mx
     from mlx_lm import load
     from mlx_lm.generate import generate_step
     model, tok = load("%s/loopling-p%d" % (a.models, a.passes)); mx.eval(model.parameters())

@@ -101,6 +101,13 @@ _CONV_SRC = """
     nst[C + c] = r2;
     nst[2 * C + c] = x0;
 """
+# Batched variant (B rows, grid.y = row): the per-element arithmetic is the same as _CONV_SRC (used by batchdecode.py).
+_CONV_ROWS_SRC = """
+    uint c = thread_position_in_grid.x;
+    uint b = thread_position_in_grid.y;
+    if (c >= C) return;
+    x += b * C; st += b * 3 * C; out += b * C; nst += b * 3 * C;
+""" + _CONV_SRC.split("if (c >= C) return;", 1)[1]
 _conv_kernels: dict = {}
 
 
@@ -114,14 +121,16 @@ def short_conv_decode(mod, x, state):
     K = mod.kernel_size
     assert K == 4
     scale = repr(float(np.float32(math.sqrt(K + 1)))) + "f"
-    k = _conv_kernels.get(scale)
+    B = x.shape[0]
+    rows = B > 1
+    k = _conv_kernels.get((scale, rows))
     if k is None:
-        k = _conv_kernels[scale] = mx.fast.metal_kernel(
-            name="short_conv_decode", input_names=["x", "st", "w"], output_names=["out", "nst"],
-            source=_CONV_SRC.replace("SCALE", scale),
+        k = _conv_kernels[(scale, rows)] = mx.fast.metal_kernel(
+            name="short_conv_decode_rows" if rows else "short_conv_decode", input_names=["x", "st", "w"],
+            output_names=["out", "nst"], source=(_CONV_ROWS_SRC if rows else _CONV_SRC).replace("SCALE", scale),
         )
     out, nst = k(
-        inputs=[x, state, mod.conv1d.weight], template=[("T", x.dtype), ("C", C)], grid=(C, 1, 1),
+        inputs=[x, state, mod.conv1d.weight], template=[("T", x.dtype), ("C", C)], grid=(C, B, 1),
         threadgroup=(min(256, C), 1, 1), output_shapes=[x.shape, state.shape], output_dtypes=[x.dtype, mx.float32],
     )
     return out, nst
@@ -152,7 +161,7 @@ def _build(layer):
     ref = weakref.ref(layer)
     out = {}
 
-    def make_s1(has_bs, has_msg):
+    def make_s1(has_bs, has_msg, wrap=None):
         def s1(layer, h, *rest):
             a = layer.self_attn
             rest = list(rest)
@@ -188,9 +197,9 @@ def _build(layer):
                 pre = a._attend_pre(q_in, a.q_proj(q_in), key, value, a.r_proj(q_in), tau)
             return (*pre, w0, w1, normed_residual)
 
-        return _fn(ref, s1)
+        return wrap(s1) if wrap else _fn(ref, s1)
 
-    def make_s2(has_bs, has_msg):
+    def make_s2(has_bs, has_msg, wrap=None):
         def s2(layer, h, normed_residual, attn_out, gate, w0, w1, cs2, cs3, *rest):
             a = layer.self_attn
             rest = list(rest)
@@ -215,7 +224,7 @@ def _build(layer):
             o = (residual + hidden.astype(f32)).astype(dtype)
             return (o, bs, *states)
 
-        return _fn(ref, s2)
+        return wrap(s2) if wrap else _fn(ref, s2)
 
     out["s1"] = {}
     out["s2"] = {}

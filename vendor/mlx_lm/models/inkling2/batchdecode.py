@@ -174,7 +174,8 @@ class BatchDecoder:
             fd = FD._get_fd(layer)
             w = lambda body: _wrap(layer, body)
             s1 = w(RV.make_pre(layer, *k)) if "pre" in _FUSED else fd["make_s1"](*k, wrap=w)
-            s = self.seg[key] = (s1, fd["make_s2"](*k, wrap=w))
+            s2 = w(RV.make_post(layer, *k)) if "post" in _FUSED else fd["make_s2"](*k, wrap=w)
+            s = self.seg[key] = (s1, s2)
         return s
 
     def _layer(self, layer, v, h, bs, msg):
@@ -200,7 +201,8 @@ class BatchDecoder:
                 vs.append(va)
                 meta.append(RS.row_meta(kv))
             a = layer.self_attn
-            attn_out = RS.sdpa_rows(q, ks, vs, pb, sinks, meta, scale=a.scaling, window=a.sliding_window or 0)
+            attn_out = RV.frz("sdpa", (id(layer), msg is not None), RS.sdpa_rows, q, ks, vs, pb, sinks, meta,
+                              scale=a.scaling, window=a.sliding_window or 0)
         else:
             outs = [FD._core(layer, q[i : i + 1], kk[i : i + 1], vv[i : i + 1], pb[i : i + 1], sinks[i : i + 1], kv)
                     for i, kv in enumerate(kvs)]

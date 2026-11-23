@@ -1,0 +1,9 @@
+  0 ExpandDims
+  1 Gather
+  2 Squeeze
+  3 Gather
+  4 Squeeze
+  5 Gather
+  6 Squeeze
+  7 Quantize
+  8 RMSNorm

@@ -1,0 +1,234 @@
+  0 AsType
+  1 AsType
+  2 RMSNorm
+  3 Reshape
+  4 CustomKernel
+  5 Slice
+  6 Squeeze
+  7 AsType
+  8 RMSNorm
+  9 AsType
+ 10 QuantizedMatmul
+ 11 Reshape
+ 12 AsType
+ 13 AsType
+ 14 Broadcast
+ 15 Multiply
+ 16 Broadcast
+ 17 Multiply
+ 18 Sum
+ 19 Sqrt
+ 20 Broadcast
+ 21 Add
+ 22 Divide
+ 23 Broadcast
+ 24 Minimum
+ 25 Broadcast
+ 26 Multiply
+ 27 AsType
+ 28 AsType
+ 29 Broadcast
+ 30 Multiply
+ 31 AsType
+ 32 Transpose
+ 33 Slice
+ 34 Squeeze
+ 35 AsType
+ 36 RMSNorm
+ 37 AsType
+ 38 QuantizedMatmul
+ 39 AsType
+ 40 Concatenate
+ 41 Slice
+ 42 ExpandDims
+ 43 Slice
+ 44 ExpandDims
+ 45 Slice
+ 46 ExpandDims
+ 47 Slice
+ 48 ExpandDims
+ 49 Concatenate
+ 50 Reshape
+ 51 AsType
+ 52 Transpose
+ 53 Reshape
+ 54 Broadcast
+ 55 QuantizedMatmul
+ 56 AsType
+ 57 Reshape
+ 58 Broadcast
+ 59 Add
+ 60 Multiply
+ 61 Sum
+ 62 Squeeze
+ 63 Reshape
+ 64 AsType
+ 65 Add
+ 66 Broadcast
+ 67 Divide
+ 68 AsType
+ 69 Reshape
+ 70 AsType
+ 71 Broadcast
+ 72 Multiply
+ 73 Broadcast
+ 74 Multiply
+ 75 Sum
+ 76 Sqrt
+ 77 Broadcast
+ 78 Add
+ 79 Divide
+ 80 Broadcast
+ 81 Minimum
+ 82 Broadcast
+ 83 Multiply
+ 84 AsType
+ 85 Transpose
+ 86 SliceUpdate
+ 87 Slice
+ 88 Slice
+ 89 Squeeze
+ 90 AsType
+ 91 RMSNorm
+ 92 AsType
+ 93 QuantizedMatmul
+ 94 AsType
+ 95 Concatenate
+ 96 Slice
+ 97 ExpandDims
+ 98 Slice
+ 99 ExpandDims
+100 Slice
+101 ExpandDims
+102 Slice
+103 ExpandDims
+104 Concatenate
+105 Reshape
+106 AsType
+107 Transpose
+108 Reshape
+109 Broadcast
+110 QuantizedMatmul
+111 AsType
+112 Reshape
+113 Broadcast
+114 Add
+115 Multiply
+116 Sum
+117 Squeeze
+118 Reshape
+119 AsType
+120 Add
+121 Broadcast
+122 Divide
+123 AsType
+124 Reshape
+125 AsType
+126 RMSNorm
+127 AsType
+128 Transpose
+129 SliceUpdate
+130 Slice
+131 Broadcast
+132 QuantizedMatmul
+133 Reshape
+134 AsType
+135 AsType
+136 Broadcast
+137 Multiply
+138 Broadcast
+139 Multiply
+140 Sum
+141 Sqrt
+142 Broadcast
+143 Add
+144 Divide
+145 Broadcast
+146 Minimum
+147 Broadcast
+148 Multiply
+149 AsType
+150 AsType
+151 Broadcast
+152 Multiply
+153 AsType
+154 Flatten
+155 Matmul
+156 Unflatten
+157 Squeeze
+158 Gather
+159 Transpose
+160 Squeeze
+161 AsType
+162 Broadcast
+163 Select
+164 ExpandDims
+165 QuantizedMatmul
+166 Squeeze
+167 ScaledDotProductAttention
+168 Transpose
+169 Reshape
+170 AsType
+171 QuantizedMatmul
+172 AsType
+173 Sigmoid
+174 Multiply
+175 AsType
+176 QuantizedMatmul
+177 CustomKernel
+178 AsType
+179 Add
+180 RMSNorm
+181 Reshape
+182 CustomKernel
+183 Squeeze
+184 AsType
+185 RMSNorm
+186 AsType
+187 ExpandDims
+188 Arange
+189 Reshape
+190 Broadcast
+191 AsType
+192 Flatten
+193 Transpose
+194 Matmul
+195 Unflatten
+196 CustomKernel
+197 StopGradient
+198 GatherQMM
+199 Slice
+200 AsType
+201 Broadcast
+202 Divide
+203 Tanh
+204 Broadcast
+205 Multiply
+206 Sigmoid
+207 Multiply
+208 Slice
+209 AsType
+210 Broadcast
+211 Divide
+212 Tanh
+213 Broadcast
+214 Multiply
+215 Multiply
+216 AsType
+217 Arange
+218 Reshape
+219 GatherQMM
+220 Squeeze
+221 AsType
+222 ExpandDims
+223 Broadcast
+224 Multiply
+225 Sum
+226 Squeeze
+227 AsType
+228 CustomKernel
+229 AsType
+230 Add
+231 AsType
+232 Slice
+233 Slice

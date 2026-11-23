@@ -1,0 +1,13 @@
+  0 Arange
+  1 Broadcast
+  2 Add
+  3 AsType
+  4 Broadcast
+  5 Add
+  6 Broadcast
+  7 Maximum
+  8 Log
+  9 Broadcast
+ 10 Multiply
+ 11 Broadcast
+ 12 Add

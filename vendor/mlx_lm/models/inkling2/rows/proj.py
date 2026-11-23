@@ -19,21 +19,9 @@ from .glue import GLUE_HEADER
 MAX_B = _qmv.MAX_B
 
 # =============================================================================================== K4 / K9 (qmv)
-# The tile is qmv._TILE with (a) a per-weight x pointer (already a parameter) and (b) an optional prologue that computes
-# the x element on load: x = bf16(f32(a) * sigmoid(f32(g))), summed exactly like MLX's load_vector (8-bit: sum += x[i]).
-_TILE2 = _qmv._TILE
-for _old, _new in [
-    ("template <int B, int K, bool PR>\nMETAL_FUNC void rows_qmv_tile(", "template <int B, int K, bool PR, bool PRO>\nMETAL_FUNC void rows_qmv_tile2("),
-    ("    const device bfloat16_t* x,\n    device bfloat16_t* y,", "    const device bfloat16_t* x,\n    const device bfloat16_t* gt,\n    device bfloat16_t* y,"),
-    ("  x += simd_lid * values_per_thread;\n", "  x += simd_lid * values_per_thread;\n  gt += simd_lid * values_per_thread;\n"),
-    ("    x += block_size;\n", "    x += block_size;\n    gt += block_size;\n"),
-    ("      U sum = load_vector<bfloat16_t, U, values_per_thread, bits>(x + b * K, x_thread);",
-     "      U sum = PRO ? proj_gate_load<values_per_thread>(x + b * K, gt + b * K, x_thread)\n"
-     "                  : load_vector<bfloat16_t, U, values_per_thread, bits>(x + b * K, x_thread);"),
-]:
-    assert _TILE2.count(_old) == 1, _old
-    _TILE2 = _TILE2.replace(_old, _new)
-
+# The tile is qmv.tile_source with a per-weight x pointer and an optional prologue that computes the x element on load:
+# x = bf16(f32(a) * sigmoid(f32(g))), summed exactly like MLX's load_vector (8-bit: sum += x[i]).  With STG the whole
+# threadgroup computes each 256-wide x block once into threadgroup memory (instead of every simdgroup recomputing it).
 _PRO = r"""
 // K9 prologue: x[i] = bf16(f32(a[i]) * sigmoid(f32(g[i]))) (layers.Attention._attend_post), then load_vector's 8-bit body.
 template <int N>
@@ -47,17 +35,37 @@ inline float proj_gate_load(const device bfloat16_t* a, const device bfloat16_t*
   return sum;
 }
 """
+_STG_FILL = r"""
+    if (STG) {
+      threadgroup bfloat16_t* sb = sx + ((k / block_size) & 1) * RB * block_size;
+      for (int idx = tid; idx < nb * block_size; idx += NSG * 32) {
+        const int b = idx / block_size, j = idx % block_size;
+        sb[idx] = static_cast<bfloat16_t>(glue_gate(static_cast<float>(xb[b * K + k + j]), static_cast<float>(gb[b * K + k + j])));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+_XLOAD_PRO = r"""
+        if (STG) {
+          const threadgroup bfloat16_t* p = sx + ((k / block_size) & 1) * RB * block_size + b * block_size + simd_lid * values_per_thread;
+          U s = 0;
+          for (int i = 0; i < values_per_thread; i++) { U v = p[i]; s += v; xtb[i] = v; }
+          smb = s;
+        } else {
+          smb = proj_gate_load<values_per_thread>(x + b * K, gt + b * K, xtb);
+        }
+"""
 
-_qh = None
+_qh = {}
 
 
-def _qheader():
-    global _qh
-    if _qh is None:
-        base = _qmv._header()
-        assert base.endswith(_qmv._TILE)
-        _qh = base[: -len(_qmv._TILE)] + GLUE_HEADER + _PRO + _TILE2
-    return _qh
+def _qheader(pro):
+    if pro not in _qh:
+        if pro:
+            _qh[pro] = _qmv.base_header() + GLUE_HEADER + _PRO + _qmv.tile_source(_XLOAD_PRO, _STG_FILL)
+        else:
+            _qh[pro] = _qmv.base_header() + _qmv.tile_source()
+    return _qh[pro]
 
 
 _kernels = {}
@@ -74,12 +82,15 @@ def _qkernel(nw, xmap, pro):
         ins += [f"w{i}", f"s{i}", f"b{i}"]
     lines = [
         "uint ty = threadgroup_position_in_grid.y;",
+        "uint rb0 = threadgroup_position_in_grid.z * RB;",
         "uint sg = simdgroup_index_in_threadgroup;",
         "uint sl = thread_index_in_simdgroup;",
     ]
+    if pro:
+        lines.insert(0, "threadgroup bfloat16_t sx[2 * RB * 256];")
     prev = "0"
     for i in range(nw):
-        end = f"{prev} + ((N{i} + 7) / 8)"
+        end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
         if i == nw - 1:
             head = "if (true)" if i == 0 else "else"
         else:
@@ -87,8 +98,8 @@ def _qkernel(nw, xmap, pro):
         gt = "gt" if pro else f"x{xmap[i]}"
         yoff = "+".join(f"N{j}" for j in range(i)) or "0"
         lines.append(
-            f"{head} {{ rows_qmv_tile2<B, K, (N{i} % 8) != 0, {'true' if pro else 'false'}>"
-            f"(w{i}, s{i}, b{i}, x{xmap[i]}, {gt}, y + B * ({yoff}), N{i}, ty - ({prev}), sg, sl); }}"
+            f"{head} {{ rows_qmv_tile<B, K, (N{i} % (RPS * NSG)) != 0, RPS, NSG, RB, STG>"
+            f"(w{i}, s{i}, b{i}, x{xmap[i]}, {gt}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl, {'sx' if pro else '(threadgroup bfloat16_t*)0'}); }}"
         )
         prev = end
     k = mx.fast.metal_kernel(
@@ -96,7 +107,7 @@ def _qkernel(nw, xmap, pro):
         input_names=ins,
         output_names=["y"],
         source="\n".join(lines),
-        header=_qheader(),
+        header=_qheader(pro),
         ensure_row_contiguous=True,
     )
     _kernels[key] = k
@@ -123,7 +134,8 @@ def _launch_q(xs, weights, gate=None):
             xmap.append(len(uniq))
             uniq.append(x)
     args = list(uniq) + ([gate] if gate is not None else [])
-    tmpl = [("B", B), ("K", K)]
+    rps, nsg, rb, stg = _qmv._cfg(B, gate is not None)
+    tmpl = [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb), ("STG", stg)]
     shapes, tiles = [], 0  # shapes: (B, N_i)
     for i, (w, s, b) in enumerate(weights):
         N = w.shape[0]
@@ -132,12 +144,12 @@ def _launch_q(xs, weights, gate=None):
         args += [w, s, b]
         tmpl.append((f"N{i}", N))
         shapes.append((B, N))
-        tiles += (N + 7) // 8
+        tiles += (N + rps * nsg - 1) // (rps * nsg)
     return _qkernel(len(weights), tuple(xmap), gate is not None)(
         inputs=args,
         template=tmpl,
-        grid=(32, 2 * tiles, 1),
-        threadgroup=(32, 2, 1),
+        grid=(32, nsg * tiles, (B + rb - 1) // rb),
+        threadgroup=(32, nsg, 1),
         output_shapes=[(B * sum(n for _, n in shapes),)],
         output_dtypes=[mx.bfloat16],
     )[0]

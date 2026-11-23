@@ -1,0 +1,8 @@
+  0 QuantizedMatmul
+  1 AsType
+  2 Broadcast
+  3 Divide
+  4 Tanh
+  5 Broadcast
+  6 Multiply
+  7 Slice

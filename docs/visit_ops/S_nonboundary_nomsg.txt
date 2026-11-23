@@ -1,0 +1,161 @@
+  0 AsType
+  1 AsType
+  2 RMSNorm
+  3 Reshape
+  4 CustomKernel
+  5 Squeeze
+  6 AsType
+  7 RMSNorm
+  8 AsType
+  9 QuantizedMatmul
+ 10 Reshape
+ 11 AsType
+ 12 AsType
+ 13 Broadcast
+ 14 Multiply
+ 15 Broadcast
+ 16 Multiply
+ 17 Sum
+ 18 Sqrt
+ 19 Broadcast
+ 20 Add
+ 21 Divide
+ 22 Broadcast
+ 23 Minimum
+ 24 Broadcast
+ 25 Multiply
+ 26 AsType
+ 27 Transpose
+ 28 Broadcast
+ 29 Full
+ 30 Concatenate
+ 31 QuantizedMatmul
+ 32 CustomKernel
+ 33 Reshape
+ 34 AsType
+ 35 Broadcast
+ 36 Multiply
+ 37 Broadcast
+ 38 Multiply
+ 39 Sum
+ 40 Sqrt
+ 41 Broadcast
+ 42 Add
+ 43 Divide
+ 44 Broadcast
+ 45 Minimum
+ 46 Broadcast
+ 47 Multiply
+ 48 AsType
+ 49 Transpose
+ 50 SliceUpdate
+ 51 Slice
+ 52 Broadcast
+ 53 Full
+ 54 Concatenate
+ 55 QuantizedMatmul
+ 56 CustomKernel
+ 57 Reshape
+ 58 AsType
+ 59 RMSNorm
+ 60 AsType
+ 61 Transpose
+ 62 SliceUpdate
+ 63 Slice
+ 64 Broadcast
+ 65 QuantizedMatmul
+ 66 Reshape
+ 67 AsType
+ 68 AsType
+ 69 Broadcast
+ 70 Multiply
+ 71 Broadcast
+ 72 Multiply
+ 73 Sum
+ 74 Sqrt
+ 75 Broadcast
+ 76 Add
+ 77 Divide
+ 78 Broadcast
+ 79 Minimum
+ 80 Broadcast
+ 81 Multiply
+ 82 AsType
+ 83 Flatten
+ 84 Matmul
+ 85 Unflatten
+ 86 Squeeze
+ 87 Gather
+ 88 Transpose
+ 89 Squeeze
+ 90 AsType
+ 91 Broadcast
+ 92 Select
+ 93 ExpandDims
+ 94 QuantizedMatmul
+ 95 Squeeze
+ 96 ScaledDotProductAttention
+ 97 Transpose
+ 98 Reshape
+ 99 AsType
+100 QuantizedMatmul
+101 AsType
+102 Sigmoid
+103 Multiply
+104 AsType
+105 QuantizedMatmul
+106 CustomKernel
+107 AsType
+108 Add
+109 RMSNorm
+110 Reshape
+111 CustomKernel
+112 Squeeze
+113 AsType
+114 RMSNorm
+115 AsType
+116 ExpandDims
+117 Arange
+118 Reshape
+119 Broadcast
+120 AsType
+121 Flatten
+122 Transpose
+123 Matmul
+124 Unflatten
+125 CustomKernel
+126 StopGradient
+127 GatherQMM
+128 Slice
+129 AsType
+130 Broadcast
+131 Divide
+132 Tanh
+133 Broadcast
+134 Multiply
+135 Sigmoid
+136 Multiply
+137 Slice
+138 AsType
+139 Broadcast
+140 Divide
+141 Tanh
+142 Broadcast
+143 Multiply
+144 Multiply
+145 AsType
+146 Arange
+147 Reshape
+148 GatherQMM
+149 Squeeze
+150 AsType
+151 ExpandDims
+152 Broadcast
+153 Multiply
+154 Sum
+155 Squeeze
+156 AsType
+157 CustomKernel
+158 AsType
+159 Add
+160 AsType

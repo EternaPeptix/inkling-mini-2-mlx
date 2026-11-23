@@ -1,0 +1,6 @@
+  0 Slice
+  1 AsType
+  2 RMSNorm
+  3 Gather
+  4 Squeeze
+  5 CustomKernel

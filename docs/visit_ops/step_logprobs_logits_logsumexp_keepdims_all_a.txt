@@ -1,0 +1,4 @@
+  0 Squeeze
+  1 LogSumExp
+  2 Broadcast
+  3 Subtract

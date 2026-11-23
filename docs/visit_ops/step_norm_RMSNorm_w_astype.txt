@@ -1,0 +1,8 @@
+  0 AsType
+  1 RMSNorm
+  2 Reshape
+  3 CustomKernel
+  4 Squeeze
+  5 AsType
+  6 RMSNorm
+  7 AsType

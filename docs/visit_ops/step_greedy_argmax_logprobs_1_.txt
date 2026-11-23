@@ -1,0 +1,2 @@
+  0 ArgReduce
+  1 Squeeze

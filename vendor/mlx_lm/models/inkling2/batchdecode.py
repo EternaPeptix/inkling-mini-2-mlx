@@ -26,8 +26,13 @@ import mlx.nn as nn
 
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2 import layers as L
+from mlx_lm.models.inkling2.rows import gemv as RG
+from mlx_lm.models.inkling2.rows import qmv as RQ
+from mlx_lm.models.inkling2.rows import sdpa as RS
 
 _ROWS = False
+# exact row kernels (lane E1/E3/E4): weights read once for all rows; each row bitwise = the B=1 op. Default all on.
+_USE = set(filter(None, os.environ.get("LOOPLING_BD_ROWS", "qmv,gemv,sdpa").split(",")))
 # timing-only toggles (NOT exact): plain M=C dispatch instead of the invariant formulation
 _PLAIN = set(filter(None, os.environ.get("LOOPLING_BD_PLAIN", "").split(",")))  # ql,lin,router,head
 _mat: dict = {}
@@ -59,7 +64,11 @@ def install():
     def qlinear(self, x):
         if not _rows(x) or "ql" in _PLAIN:
             return ql_call(self, x)
-        C = x.shape[0]
+        C, K = x.shape[0], x.shape[-1]
+        if ("qmv" in _USE and self.mode == "affine" and self.bits == 8 and self.group_size == 64
+                and x.dtype == mx.bfloat16 and C <= RQ.MAX_B and K % 256 == 0 and K not in (64, 128)
+                and "bias" not in self):
+            return RQ.qmv_rows(x.reshape(C, K), self["weight"], self["scales"], self["biases"]).reshape(C, 1, -1)
         bc = lambda a: None if a is None else mx.broadcast_to(a[None], (C,) + a.shape)
         y = mx.quantized_matmul(x, bc(self["weight"]), scales=bc(self["scales"]), biases=bc(self.get("biases")),
                                 transpose=True, group_size=self.group_size, bits=self.bits, mode=self.mode)
@@ -71,6 +80,9 @@ def install():
         if not _rows(x) or "lin" in _PLAIN:
             return lin_call(self, x)
         w = self["weight"]
+        if "gemv" in _USE and x.dtype == w.dtype and w.dtype in (mx.float32, mx.bfloat16) and "bias" not in self:
+            C, K = x.shape[0], x.shape[-1]
+            return RG.gemv_rows(x.reshape(C, K), w).reshape(C, 1, -1)
         y = x @ _matw(w, x.shape[0]).transpose(0, 2, 1)
         if "bias" in self:
             y = y + self["bias"]
@@ -82,7 +94,11 @@ def install():
         from mlx_lm.kernels.expert_routing import expert_routing
 
         assert L._use_kernels()
-        logits = h.astype(mx.float32) @ _matw(self.weight, h.shape[0]).transpose(0, 2, 1)
+        if "gemv" in _USE:
+            C, K = h.shape[0], h.shape[-1]
+            logits = RG.gemv_rows(h.astype(mx.float32).reshape(C, K), self.weight).reshape(C, 1, -1)
+        else:
+            logits = h.astype(mx.float32) @ _matw(self.weight, h.shape[0]).transpose(0, 2, 1)
         return expert_routing(logits, self.e_score_correction_bias, top_k=self.top_k, multiplier=1.0,
                               score_eps=L._ROUTER_SCORE_EPS, route_scale=self.routed_scaling_factor)
 
@@ -152,9 +168,19 @@ class BatchDecoder:
             args.append(mx.concatenate([FD._full_tau(layer, FD._end(kv))[None] for kv in kvs]))
         args += [cs[0], cs[1]]
         q, kk, vv, pb, sinks, gate, w0, w1, nr = s1(*args)
-        outs = [FD._core(layer, q[i : i + 1], kk[i : i + 1], vv[i : i + 1], pb[i : i + 1], sinks[i : i + 1], kv)
-                for i, kv in enumerate(kvs)]
-        attn_out = mx.concatenate(outs)
+        if "sdpa" in _USE and not any(getattr(kv, "_fd_delta", None) is not None for kv in kvs):
+            ks, vs, meta = [], [], []
+            for i, kv in enumerate(kvs):
+                ka, va = kv.update_and_fetch(kk[i : i + 1], vv[i : i + 1])
+                ks.append(ka)
+                vs.append(va)
+                meta.append(RS.row_meta(kv))
+            a = layer.self_attn
+            attn_out = RS.sdpa_rows(q, ks, vs, pb, sinks, meta, scale=a.scaling, window=a.sliding_window or 0)
+        else:
+            outs = [FD._core(layer, q[i : i + 1], kk[i : i + 1], vv[i : i + 1], pb[i : i + 1], sinks[i : i + 1], kv)
+                    for i, kv in enumerate(kvs)]
+            attn_out = mx.concatenate(outs)
         args2 = [h, nr, attn_out, gate, w0, w1, cs[2], cs[3]]
         if bs is not None:
             args2.append(bs)

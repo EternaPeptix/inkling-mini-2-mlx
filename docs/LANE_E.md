@@ -57,3 +57,20 @@ not quantized); message-gate down_proj bf16, forget/message gate projs f32. Acti
 `LANE=<lane> RHOST=<512S1|512S2> scripts/r [--gpu] '<cmd>'` from your worktree root (zsh script; never run Python or
 Metal on this Mac). Both Studios have the same venv (`~/loopling-opt/.venv`, mlx 0.32.4) and models. Use `--gpu` for
 anything touching Metal; the lock serializes GPU use per host; keep each GPU command to a few minutes.
+
+## Finding 2026-11-23: decode is GPU-bound by dependent-dispatch latency (not CPU, not bandwidth)
+
+bench/overlap.py (p3, C=1, 512S2): with one command buffer per step (`MLX_MAX_OPS_PER_BUFFER=100000
+MLX_MAX_MB_PER_BUFFER=1000000`) an isolated step is build 2.3 + encode 7.9 ms CPU, then **16.5 ms of GPU** after the
+commit. Pipelined steady state = 15.9 ms/step = the GPU time (CPU work hides under it). Default buffering: the GPU runs
+while encoding (encode 16 ms, tail 1.7 ms) - same total. Weight bytes alone are ~4.5 ms/step, so ~11 ms is GPU-side
+latency of ~4,000 dependent kernels (~3-4 us each, matches the native Metal microbench: serial/concurrent+barrier
+2.2-4 us per dependent dispatch). The earlier "GPU-only 5.2 ms" reading (wait after encode) was wrong: wait = GPU minus
+overlap.
+
+Consequence: the only big lever is fewer kernels per layer visit (fusion), at every C. A native host (Zig) would not
+fix this by itself - the latency is on the GPU side - so we stay on MLX custom kernels (same Metal source would port).
+
+Row kernels wired into inkling2/batchdecode.py (`LOOPLING_BD_ROWS`, default `qmv,gemv,sdpa`), exact 4/4:
+p3 C=1/2/4/8 = 57.5 / 92.5 / 135.9 / 173.6 tok/s aggregate (was 55.0 / 85.0 / 124.9 / 166.9). At C=8 the GPU time is
+~25 ms, dominated by per-row expert reads (64 expert slots/visit, ~52 distinct) -> E2 dedups shared experts.

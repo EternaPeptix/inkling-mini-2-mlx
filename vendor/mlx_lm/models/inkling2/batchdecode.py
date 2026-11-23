@@ -30,11 +30,14 @@ from mlx_lm.models.inkling2.rows import gemv as RG
 from mlx_lm.models.inkling2.rows import gather as RGa
 from mlx_lm.models.inkling2.rows import qmv as RQ
 from mlx_lm.models.inkling2.rows import sdpa as RS
+from mlx_lm.models.inkling2.rows import visit as RV
 
 _ROWS = False
 # exact row kernels (lane E1/E3/E4): weights read once for all rows; each row bitwise = the B=1 op. Default all on.
 _USE = set(filter(None, os.environ.get("LOOPLING_BD_ROWS", "qmv,gemv,sdpa,gather").split(",")))
 # timing-only toggles (NOT exact): plain M=C dispatch instead of the invariant formulation
+# fused visit stages (rows/visit.py, docs/FUSED.md): "pre" = K4 qkv multi-qmv + K5 mid + K6 rel in place of make_s1's ops
+_FUSED = set(filter(None, os.environ.get("LOOPLING_BD_FUSED", "").split(",")))
 _PLAIN = set(filter(None, os.environ.get("LOOPLING_BD_PLAIN", "").split(",")))  # ql,lin,router,head
 _mat: dict = {}
 _installed = False
@@ -170,7 +173,8 @@ class BatchDecoder:
         if s is None:
             fd = FD._get_fd(layer)
             w = lambda body: _wrap(layer, body)
-            s = self.seg[key] = (fd["make_s1"](*k, wrap=w), fd["make_s2"](*k, wrap=w))
+            s1 = w(RV.make_pre(layer, *k)) if "pre" in _FUSED else fd["make_s1"](*k, wrap=w)
+            s = self.seg[key] = (s1, fd["make_s2"](*k, wrap=w))
         return s
 
     def _layer(self, layer, v, h, bs, msg):

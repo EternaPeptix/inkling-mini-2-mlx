@@ -27,12 +27,13 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2 import layers as L
 from mlx_lm.models.inkling2.rows import gemv as RG
+from mlx_lm.models.inkling2.rows import gather as RGa
 from mlx_lm.models.inkling2.rows import qmv as RQ
 from mlx_lm.models.inkling2.rows import sdpa as RS
 
 _ROWS = False
 # exact row kernels (lane E1/E3/E4): weights read once for all rows; each row bitwise = the B=1 op. Default all on.
-_USE = set(filter(None, os.environ.get("LOOPLING_BD_ROWS", "qmv,gemv,sdpa").split(",")))
+_USE = set(filter(None, os.environ.get("LOOPLING_BD_ROWS", "qmv,gemv,sdpa,gather").split(",")))
 # timing-only toggles (NOT exact): plain M=C dispatch instead of the invariant formulation
 _PLAIN = set(filter(None, os.environ.get("LOOPLING_BD_PLAIN", "").split(",")))  # ql,lin,router,head
 _mat: dict = {}
@@ -60,6 +61,24 @@ def install():
         return
     _installed = True
     ql_call, lin_call, router_call = nn.QuantizedLinear.__call__, nn.Linear.__call__, L.TopKRouter.__call__
+    experts_call = L.Experts.__call__
+
+    def _gq(m, x, idx):
+        return RGa.gather_rows(x, m["weight"], m["scales"], None, idx, mode=m.mode, group_size=m.group_size,
+                               bits=m.bits, global_scale=m.get("global_scale"))
+
+    def experts(self, x, indices):
+        gu_m, dn_m = self.gate_up_proj, self.down_proj
+        ok = ("gather" in _USE and _rows(x) and x.dtype == mx.bfloat16 and gu_m.mode in ("nvfp4", "mxfp8", "mxfp4")
+              and "biases" not in gu_m and "biases" not in dn_m and x.shape[0] * indices.shape[-1] <= 256)
+        if not ok:
+            return experts_call(self, x, indices)
+        C, D = x.shape[0], x.shape[-1]
+        idx = mx.stop_gradient(indices).reshape(C, -1).astype(mx.uint32)
+        gu = _gq(gu_m, x.reshape(C, D), idx)  # (C, E, 2h)
+        h = self.act_fn(gu[..., 0::2], gu[..., 1::2])
+        y = _gq(dn_m, h, idx)  # (C, E, D)
+        return y.reshape(C, 1, idx.shape[1], D)
 
     def qlinear(self, x):
         if not _rows(x) or "ql" in _PLAIN:
@@ -105,6 +124,7 @@ def install():
     nn.QuantizedLinear.__call__ = qlinear
     nn.Linear.__call__ = linear
     L.TopKRouter.__call__ = router
+    L.Experts.__call__ = experts
 
 
 class _RowsMode:

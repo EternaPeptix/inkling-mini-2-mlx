@@ -19,14 +19,18 @@ Layout contract (the caches' own layout, nothing is copied): each ks[b] / vs[b] 
 head stride cap*D where cap is the keys/values buffer capacity (`kv.keys.shape[2]`); pass cap in the row meta. Metal allows
 31 buffer bindings, so at most MAX_ROWS (=11) rows go into one launch; larger B is split in chunks.
 """
+import os
+
 import numpy as np
 
 import mlx.core as mx
 
-MAX_ROWS = 11
+from .glue import GLUE_HEADER
+
+MAX_ROWS = 10  # 31-buffer Metal limit: 6 fixed inputs + 2*10 KV + 4 outputs = 30 <= 31
 _TWO_PASS_N = 1024  # arch 'd': sdpa_vector_2pass when the key length >= 1024
 
-_HEADER = r"""
+_HEADER = GLUE_HEADER + r"""
 template <typename T, typename PBT>
 struct RowMask {
   const device PBT* pb;
@@ -35,7 +39,7 @@ struct RowMask {
   METAL_FUNC bool at(int i, thread float& v) const {
     int kp;
     if (rot) {
-      int m = (i - idx) % S;
+      int m = i - idx;
       if (m < 0) m += S;
       kp = m + (end - S);
     } else {
@@ -52,10 +56,10 @@ struct RowMask {
 };
 
 // == sdpa_vector (single pass), one threadgroup = one (row, q head); verbatim arithmetic ==
-template <typename T, typename PBT, int D>
+template <typename T, typename PBT, int D, bool HAS_GATE, typename GT>
 METAL_FUNC void sdpa1_head(
-    const device T* queries, const device T* keys, const device T* values, device T* out, const int N,
-    const float scale, const float sink, const RowMask<T, PBT> msk, threadgroup float* outputs,
+    const device T* queries, const device T* keys, const device T* values, GT gate, device T* out,
+    const int N, const float scale, const float sink, const RowMask<T, PBT> msk, threadgroup float* outputs,
     threadgroup float* max_scores, threadgroup float* sum_exp_scores, uint simd_gid, uint simd_lid) {
   constexpr int BN = 32;
   constexpr int BD = 32;
@@ -71,6 +75,7 @@ METAL_FUNC void sdpa1_head(
   queries += simd_lid * qk_per_thread;
   keys += simd_gid * k_seq_stride + simd_lid * qk_per_thread;
   values += simd_gid * k_seq_stride + simd_lid * v_per_thread;
+  gate += simd_gid * v_per_thread;
   out += simd_gid * v_per_thread;
   for (int i = 0; i < qk_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
@@ -119,15 +124,154 @@ METAL_FUNC void sdpa1_head(
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
   for (int i = 0; i < v_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+    outputs[(i * BD + simd_lid) * BN + simd_gid] = o[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 0; i < v_per_thread; i++) {
+    o[i] = simd_sum(outputs[(i * BD + simd_gid) * BN + simd_lid] * factor);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (simd_lid == 0) {
+    if constexpr (HAS_GATE) {
+      for (int i = 0; i < v_per_thread; i++) {
+        T ov = static_cast<T>(o[i]);
+        out[i] = static_cast<T>(glue_gate(static_cast<float>(ov), static_cast<float>(gate[i])));
+      }
+    } else {
+      for (int i = 0; i < v_per_thread; i++) {
+        out[i] = static_cast<T>(o[i]);
+      }
+    }
+  }
+}
+
+// == sdpa_vector (single pass, NS physical simdgroups simulating BN=32 virtual simdgroups); verbatim arithmetic ==
+template <typename T, typename PBT, int D, int NS, bool HAS_GATE, typename GT>
+METAL_FUNC void sdpa1_head_v32(
+    const device T* queries, const device T* keys, const device T* values, GT gate, device T* out,
+    const int N, const float scale, const float sink, const RowMask<T, PBT> msk, threadgroup float* outputs,
+    threadgroup float* max_scores, threadgroup float* sum_exp_scores, uint simd_gid, uint simd_lid) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int NV = BN / NS;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  constexpr int k_seq_stride = D;
+  int inner_k_stride = BN * k_seq_stride;
+  int inner_v_stride = BN * k_seq_stride;
+  typedef float U;
+  thread U q[qk_per_thread];
+  thread U k[qk_per_thread];
+  thread U o[v_per_thread];
+  queries += simd_lid * qk_per_thread;
+  if constexpr (D == 128) {
+    bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+    q[0] = static_cast<U>(scale) * qb.x;
+    q[1] = static_cast<U>(scale) * qb.y;
+    q[2] = static_cast<U>(scale) * qb.z;
+    q[3] = static_cast<U>(scale) * qb.w;
+  } else {
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[i] = static_cast<U>(scale) * queries[i];
+    }
+  }
+  for (int v = 0; v < NV; v++) {
+    int vg = (int)simd_gid + v * NS;
+    const device T* kp = keys + vg * k_seq_stride + simd_lid * qk_per_thread;
+    const device T* vp = values + vg * k_seq_stride + simd_lid * v_per_thread;
     for (int i = 0; i < v_per_thread; i++) {
-      out[i] = static_cast<T>(o[i]);
+      o[i] = 0;
+    }
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+    if (vg == 0) {
+      max_score = sink;
+      sum_exp_score = 1;
+    }
+    for (int i = vg; i < N; i += BN) {
+      float fm = 0;
+      bool use_key = msk.at(i, fm);
+      if (use_key) {
+        U score = 0;
+        if constexpr (D == 128) {
+          bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
+          score += q[0] * kb.x;
+          score += q[1] * kb.y;
+          score += q[2] * kb.z;
+          score += q[3] * kb.w;
+        } else {
+          for (int j = 0; j < qk_per_thread; j++) {
+            k[j] = kp[j];
+          }
+          for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * k[j];
+          }
+        }
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        if constexpr (D == 128) {
+          bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
+          o[0] = o[0] * factor + exp_score * vb.x;
+          o[1] = o[1] * factor + exp_score * vb.y;
+          o[2] = o[2] * factor + exp_score * vb.z;
+          o[3] = o[3] * factor + exp_score * vb.w;
+        } else {
+          for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * vp[j];
+          }
+        }
+      }
+      kp += inner_k_stride;
+      vp += inner_v_stride;
+    }
+    if (simd_lid == 0) {
+      max_scores[vg] = max_score;
+      sum_exp_scores[vg] = sum_exp_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[(i * BD + simd_lid) * BN + vg] = o[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  U max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  for (int f = (int)simd_gid; f < BD; f += NS) {
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    }
+    if (simd_lid == 0) {
+      int base = f * v_per_thread;
+      if constexpr (D == 128) {
+        if constexpr (HAS_GATE) {
+          bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+          bfloat4 ob = bfloat4(
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
+          ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+        } else {
+          bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+          ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+        }
+      } else if constexpr (HAS_GATE) {
+        for (int i = 0; i < v_per_thread; i++) {
+          T ov = static_cast<T>(o[i]);
+          out[base + i] = static_cast<T>(glue_gate(static_cast<float>(ov), static_cast<float>(gate[base + i])));
+        }
+      } else {
+        for (int i = 0; i < v_per_thread; i++) {
+          out[base + i] = static_cast<T>(o[i]);
+        }
+      }
     }
   }
 }
@@ -234,16 +378,17 @@ METAL_FUNC void sdpa2_block(
 }
 
 // == sdpa_vector_2pass_2, one threadgroup = one (row, q head); verbatim arithmetic ==
-template <typename T, int D>
+template <typename T, int D, bool HAS_GATE, typename GT>
 METAL_FUNC void sdpa2_reduce(
-    const device T* partials, const device float* sums, const device float* maxs, device T* out, const int blocks,
-    threadgroup float* outputs, uint simd_gid, uint simd_lid) {
+    const device T* partials, const device float* sums, const device float* maxs, GT gate, device T* out,
+    const int blocks, threadgroup float* outputs, uint simd_gid, uint simd_lid) {
   constexpr int BN = 32;
   constexpr int BD = 32;
   constexpr int elem_per_thread = D / BD;
   typedef float U;
   thread U o[elem_per_thread] = {0};
   partials += simd_gid * D + simd_lid * elem_per_thread;
+  gate += simd_gid * elem_per_thread;
   out += simd_gid * elem_per_thread;
   U sum_exp_score = 0.0;
   U max_score = Limits<U>::finite_min;
@@ -266,15 +411,23 @@ METAL_FUNC void sdpa2_reduce(
     partials += BN * D;
   }
   for (int i = 0; i < elem_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+    outputs[(i * BD + simd_lid) * BN + simd_gid] = o[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 0; i < elem_per_thread; i++) {
+    o[i] = simd_sum(outputs[(i * BD + simd_gid) * BN + simd_lid]);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (simd_lid == 0) {
-    for (int i = 0; i < elem_per_thread; i++) {
-      out[i] = static_cast<T>(o[i]);
+    if constexpr (HAS_GATE) {
+      for (int i = 0; i < elem_per_thread; i++) {
+        T ov = static_cast<T>(o[i]);
+        out[i] = static_cast<T>(glue_gate(static_cast<float>(ov), static_cast<float>(gate[i])));
+      }
+    } else {
+      for (int i = 0; i < elem_per_thread; i++) {
+        out[i] = static_cast<T>(o[i]);
+      }
     }
   }
 }
@@ -287,7 +440,7 @@ _STAGE1 = r"""
     constexpr int D = 128;
     constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;  // threadgroups per kv head in the 2-pass stage 1
     constexpr int NTG2 = HKV * TGPK;
-    threadgroup float outputs[1024];
+    threadgroup float outputs[4 * 1024];
     threadgroup float max_scores[32];
     threadgroup float sum_exp_scores[32];
     uint t = threadgroup_position_in_grid.x;
@@ -314,8 +467,9 @@ _STAGE1 = r"""
         int kvh = h / GQA;
         int bh = b * HQ + h;
         msk.pb = pb + (size_t)bh * R;
-        sdpa1_head<T, PBT, D>(
-            q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D, o1 + (size_t)bh * D, S, sc,
+        sdpa1_head<T, PBT, D, HAS_GATE>(
+            q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+            gate + (size_t)bh * D, o1 + (size_t)bh * D, S, sc,
             float(static_cast<T>(sinks[bh])), msk, outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
     } else {
         int kvh = tl / TGPK;
@@ -335,21 +489,83 @@ _STAGE1 = r"""
 
 _STAGE2 = r"""
     constexpr int D = 128;
-    threadgroup float outputs[1024];
+    threadgroup float outputs[4 * 1024];
     uint bh = threadgroup_position_in_grid.x;
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint simd_lid = thread_index_in_simdgroup;
     uint tix = thread_position_in_threadgroup.x;
     int b = bh / HQ;
     if (meta[b * MW] >= 1024) {
-        sdpa2_reduce<T, D>(partials + (size_t)bh * BLOCKS * D, sums + (size_t)bh * BLOCKS, maxs + (size_t)bh * BLOCKS,
-                           out + (size_t)bh * D, BLOCKS, outputs, simd_gid, simd_lid);
+        sdpa2_reduce<T, D, HAS_GATE>(partials + (size_t)bh * BLOCKS * D, sums + (size_t)bh * BLOCKS,
+                                     maxs + (size_t)bh * BLOCKS, gate + (size_t)bh * D, out + (size_t)bh * D,
+                                     BLOCKS, outputs, simd_gid, simd_lid);
     } else if (tix < D) {
         out[(size_t)bh * D + tix] = o1[(size_t)bh * D + tix];
     }
 """
 
+_STAGE1_SHORT = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b = (int)t / HQ;
+    int h = (int)t % HQ;
+    int kvh = h / GQA;
+    int bh = (int)t;
+    const int S = meta[b * MW + 0];
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kcap = meta[b * MW + 4];
+    const int vcap = meta[b * MW + 5];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = meta[b * MW + 1]; msk.idx = meta[b * MW + 2]; msk.rot = meta[b * MW + 3];
+    msk.R = R; msk.window = WIN;
+    msk.pb = pb + (size_t)bh * R;
+    const float sc = scale[0];
+    sdpa1_head_v32<T, PBT, D, NS, HAS_GATE>(
+        q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+        gate + (size_t)bh * D, o1 + (size_t)bh * D, S, sc,
+        float(static_cast<T>(sinks[bh])), msk, outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+_STAGE1_2PASS = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;  // threadgroups per kv head in the 2-pass stage 1
+    constexpr int NTG2 = HKV * TGPK;
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b = (int)t / NTG2;
+    int tl = (int)t % NTG2;
+    const int S = meta[b * MW + 0];
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kcap = meta[b * MW + 4];
+    const int vcap = meta[b * MW + 5];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = meta[b * MW + 1]; msk.idx = meta[b * MW + 2]; msk.rot = meta[b * MW + 3];
+    msk.R = R; msk.window = WIN;
+    const float sc = scale[0];
+    int kvh = tl / TGPK;
+    int f = (tl % TGPK) * NS + (int)simd_gid;
+    if (f < BLOCKS * GQA) {
+        int block = f / GQA;
+        int h = kvh * GQA + f % GQA;
+        int bh = b * HQ + h;
+        msk.pb = pb + (size_t)bh * R;
+        sdpa2_block<T, PBT, D, BLOCKS>(
+            q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+            partials + ((size_t)bh * BLOCKS + block) * D, sums + (size_t)bh * BLOCKS + block,
+            maxs + (size_t)bh * BLOCKS + block, S, sc, float(static_cast<T>(sinks[bh])), msk, block, simd_lid);
+    }
+"""
+
 _kernels: dict = {}
+_DUMMY_GATE = mx.zeros((256,), mx.bfloat16)
 
 
 def _blocks(N, n_simds):
@@ -377,30 +593,46 @@ def _get_kernels(B):
         sel = "switch (b) {\n" + "".join(
             f"        case {i}: K = k{i}; V = v{i}; break;\n" for i in range(B)
         ) + "        default: K = k0; V = v0; break;\n    }"
-        names = ["q", "pb", "sinks", "meta", "scale"] + [f"k{i}" for i in range(B)] + [f"v{i}" for i in range(B)]
+        kv_names = [f"k{i}" for i in range(B)] + [f"v{i}" for i in range(B)]
+        names = ["q", "pb", "sinks", "meta", "scale", "gate"] + kv_names
+        names2 = ["q", "pb", "sinks", "meta", "scale"] + kv_names
         s1 = mx.fast.metal_kernel(
             name=f"rows_sdpa_s1_b{B}", input_names=names, output_names=["o1", "partials", "sums", "maxs"],
             source=_STAGE1.replace("SELECT_KV", sel), header=_HEADER, ensure_row_contiguous=False,
         )
         s2 = mx.fast.metal_kernel(
-            name="rows_sdpa_s2", input_names=["partials", "sums", "maxs", "o1", "meta"], output_names=["out"],
+            name="rows_sdpa_s2", input_names=["partials", "sums", "maxs", "o1", "meta", "gate"], output_names=["out"],
             source=_STAGE2, header=_HEADER, ensure_row_contiguous=False,
         )
-        ks = _kernels[B] = (s1, s2)
+        s1_short = mx.fast.metal_kernel(
+            name=f"rows_sdpa_s1_short_b{B}", input_names=names, output_names=["o1"],
+            source=_STAGE1_SHORT.replace("SELECT_KV", sel), header=_HEADER, ensure_row_contiguous=False,
+        )
+        s1_2pass = mx.fast.metal_kernel(
+            name=f"rows_sdpa_s1_2pass_b{B}", input_names=names2, output_names=["partials", "sums", "maxs"],
+            source=_STAGE1_2PASS.replace("SELECT_KV", sel), header=_HEADER, ensure_row_contiguous=False,
+        )
+        ks = _kernels[B] = (s1, s2, s1_short, s1_2pass)
     return ks
 
 
-def sdpa_rows(q, ks, vs, pb, sinks, meta, *, scale, window):
+_SCALE_CACHE = {}
+_META_CACHE = {}
+
+
+def sdpa_rows(q, ks, vs, pb, sinks, meta, *, scale, window, gate=None):
     """q (B, Hq, 1, D) bf16; ks / vs: B arrays (1, Hkv, S_b, D) as returned by each row's update_and_fetch;
     pb (B, 1, Hq, R) or (B, Hq, R) (bf16 or f32), sinks (B, 1, Hq) or (B, Hq); meta: B tuples (end, idx, rot, kcap, vcap)
-    (see row_meta); scale: python float; window: 0 (full attention) or the sliding window.
-    Returns (B, 1, Hq, D) bf16, row b bitwise == fastdecode._core on that row alone."""
+    (see row_meta); scale: python float; window: 0 (full attention) or the sliding window;
+    gate: optional (B, 1, Hq * D) or (B, Hq * D) bf16 to fuse `bf16(out) * sigmoid(gate)` on store.
+    Returns (B, 1, Hq, D) bf16, row b bitwise == fastdecode._core (and _attend_post gate if provided)."""
     B = q.shape[0]
     if B > MAX_ROWS:
         outs = []
         for s in range(0, B, MAX_ROWS):
             e = min(B, s + MAX_ROWS)
-            outs.append(sdpa_rows(q[s:e], ks[s:e], vs[s:e], pb[s:e], sinks[s:e], meta[s:e], scale=scale, window=window))
+            outs.append(sdpa_rows(q[s:e], ks[s:e], vs[s:e], pb[s:e], sinks[s:e], meta[s:e], scale=scale, window=window,
+                                  gate=None if gate is None else gate[s:e]))
         return mx.concatenate(outs, axis=0)
     assert q.dtype == mx.bfloat16 and q.shape[2] == 1 and q.shape[3] == 128
     Hq = q.shape[1]
@@ -410,35 +642,1486 @@ def sdpa_rows(q, ks, vs, pb, sinks, meta, *, scale, window):
     blocks = _blocks(max(k.shape[2] for k in ks), gqa)
     assert blocks == 128
     R = pb.shape[-1]
-    Ss = [k.shape[2] for k in ks]
-    mt = np.empty((B, _MW), np.int32)
-    for i, (end, idx, rot, kcap, vcap) in enumerate(meta):
-        mt[i] = (Ss[i], end, idx, rot, kcap, vcap)
+    Ss = tuple(k.shape[2] for k in ks)
+    mkey = (Ss, tuple(meta))
+    mta = _META_CACHE.get(mkey)
+    if mta is None:
+        if len(_META_CACHE) >= 64:
+            _META_CACHE.clear()
+        mt = np.empty((B, _MW), np.int32)
+        for i, (end, idx, rot, kcap, vcap) in enumerate(meta):
+            mt[i] = (Ss[i], end, idx, rot, kcap, vcap)
+        mta = _META_CACHE[mkey] = mx.array(mt)
     has2 = any(s >= _TWO_PASS_N for s in Ss)
-    # threadgroup width: 32 simdgroups when short (single-pass) rows are present; otherwise GQA simdgroups per group
-    # (MLX's own sdpa_vector_2pass_1 geometry; 96-thread groups balance better over the GPU cores than 1024-thread ones)
-    ns = gqa if all(s >= _TWO_PASS_N for s in Ss) else 32
-    tgpk = (blocks * gqa + ns - 1) // ns
-    ntg = sum(Hkv * tgpk if s >= _TWO_PASS_N else Hq for s in Ss)
-    s1, s2 = _get_kernels(B)
+    has_gate = gate is not None
+    s1, s2, s1_short, s1_2pass = _get_kernels(B)
     qc = mx.contiguous(q)
     pbc = mx.contiguous(pb)
     sk = mx.contiguous(sinks)
-    mta = mx.array(mt)
-    sc = mx.array([scale], mx.float32)
-    tmpl = [("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", B), ("MW", _MW), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
-            ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("NS", ns)]
-    n2 = B * Hq * blocks if has2 else 1
-    o1, partials, sums, maxs = s1(
-        inputs=[qc, pbc, sk, mta, sc] + list(ks) + list(vs), template=tmpl, grid=(ntg * 32 * ns, 1, 1),
-        threadgroup=(32 * ns, 1, 1), output_shapes=[(B, 1, Hq, 128), (n2 * 128 if has2 else 1,), (n2,), (n2,)],
-        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
-    )
+    gt = mx.contiguous(gate) if has_gate else _DUMMY_GATE
+    sck = float(scale)
+    sc = _SCALE_CACHE.get(sck)
+    if sc is None:
+        sc = _SCALE_CACHE[sck] = mx.array([sck], mx.float32)
     if not has2:
+        ns = int(os.environ.get("LOOPLING_SDPA1_NS", "0")) or (16 if max(Ss) < 256 else 8)
+        tmpl = [("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", B), ("MW", _MW), ("HQ", Hq), ("GQA", gqa),
+                ("R", R), ("WIN", int(window)), ("NS", ns), ("HAS_GATE", has_gate)]
+        (o1,) = s1_short(
+            inputs=[qc, pbc, sk, mta, sc, gt] + list(ks) + list(vs), template=tmpl,
+            grid=(B * Hq * 32 * ns, 1, 1), threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(B, 1, Hq, 128)], output_dtypes=[mx.bfloat16],
+        )
         return o1
+    # threadgroup width: 32 simdgroups when short (single-pass) rows are present; otherwise GQA simdgroups per group
+    # (MLX's own sdpa_vector_2pass_1 geometry; 96-thread groups balance better over the GPU cores than 1024-thread ones)
+    all2 = all(s >= _TWO_PASS_N for s in Ss)
+    ns = gqa if all2 else 32
+    tgpk = (blocks * gqa + ns - 1) // ns
+    n2 = B * Hq * blocks
+    if all2:
+        ntg = B * Hkv * tgpk
+        tmpl = [("T", mx.bfloat16), ("PBT", pb.dtype), ("MW", _MW), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("NS", ns)]
+        partials, sums, maxs = s1_2pass(
+            inputs=[qc, pbc, sk, mta, sc] + list(ks) + list(vs), template=tmpl,
+            grid=(ntg * 32 * ns, 1, 1), threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(n2 * 128,), (n2,), (n2,)], output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+        )
+        o1 = _DUMMY_GATE
+    else:
+        ntg = sum(Hkv * tgpk if s >= _TWO_PASS_N else Hq for s in Ss)
+        tmpl = [("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", B), ("MW", _MW), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("NS", ns), ("HAS_GATE", has_gate)]
+        o1, partials, sums, maxs = s1(
+            inputs=[qc, pbc, sk, mta, sc, gt] + list(ks) + list(vs), template=tmpl, grid=(ntg * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1), output_shapes=[(B, 1, Hq, 128), (n2 * 128,), (n2,), (n2,)],
+            output_dtypes=[mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
+        )
     (out,) = s2(
-        inputs=[partials, sums, maxs, o1, mta], template=[("T", mx.bfloat16), ("MW", _MW), ("HQ", Hq), ("BLOCKS", blocks)],
+        inputs=[partials, sums, maxs, o1, mta, gt],
+        template=[("T", mx.bfloat16), ("MW", _MW), ("HQ", Hq), ("BLOCKS", blocks), ("HAS_GATE", has_gate)],
         grid=(B * Hq * 1024, 1, 1), threadgroup=(1024, 1, 1), output_shapes=[(B, 1, Hq, 128)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out
+
+
+_B1_PACKED_SHORT = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    int h = (int)threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int kvh = h / GQA;
+    const int S = meta[0];
+    const int cap = meta[4];
+    const int lidx = meta[5];
+    const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+    const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = meta[1]; msk.idx = meta[2]; msk.rot = meta[3];
+    msk.R = R; msk.window = WIN;
+    msk.pb = pb + (size_t)h * R;
+    const float sc = scale[0];
+    float sink = float(static_cast<T>(qkv[SINK_OFF + h]));
+    sdpa1_head_v32<T, PBT, D, NS, true>(
+        q + (size_t)h * D, K, V, qkv + GATE_OFF + (size_t)h * D, out + (size_t)h * D,
+        S, sc, sink, msk, outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+_B1_PACKED_2P1 = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    uint tl = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    const int S = meta[0];
+    const int cap = meta[4];
+    const int lidx = meta[5];
+    int kvh = (int)tl / TGPK;
+    int f = ((int)tl % TGPK) * NS + (int)simd_gid;
+    if (f < BLOCKS * GQA) {
+        int block = f / GQA;
+        int h = kvh * GQA + f % GQA;
+        const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+        const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+        RowMask<T, PBT> msk;
+        msk.S = S; msk.end = meta[1]; msk.idx = meta[2]; msk.rot = meta[3];
+        msk.R = R; msk.window = WIN;
+        msk.pb = pb + (size_t)h * R;
+        sdpa2_block<T, PBT, D, BLOCKS>(
+            q + (size_t)h * D, K, V,
+            partials + ((size_t)h * BLOCKS + block) * D, sums + (size_t)h * BLOCKS + block,
+            maxs + (size_t)h * BLOCKS + block, S, scale[0],
+            float(static_cast<T>(qkv[SINK_OFF + h])), msk, block, simd_lid);
+    }
+"""
+
+_B1_PACKED_2P2 = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    uint h = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    sdpa2_reduce<T, D, true>(
+        partials + (size_t)h * BLOCKS * D, sums + (size_t)h * BLOCKS,
+        maxs + (size_t)h * BLOCKS, qkv + GATE_OFF + (size_t)h * D, out + (size_t)h * D,
+        BLOCKS, outputs, simd_gid, simd_lid);
+"""
+
+_b1_packed_kernels = None
+_B1_META_CACHE: dict = {}
+
+
+def _get_b1_packed_kernels():
+    global _b1_packed_kernels
+    if _b1_packed_kernels is None:
+        s1_short = mx.fast.metal_kernel(
+            name="b1_packed_sdpa_short",
+            input_names=["q", "kv", "pb", "qkv", "meta", "scale"],
+            output_names=["out"],
+            source=_B1_PACKED_SHORT,
+            header=_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s1_2p = mx.fast.metal_kernel(
+            name="b1_packed_sdpa_2p1",
+            input_names=["q", "kv", "pb", "qkv", "meta", "scale"],
+            output_names=["partials", "sums", "maxs"],
+            source=_B1_PACKED_2P1,
+            header=_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s2_2p = mx.fast.metal_kernel(
+            name="b1_packed_sdpa_2p2",
+            input_names=["partials", "sums", "maxs", "qkv"],
+            output_names=["out"],
+            source=_B1_PACKED_2P2,
+            header=_HEADER,
+            ensure_row_contiguous=True,
+        )
+        _b1_packed_kernels = (s1_short, s1_2p, s2_2p)
+    return _b1_packed_kernels
+
+
+def sdpa_b1_packed(
+    q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap, *, scale, window, Hq=24, Hkv=8, kv_layer_idx=0,
+    gate_stride=None, sink_stride=None,
+):
+    """Dedicated B=1 decode attention directly over packed head-major KV (2, Hkv, cap, 128) or stacked (NL, 2, Hkv, cap, 128)."""
+    assert q.dtype == mx.bfloat16 and kv_buf.dtype == mx.bfloat16 and qkv_flat.dtype == mx.bfloat16
+    gqa = Hq // Hkv
+    assert Hq == gqa * Hkv and (
+        (kv_buf.ndim == 4 and kv_buf.shape == (2, Hkv, cap, 128) and kv_layer_idx == 0)
+        or (kv_buf.ndim == 5 and kv_buf.shape[1:] == (2, Hkv, cap, 128) and 0 <= kv_layer_idx < kv_buf.shape[0])
+    )
+    R = pb.shape[-1]
+    sck = float(scale)
+    sc = _SCALE_CACHE.get(sck)
+    if sc is None:
+        sc = _SCALE_CACHE[sck] = mx.array([sck], mx.float32)
+    mkey = (int(S), int(end), int(idx), int(rot), int(cap), int(kv_layer_idx))
+    mta = _B1_META_CACHE.get(mkey)
+    if mta is None:
+        if len(_B1_META_CACHE) >= 256:
+            _B1_META_CACHE.clear()
+        mta = _B1_META_CACHE[mkey] = mx.array(mkey, mx.int32)
+    s1_short, s1_2p, s2_2p = _get_b1_packed_kernels()
+    if S < _TWO_PASS_N:
+        ns_env = os.environ.get("LOOPLING_SDPA1_NS", "")
+        ns = int(ns_env) if ns_env and ns_env != "0" else 32
+        (out,) = s1_short(
+            inputs=[q, kv_buf, pb, qkv_flat, mta, sc],
+            template=[("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                      ("R", R), ("WIN", int(window)), ("NS", ns), ("GATE_OFF", int(gate_off)),
+                      ("SINK_OFF", int(sink_off))],
+            grid=(Hq * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(1, Hq * 128)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return out
+    blocks = _blocks(S, gqa)
+    ns = gqa
+    tgpk = (blocks * gqa + ns - 1) // ns
+    ntg = Hkv * tgpk
+    partials, sums, maxs = s1_2p(
+        inputs=[q, kv_buf, pb, qkv_flat, mta, sc],
+        template=[("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                  ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("NS", ns),
+                  ("SINK_OFF", int(sink_off))],
+        grid=(ntg * 32 * ns, 1, 1),
+        threadgroup=(32 * ns, 1, 1),
+        output_shapes=[(Hq * blocks * 128,), (Hq * blocks,), (Hq * blocks,)],
+        output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+    )
+    (out,) = s2_2p(
+        inputs=[partials, sums, maxs, qkv_flat],
+        template=[("T", mx.bfloat16), ("BLOCKS", blocks), ("GATE_OFF", int(gate_off))],
+        grid=(Hq * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, Hq * 128)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out
+
+
+_CAUSAL_HEADER = _HEADER + r"""
+template <typename T, typename PBT, int D, int NS, bool HAS_GATE, bool HAS_STAGE = false>
+METAL_FUNC void sdpa1_head_v32_causal(
+    const device T* queries, const device T* K, const device T* V,
+    const device T* Knew, const device T* Vnew, const device T* gate, device T* out,
+    const int N, const float scale, const float sink, const RowMask<T, PBT> msk,
+    const int db, const device int* anc_ptr, const int S0, const int slot0, const int max_size, const int rot,
+    const device T* Kst, const device T* Vst, const int slot_main, const int st_len,
+    threadgroup float* outputs, threadgroup float* max_scores, threadgroup float* sum_exp_scores,
+    uint simd_gid, uint simd_lid) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int NV = BN / NS;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  typedef float U;
+  int anc[8];
+  for (int t = 0; t <= db; t++) anc[t] = anc_ptr[t];
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread];
+  queries += simd_lid * qk_per_thread;
+  bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+  q[0] = static_cast<U>(scale) * qb.x;
+  q[1] = static_cast<U>(scale) * qb.y;
+  q[2] = static_cast<U>(scale) * qb.z;
+  q[3] = static_cast<U>(scale) * qb.w;
+  for (int v = 0; v < NV; v++) {
+    int vg = (int)simd_gid + v * NS;
+    for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+    if (vg == 0) {
+      max_score = sink;
+      sum_exp_score = 1;
+    }
+    for (int i = vg; i < N; i += BN) {
+      float fm = 0;
+      if (msk.at(i, fm)) {
+        int d = rot ? (i - slot0 + (i < slot0 ? max_size : 0)) : (i - S0);
+        bool is_new = (d >= 0 && d <= db);
+        const device T* kp;
+        const device T* vp;
+        if (is_new) {
+          kp = Knew + (size_t)anc[d] * D + simd_lid * qk_per_thread;
+          vp = Vnew + (size_t)anc[d] * D + simd_lid * v_per_thread;
+        } else if constexpr (HAS_STAGE) {
+          int ds = rot ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+          if (ds >= 0 && ds < st_len) {
+            kp = Kst + (size_t)ds * D + simd_lid * qk_per_thread;
+            vp = Vst + (size_t)ds * D + simd_lid * v_per_thread;
+          } else {
+            kp = K + (size_t)i * D + simd_lid * qk_per_thread;
+            vp = V + (size_t)i * D + simd_lid * v_per_thread;
+          }
+        } else {
+          kp = K + (size_t)i * D + simd_lid * qk_per_thread;
+          vp = V + (size_t)i * D + simd_lid * v_per_thread;
+        }
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      }
+    }
+    if (simd_lid == 0) {
+      max_scores[vg] = max_score;
+      sum_exp_scores[vg] = sum_exp_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[(i * BD + simd_lid) * BN + vg] = o[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  U max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  for (int f = (int)simd_gid; f < BD; f += NS) {
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    }
+    if (simd_lid == 0) {
+      int base = f * v_per_thread;
+      if constexpr (HAS_GATE) {
+        bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+        bfloat4 ob = bfloat4(
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
+        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      } else {
+        bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      }
+    }
+  }
+}
+
+template <typename T, typename PBT, int D, int BLOCKS, bool HAS_STAGE = false>
+METAL_FUNC void sdpa2_block_causal(
+    const device T* queries, const device T* K, const device T* V,
+    const device T* Knew, const device T* Vnew, device T* out, device float* sums,
+    device float* maxs, const int N, const float scale, const float sink, const RowMask<T, PBT> msk,
+    const int db, const device int* anc_ptr, const int S0, const int slot0, const int max_size, const int rot,
+    const device T* Kst, const device T* Vst, const int slot_main, const int st_len,
+    const int block_idx, uint simd_lid) {
+  constexpr int TK = 4;
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  constexpr int blocks = BLOCKS;
+  typedef float U;
+  int anc[8];
+  for (int t = 0; t <= db; t++) anc[t] = anc_ptr[t];
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread] = {0};
+  queries += simd_lid * qk_per_thread;
+  out += simd_lid * v_per_thread;
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+  U max_score = Limits<U>::finite_min;
+  U sum_exp_score = 0;
+  if (block_idx == 0) {
+    max_score = sink;
+    sum_exp_score = 1;
+  }
+  int i = block_idx;
+  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+    T k_reg[TK][qk_per_thread];
+    T v_reg[TK][v_per_thread];
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      int d = rot ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
+      bool is_new = (d >= 0 && d <= db);
+      const device T* kp;
+      if (is_new) {
+        kp = Knew + (size_t)anc[d] * D + simd_lid * qk_per_thread;
+      } else if constexpr (HAS_STAGE) {
+        int ds = rot ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+        kp = ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D) : (K + (size_t)ii * D)) + simd_lid * qk_per_thread;
+      } else {
+        kp = K + (size_t)ii * D + simd_lid * qk_per_thread;
+      }
+      for (int j = 0; j < qk_per_thread; j++) {
+        k_reg[t][j] = kp[j];
+      }
+    }
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      int d = rot ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
+      bool is_new = (d >= 0 && d <= db);
+      const device T* vp;
+      if (is_new) {
+        vp = Vnew + (size_t)anc[d] * D + simd_lid * v_per_thread;
+      } else if constexpr (HAS_STAGE) {
+        int ds = rot ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+        vp = ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D) : (V + (size_t)ii * D)) + simd_lid * v_per_thread;
+      } else {
+        vp = V + (size_t)ii * D + simd_lid * v_per_thread;
+      }
+      for (int j = 0; j < v_per_thread; j++) {
+        v_reg[t][j] = vp[j];
+      }
+    }
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      float fm = 0;
+      if (msk.at(ii, fm)) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+          score += q[j] * static_cast<U>(k_reg[t][j]);
+        }
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
+        }
+      }
+    }
+  }
+  for (; i < N; i += blocks) {
+    float fm = 0;
+    if (msk.at(i, fm)) {
+      int d = rot ? (i - slot0 + (i < slot0 ? max_size : 0)) : (i - S0);
+      bool is_new = (d >= 0 && d <= db);
+      const device T* kp;
+      const device T* vp;
+      if (is_new) {
+        kp = Knew + (size_t)anc[d] * D + simd_lid * qk_per_thread;
+        vp = Vnew + (size_t)anc[d] * D + simd_lid * v_per_thread;
+      } else if constexpr (HAS_STAGE) {
+        int ds = rot ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+        if (ds >= 0 && ds < st_len) {
+          kp = Kst + (size_t)ds * D + simd_lid * qk_per_thread;
+          vp = Vst + (size_t)ds * D + simd_lid * v_per_thread;
+        } else {
+          kp = K + (size_t)i * D + simd_lid * qk_per_thread;
+          vp = V + (size_t)i * D + simd_lid * v_per_thread;
+        }
+      } else {
+        kp = K + (size_t)i * D + simd_lid * qk_per_thread;
+        vp = V + (size_t)i * D + simd_lid * v_per_thread;
+      }
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * kp[j];
+      }
+      score = simd_sum(score);
+      score += fm;
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * vp[j];
+      }
+    }
+  }
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+  for (int i2 = 0; i2 < v_per_thread; i2++) {
+    out[i2] = static_cast<T>(o[i2]);
+  }
+}
+"""
+
+_CAUSAL_SHORT_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    int bh_l = (int)threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b_idx = bh_l / HQ;
+    int h = bh_l % HQ;
+    int b = BOFF + b_idx;
+    int bh = b * HQ + h;
+    int kvh = h / GQA;
+    const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
+    const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
+    const int db = tree_meta[b * 9];
+    const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
+    const int end_b = end0 + db + 1;
+    const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
+    const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+    const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+    const device T* Knew = kv_new + (size_t)kvh * WW * D;
+    const device T* Vnew = kv_new + (size_t)(HKV + kvh) * WW * D;
+    RowMask<T, PBT> msk;
+    msk.S = S_b; msk.end = end_b; msk.idx = idx_b; msk.rot = ROT;
+    msk.R = R; msk.window = WIN; msk.pb = pb + (size_t)bh * R;
+    float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
+    sdpa1_head_v32_causal<T, PBT, D, NS, true>(
+        q + (size_t)bh * D, K, V, Knew, Vnew, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, out + (size_t)bh_l * D,
+        S_b, scale[0], sink, msk, db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT,
+        nullptr, nullptr, 0, 0,
+        outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+_CAUSAL_2P1_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    constexpr int NTG2 = HKV * TGPK;
+    int t_all = (int)threadgroup_position_in_grid.x;
+    int b_idx = t_all / NTG2;
+    int tl = t_all % NTG2;
+    int b = BOFF + b_idx;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
+    const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
+    const int db = tree_meta[b * 9];
+    const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
+    const int end_b = end0 + db + 1;
+    const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
+    int kvh = tl / TGPK;
+    int f = (tl % TGPK) * NS + (int)simd_gid;
+    if (f < BLOCKS * GQA) {
+        int block = f / GQA;
+        int h = kvh * GQA + f % GQA;
+        int bh = b * HQ + h;
+        int bh_l = b_idx * HQ + h;
+        const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+        const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+        const device T* Knew = kv_new + (size_t)kvh * WW * D;
+        const device T* Vnew = kv_new + (size_t)(HKV + kvh) * WW * D;
+        RowMask<T, PBT> msk;
+        msk.S = S_b; msk.end = end_b; msk.idx = idx_b; msk.rot = ROT;
+        msk.R = R; msk.window = WIN; msk.pb = pb + (size_t)bh * R;
+        sdpa2_block_causal<T, PBT, D, BLOCKS>(
+            q + (size_t)bh * D, K, V, Knew, Vnew,
+            partials + ((size_t)bh_l * BLOCKS + block) * D, sums + (size_t)bh_l * BLOCKS + block,
+            maxs + (size_t)bh_l * BLOCKS + block, S_b, scale[0],
+            float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])), msk,
+            db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT, nullptr, nullptr, 0, 0, block, simd_lid);
+    }
+"""
+
+_CAUSAL_2P2_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    int bh_l = (int)threadgroup_position_in_grid.x;
+    int b_idx = bh_l / HQ;
+    int h = bh_l % HQ;
+    int b = BOFF + b_idx;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    sdpa2_reduce<T, D, true>(
+        partials + (size_t)bh_l * BLOCKS * D, sums + (size_t)bh_l * BLOCKS,
+        maxs + (size_t)bh_l * BLOCKS, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, out + (size_t)bh_l * D,
+        BLOCKS, outputs, simd_gid, simd_lid);
+"""
+
+_CAUSAL_SHORT_ST_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    int bh_l = (int)threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b_idx = bh_l / HQ;
+    int h = bh_l % HQ;
+    int b = BOFF + b_idx;
+    int bh = b * HQ + h;
+    int kvh = h / GQA;
+    const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
+    const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
+    const int slot_main = meta[6], st_len = meta[7];
+    const int db = tree_meta[b * 9];
+    const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
+    const int end_b = end0 + db + 1;
+    const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
+    const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+    const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+    const device T* Kst = kv_st + ((size_t)lidx * 2 * HKV + kvh) * SCAP * D;
+    const device T* Vst = kv_st + ((size_t)lidx * 2 * HKV + HKV + kvh) * SCAP * D;
+    const device T* Knew = kv_new + (size_t)kvh * WW * D;
+    const device T* Vnew = kv_new + (size_t)(HKV + kvh) * WW * D;
+    RowMask<T, PBT> msk;
+    msk.S = S_b; msk.end = end_b; msk.idx = idx_b; msk.rot = ROT;
+    msk.R = R; msk.window = WIN; msk.pb = pb + (size_t)bh * R;
+    float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
+    sdpa1_head_v32_causal<T, PBT, D, NS, true, true>(
+        q + (size_t)bh * D, K, V, Knew, Vnew, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, out + (size_t)bh_l * D,
+        S_b, scale[0], sink, msk, db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT,
+        Kst, Vst, slot_main, st_len,
+        outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+_CAUSAL_2P1_ST_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    constexpr int NTG2 = HKV * TGPK;
+    int t_all = (int)threadgroup_position_in_grid.x;
+    int b_idx = t_all / NTG2;
+    int tl = t_all % NTG2;
+    int b = BOFF + b_idx;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
+    const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
+    const int slot_main = meta[6], st_len = meta[7];
+    const int db = tree_meta[b * 9];
+    const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
+    const int end_b = end0 + db + 1;
+    const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
+    int kvh = tl / TGPK;
+    int f = (tl % TGPK) * NS + (int)simd_gid;
+    if (f < BLOCKS * GQA) {
+        int block = f / GQA;
+        int h = kvh * GQA + f % GQA;
+        int bh = b * HQ + h;
+        int bh_l = b_idx * HQ + h;
+        const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+        const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+        const device T* Kst = kv_st + ((size_t)lidx * 2 * HKV + kvh) * SCAP * D;
+        const device T* Vst = kv_st + ((size_t)lidx * 2 * HKV + HKV + kvh) * SCAP * D;
+        const device T* Knew = kv_new + (size_t)kvh * WW * D;
+        const device T* Vnew = kv_new + (size_t)(HKV + kvh) * WW * D;
+        RowMask<T, PBT> msk;
+        msk.S = S_b; msk.end = end_b; msk.idx = idx_b; msk.rot = ROT;
+        msk.R = R; msk.window = WIN; msk.pb = pb + (size_t)bh * R;
+        sdpa2_block_causal<T, PBT, D, BLOCKS, true>(
+            q + (size_t)bh * D, K, V, Knew, Vnew,
+            partials + ((size_t)bh_l * BLOCKS + block) * D, sums + (size_t)bh_l * BLOCKS + block,
+            maxs + (size_t)bh_l * BLOCKS + block, S_b, scale[0],
+            float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])), msk,
+            db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT,
+            Kst, Vst, slot_main, st_len, block, simd_lid);
+    }
+"""
+
+_causal_w_kernels = None
+_causal_w_dyn_kernels = None
+_causal_w_stage_kernels = None
+_CW_META_CACHE: dict = {}
+_CHAIN_TREE_META: dict = {}
+
+
+def _default_tree_meta(W):
+    v = _CHAIN_TREE_META.get(W)
+    if v is None:
+        rows = [[b] + list(range(b + 1)) + [0] * (8 - (b + 1)) for b in range(W)]
+        v = _CHAIN_TREE_META[W] = (tuple(range(W)), mx.array(rows, mx.int32))
+    return v
+
+
+def _get_causal_w_kernels():
+    global _causal_w_kernels
+    if _causal_w_kernels is None:
+        s1_short = mx.fast.metal_kernel(
+            name="causal_w_sdpa_short_t",
+            input_names=["q", "kv", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta"],
+            output_names=["out"],
+            source=_CAUSAL_SHORT_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s1_2p = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p1_t",
+            input_names=["q", "kv", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta"],
+            output_names=["partials", "sums", "maxs"],
+            source=_CAUSAL_2P1_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s2_2p = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p2",
+            input_names=["partials", "sums", "maxs", "qkv"],
+            output_names=["out"],
+            source=_CAUSAL_2P2_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        _causal_w_kernels = (s1_short, s1_2p, s2_2p)
+    return _causal_w_kernels
+
+
+def _get_causal_w_dyn_kernels():
+    global _causal_w_dyn_kernels
+    if _causal_w_dyn_kernels is None:
+        s_short = _CAUSAL_SHORT_SRC.replace(
+            "    int bh = b * HQ + h;",
+            "    if (b >= w_act[0]) return;\n    int bh = b * HQ + h;",
+        )
+        s_2p1 = _CAUSAL_2P1_SRC.replace(
+            "    int b = BOFF + b_idx;",
+            "    int b = BOFF + b_idx;\n    if (b >= w_act[0]) return;",
+        )
+        s_2p2 = _CAUSAL_2P2_SRC.replace(
+            "    int b = BOFF + b_idx;",
+            "    int b = BOFF + b_idx;\n    if (b >= w_act[0]) return;",
+        )
+        assert s_short != _CAUSAL_SHORT_SRC and s_2p1 != _CAUSAL_2P1_SRC and s_2p2 != _CAUSAL_2P2_SRC
+        s1_short = mx.fast.metal_kernel(
+            name="causal_w_sdpa_short_dyn",
+            input_names=["q", "kv", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta", "w_act"],
+            output_names=["out"],
+            source=s_short,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s1_2p = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p1_dyn",
+            input_names=["q", "kv", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta", "w_act"],
+            output_names=["partials", "sums", "maxs"],
+            source=s_2p1,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s2_2p = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p2_dyn",
+            input_names=["partials", "sums", "maxs", "qkv", "w_act"],
+            output_names=["out"],
+            source=s_2p2,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        _causal_w_dyn_kernels = (s1_short, s1_2p, s2_2p)
+    return _causal_w_dyn_kernels
+
+
+def _get_causal_w_stage_kernels():
+    global _causal_w_stage_kernels
+    if _causal_w_stage_kernels is None:
+        s1_short = mx.fast.metal_kernel(
+            name="causal_w_sdpa_short_st",
+            input_names=["q", "kv", "kv_st", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta"],
+            output_names=["out"],
+            source=_CAUSAL_SHORT_ST_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        s1_2p = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p1_st",
+            input_names=["q", "kv", "kv_st", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta"],
+            output_names=["partials", "sums", "maxs"],
+            source=_CAUSAL_2P1_ST_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        _, _, s2_2p = _get_causal_w_kernels()
+        _causal_w_stage_kernels = (s1_short, s1_2p, s2_2p)
+    return _causal_w_stage_kernels
+
+
+def sdpa_causal_w_packed(
+    q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off, S0, end0, slot0, rot, cap, max_size, W, *,
+    scale, window, Hq=24, Hkv=8, kv_layer_idx=0, tree_meta=None, depths=None, meta_arr=None, s_bounds=None,
+    kv_stage=None, w_act=None, gate_stride=None, sink_stride=None,
+):
+    """Causal W-token/tree decode attention over pre-step packed KV + kv_new."""
+    assert q.dtype == mx.bfloat16 and kv_buf.dtype == mx.bfloat16 and kv_new.dtype == mx.bfloat16 and qkv_flat.dtype == mx.bfloat16
+    gqa = Hq // Hkv
+    g_str = int(gate_stride or Hq * 128)
+    s_str = int(sink_stride or Hq)
+    assert Hq == gqa * Hkv and kv_new.shape == (2, Hkv, W, 128) and (
+        (kv_buf.ndim == 4 and kv_buf.shape == (2, Hkv, cap, 128) and kv_layer_idx == 0)
+        or (kv_buf.ndim == 5 and kv_buf.shape[1:] == (2, Hkv, cap, 128) and 0 <= kv_layer_idx < kv_buf.shape[0])
+    )
+    if tree_meta is None:
+        depths_t, tree_meta = _default_tree_meta(W)
+        if depths is not None:
+            depths_t = tuple(int(d) for d in depths)
+    else:
+        assert tree_meta.shape == (W, 9) and tree_meta.dtype == mx.int32
+        depths_t = tuple(int(d) for d in depths) if depths is not None else None
+    R = pb.shape[-1]
+    sck = float(scale)
+    sc = _SCALE_CACHE.get(sck)
+    if sc is None:
+        sc = _SCALE_CACHE[sck] = mx.array([sck], mx.float32)
+    if meta_arr is not None:
+        mta = meta_arr
+        kv_lidx_t = int(kv_layer_idx)
+    else:
+        mkey = (int(S0), int(end0), int(slot0), int(cap), int(max_size), int(kv_layer_idx))
+        mta = _CW_META_CACHE.get(mkey)
+        if mta is None:
+            if len(_CW_META_CACHE) >= 256:
+                _CW_META_CACHE.clear()
+            mta = _CW_META_CACHE[mkey] = mx.array(mkey, mx.int32)
+        kv_lidx_t = -1
+    has_wa = (w_act is not None)
+    wa_arg = [w_act.reshape(-1)] if has_wa else []
+    if kv_stage is not None:
+        assert not has_wa
+        assert meta_arr is not None and int(meta_arr.shape[0]) == 8
+        assert kv_buf.ndim == 5 and kv_stage.shape[:3] == kv_buf.shape[:3] and kv_stage.shape[4] == 128 and kv_stage.dtype == mx.bfloat16
+        scap = int(kv_stage.shape[3])
+        s1_short, s1_2p, s2_2p = _get_causal_w_stage_kernels()
+    elif has_wa:
+        scap = 0
+        s1_short, s1_2p, s2_2p = _get_causal_w_dyn_kernels()
+    else:
+        scap = 0
+        s1_short, s1_2p, s2_2p = _get_causal_w_kernels()
+
+    if s_bounds is not None:
+        s_min_b, s_max_b = int(s_bounds[0]), int(s_bounds[1])
+        split = W if s_max_b < _TWO_PASS_N else 0
+        s_vals = None
+    else:
+        s_vals = [min(end0 + d + 1, max_size) if rot else (S0 + d + 1) for d in depths_t]
+        split = 0
+        while split < W and s_vals[split] < _TWO_PASS_N:
+            split += 1
+
+    def _run_short(b_off, b_cnt):
+        ns_env = os.environ.get("LOOPLING_SDPA1_NS", "")
+        ns = int(ns_env) if ns_env and ns_env != "0" else 32
+        if kv_stage is not None:
+            (o,) = s1_short(
+                inputs=[q, kv_buf, kv_stage, kv_new, pb, qkv_flat, mta, sc, tree_meta],
+                template=[
+                    ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                    ("R", R), ("WIN", int(window)), ("NS", ns), ("ROT", int(rot)), ("WW", int(W)),
+                    ("BOFF", int(b_off)), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", g_str),
+                    ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
+                    ("KV_LIDX", kv_lidx_t), ("SCAP", scap),
+                ],
+                grid=(b_cnt * Hq * 32 * ns, 1, 1),
+                threadgroup=(32 * ns, 1, 1),
+                output_shapes=[(b_cnt, Hq * 128)],
+                output_dtypes=[mx.bfloat16],
+            )
+            return o
+        (o,) = s1_short(
+            inputs=[q, kv_buf, kv_new, pb, qkv_flat, mta, sc, tree_meta] + wa_arg,
+            template=[
+                ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                ("R", R), ("WIN", int(window)), ("NS", ns), ("ROT", int(rot)), ("WW", int(W)),
+                ("BOFF", int(b_off)), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", g_str),
+                ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
+                ("KV_LIDX", kv_lidx_t),
+            ],
+            grid=(b_cnt * Hq * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(b_cnt, Hq * 128)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return o
+
+    def _run_2p(b_off, b_cnt):
+        s_hi = s_max_b if s_bounds is not None else s_vals[-1]
+        blocks = _blocks(s_hi, gqa)
+        ns = gqa
+        tgpk = (blocks * gqa + ns - 1) // ns
+        ntg = b_cnt * Hkv * tgpk
+        if kv_stage is not None:
+            partials, sums, maxs = s1_2p(
+                inputs=[q, kv_buf, kv_stage, kv_new, pb, qkv_flat, mta, sc, tree_meta],
+                template=[
+                    ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                    ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("NS", ns), ("ROT", int(rot)),
+                    ("WW", int(W)), ("BOFF", int(b_off)), ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
+                    ("KV_LIDX", kv_lidx_t), ("SCAP", scap),
+                ],
+                grid=(ntg * 32 * ns, 1, 1),
+                threadgroup=(32 * ns, 1, 1),
+                output_shapes=[(b_cnt * Hq * blocks * 128,), (b_cnt * Hq * blocks,), (b_cnt * Hq * blocks,)],
+                output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+            )
+        else:
+            partials, sums, maxs = s1_2p(
+                inputs=[q, kv_buf, kv_new, pb, qkv_flat, mta, sc, tree_meta] + wa_arg,
+                template=[
+                    ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+                    ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("NS", ns), ("ROT", int(rot)),
+                    ("WW", int(W)), ("BOFF", int(b_off)), ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
+                    ("KV_LIDX", kv_lidx_t),
+                ],
+                grid=(ntg * 32 * ns, 1, 1),
+                threadgroup=(32 * ns, 1, 1),
+                output_shapes=[(b_cnt * Hq * blocks * 128,), (b_cnt * Hq * blocks,), (b_cnt * Hq * blocks,)],
+                output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+            )
+        (o,) = s2_2p(
+            inputs=[partials, sums, maxs, qkv_flat] + wa_arg,
+            template=[("T", mx.bfloat16), ("HQ", Hq), ("BLOCKS", blocks), ("BOFF", int(b_off)), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", g_str)],
+            grid=(b_cnt * Hq * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(b_cnt, Hq * 128)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return o
+
+    if split == W:
+        return _run_short(0, W)
+    if split == 0:
+        return _run_2p(0, W)
+    return mx.concatenate([_run_short(0, split), _run_2p(split, W - split)], axis=0)
+
+
+# =============================================================================================== Staged batched SDPA
+_SMW = 9  # S_now, end_now, idx_now, rot, kcap, vcap, slot_main, rot_wrap, max_size
+
+_STAGED_HEADER = _HEADER + r"""
+template <typename T, typename PBT, int D, int NS, bool HAS_GATE>
+METAL_FUNC void sdpa1_head_v32_staged(
+    const device T* queries, const device T* K_main, const device T* V_main,
+    const device T* Kst, const device T* Vst, const device T* Knew, const device T* Vnew,
+    const device T* gate, device T* out, const int N, const float scale, const float sink,
+    const RowMask<T, PBT> msk, const int slot_main, const int rot_wrap, const int max_size,
+    const int st_len, threadgroup float* outputs, threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores, uint simd_gid, uint simd_lid) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int NV = BN / NS;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  typedef float U;
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread];
+  const int loff = (int)simd_lid * qk_per_thread;
+  queries += loff;
+  bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+  q[0] = static_cast<U>(scale) * qb.x;
+  q[1] = static_cast<U>(scale) * qb.y;
+  q[2] = static_cast<U>(scale) * qb.z;
+  q[3] = static_cast<U>(scale) * qb.w;
+  for (int v = 0; v < NV; v++) {
+    int vg = (int)simd_gid + v * NS;
+    for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+    if (vg == 0) {
+      max_score = sink;
+      sum_exp_score = 1;
+    }
+    for (int i = vg; i < N; i += BN) {
+      float fm = 0;
+      if (msk.at(i, fm)) {
+        int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+        const device T* kp;
+        const device T* vp;
+        if (ds == st_len) {
+          kp = Knew + loff;
+          vp = Vnew + loff;
+        } else if (ds >= 0 && ds < st_len) {
+          kp = Kst + (size_t)ds * 128 + loff;
+          vp = Vst + (size_t)ds * 128 + loff;
+        } else {
+          kp = K_main + (size_t)i * 128 + loff;
+          vp = V_main + (size_t)i * 128 + loff;
+        }
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      }
+    }
+    if (simd_lid == 0) {
+      max_scores[vg] = max_score;
+      sum_exp_scores[vg] = sum_exp_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[(i * BD + simd_lid) * BN + vg] = o[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  U max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  for (int f = (int)simd_gid; f < BD; f += NS) {
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    }
+    if (simd_lid == 0) {
+      int base = f * v_per_thread;
+      if constexpr (HAS_GATE) {
+        bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+        bfloat4 ob = bfloat4(
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
+        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      } else {
+        bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      }
+    }
+  }
+}
+
+template <typename T, typename PBT, int D, int BLOCKS>
+METAL_FUNC void sdpa2_block_staged(
+    const device T* queries, const device T* K_main, const device T* V_main,
+    const device T* Kst, const device T* Vst, const device T* Knew, const device T* Vnew,
+    device T* out, device float* sums, device float* maxs, const int N, const float scale,
+    const float sink, const RowMask<T, PBT> msk, const int slot_main, const int rot_wrap,
+    const int max_size, const int st_len, const int block_idx, uint simd_lid) {
+  constexpr int TK = 4;
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  constexpr int blocks = BLOCKS;
+  typedef float U;
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread] = {0};
+  const int loff = (int)simd_lid * qk_per_thread;
+  queries += loff;
+  out += loff;
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+  U max_score = Limits<U>::finite_min;
+  U sum_exp_score = 0;
+  if (block_idx == 0) {
+    max_score = sink;
+    sum_exp_score = 1;
+  }
+  int i = block_idx;
+  if (!rot_wrap) {
+    const int k_seq_stride = D;
+    const device T* keys = K_main + (size_t)i * k_seq_stride + loff;
+    const device T* values = V_main + (size_t)i * k_seq_stride + loff;
+    const int stride_k_tok = blocks * k_seq_stride;
+    const int stride_v_tok = blocks * k_seq_stride;
+    for (; i + (TK - 1) * blocks < slot_main; i += blocks * TK) {
+      T k_reg[TK][qk_per_thread];
+      T v_reg[TK][v_per_thread];
+      for (int t = 0; t < TK; t++) {
+        const device T* kp = keys + t * stride_k_tok;
+        for (int j = 0; j < qk_per_thread; j++) k_reg[t][j] = kp[j];
+      }
+      for (int t = 0; t < TK; t++) {
+        const device T* vp = values + t * stride_v_tok;
+        for (int j = 0; j < v_per_thread; j++) v_reg[t][j] = vp[j];
+      }
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        float fm = 0;
+        if (msk.at(ii, fm)) {
+          U score = 0;
+          for (int j = 0; j < qk_per_thread; j++) score += q[j] * static_cast<U>(k_reg[t][j]);
+          score = simd_sum(score);
+          score += static_cast<U>(fm);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
+        }
+      }
+      keys += TK * stride_k_tok;
+      values += TK * stride_v_tok;
+    }
+  }
+  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+    T k_reg[TK][qk_per_thread];
+    T v_reg[TK][v_per_thread];
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+      const device T* kp = (ds == st_len) ? (Knew + loff) : ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D + loff) : (K_main + (size_t)ii * D + loff));
+      for (int j = 0; j < qk_per_thread; j++) k_reg[t][j] = kp[j];
+    }
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+      const device T* vp = (ds == st_len) ? (Vnew + loff) : ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D + loff) : (V_main + (size_t)ii * D + loff));
+      for (int j = 0; j < v_per_thread; j++) v_reg[t][j] = vp[j];
+    }
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      float fm = 0;
+      if (msk.at(ii, fm)) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) score += q[j] * static_cast<U>(k_reg[t][j]);
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
+      }
+    }
+  }
+  for (; i < N; i += blocks) {
+    float fm = 0;
+    if (msk.at(i, fm)) {
+      int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+      const device T* kp = (ds == st_len) ? (Knew + loff) : ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D + loff) : (K_main + (size_t)i * D + loff));
+      const device T* vp = (ds == st_len) ? (Vnew + loff) : ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D + loff) : (V_main + (size_t)i * D + loff));
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) score += q[j] * kp[j];
+      score = simd_sum(score);
+      score += fm;
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+      for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * vp[j];
+    }
+  }
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+  for (int i2 = 0; i2 < v_per_thread; i2++) {
+    out[i2] = static_cast<T>(o[i2]);
+  }
+}
+"""
+
+_STAGED_SHORT_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b = (int)t / HQ;
+    int h = (int)t % HQ;
+    int kvh = h / GQA;
+    int bh = (int)t;
+    const int S = meta[b * MW + 0];
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kcap = meta[b * MW + 4];
+    const int vcap = meta[b * MW + 5];
+    const int slot_main = meta[b * MW + 6];
+    const int rot_wrap = meta[b * MW + 7];
+    const int max_size = meta[b * MW + 8];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = meta[b * MW + 1]; msk.idx = meta[b * MW + 2]; msk.rot = meta[b * MW + 3];
+    msk.R = R; msk.window = WIN;
+    msk.pb = pb + (size_t)bh * R;
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    const int st_len = st_info[2];
+    const device T* Kst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+    const device T* Vst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+    const device T* Knew = kv_new + ((size_t)(b * 2 + 0) * HKV + kvh) * D;
+    const device T* Vnew = kv_new + ((size_t)(b * 2 + 1) * HKV + kvh) * D;
+    float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
+    sdpa1_head_v32_staged<T, PBT, D, NS, true>(
+        q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+        Kst, Vst, Knew, Vnew,
+        qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, o1 + (size_t)bh * D,
+        S, scale[0], sink, msk, slot_main, rot_wrap, max_size, st_len,
+        outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+_STAGED_2PASS_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    constexpr int NTG2 = HKV * TGPK;
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b = (int)t / NTG2;
+    int tl = (int)t % NTG2;
+    const int S = meta[b * MW + 0];
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kcap = meta[b * MW + 4];
+    const int vcap = meta[b * MW + 5];
+    const int slot_main = meta[b * MW + 6];
+    const int rot_wrap = meta[b * MW + 7];
+    const int max_size = meta[b * MW + 8];
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    const int st_len = st_info[2];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = meta[b * MW + 1]; msk.idx = meta[b * MW + 2]; msk.rot = meta[b * MW + 3];
+    msk.R = R; msk.window = WIN;
+    const float sc = scale[0];
+    int kvh = tl / TGPK;
+    int f = (tl % TGPK) * NS + (int)simd_gid;
+    if (f < BLOCKS * GQA) {
+        int block = f / GQA;
+        int h = kvh * GQA + f % GQA;
+        int bh = b * HQ + h;
+        msk.pb = pb + (size_t)bh * R;
+        const device T* Kst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+        const device T* Vst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+        const device T* Knew = kv_new + ((size_t)(b * 2 + 0) * HKV + kvh) * D;
+        const device T* Vnew = kv_new + ((size_t)(b * 2 + 1) * HKV + kvh) * D;
+        sdpa2_block_staged<T, PBT, D, BLOCKS>(
+            q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+            Kst, Vst, Knew, Vnew,
+            partials + ((size_t)bh * BLOCKS + block) * D, sums + (size_t)bh * BLOCKS + block,
+            maxs + (size_t)bh * BLOCKS + block, S, sc,
+            float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])),
+            msk, slot_main, rot_wrap, max_size, st_len, block, simd_lid);
+    }
+"""
+
+_STAGED_MIXED_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    constexpr int NTG2 = HKV * TGPK;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int b = 0, acc = 0;
+    for (; b < NROWS; ++b) {
+        int n = meta[b * MW] >= 1024 ? NTG2 : HQ;
+        if ((int)t < acc + n) break;
+        acc += n;
+    }
+    int tl = (int)t - acc;
+    const int S = meta[b * MW + 0];
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kcap = meta[b * MW + 4];
+    const int vcap = meta[b * MW + 5];
+    const int slot_main = meta[b * MW + 6];
+    const int rot_wrap = meta[b * MW + 7];
+    const int max_size = meta[b * MW + 8];
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    const int st_len = st_info[2];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = meta[b * MW + 1]; msk.idx = meta[b * MW + 2]; msk.rot = meta[b * MW + 3];
+    msk.R = R; msk.window = WIN;
+    const float sc = scale[0];
+    if (S < 1024) {
+        int h = tl;
+        int kvh = h / GQA;
+        int bh = b * HQ + h;
+        msk.pb = pb + (size_t)bh * R;
+        const device T* Kst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+        const device T* Vst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+        const device T* Knew = kv_new + ((size_t)(b * 2 + 0) * HKV + kvh) * D;
+        const device T* Vnew = kv_new + ((size_t)(b * 2 + 1) * HKV + kvh) * D;
+        sdpa1_head_v32_staged<T, PBT, D, 32, true>(
+            q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+            Kst, Vst, Knew, Vnew,
+            qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, o1 + (size_t)bh * D,
+            S, sc, float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])),
+            msk, slot_main, rot_wrap, max_size, st_len, outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+    } else {
+        int kvh = tl / TGPK;
+        int f = (tl % TGPK) * NS + (int)simd_gid;
+        if (f < BLOCKS * GQA) {
+            int block = f / GQA;
+            int h = kvh * GQA + f % GQA;
+            int bh = b * HQ + h;
+            msk.pb = pb + (size_t)bh * R;
+            const device T* Kst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+            const device T* Vst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+            const device T* Knew = kv_new + ((size_t)(b * 2 + 0) * HKV + kvh) * D;
+            const device T* Vnew = kv_new + ((size_t)(b * 2 + 1) * HKV + kvh) * D;
+            sdpa2_block_staged<T, PBT, D, BLOCKS>(
+                q + (size_t)bh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+                Kst, Vst, Knew, Vnew,
+                partials + ((size_t)bh * BLOCKS + block) * D, sums + (size_t)bh * BLOCKS + block,
+                maxs + (size_t)bh * BLOCKS + block, S, sc,
+                float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])),
+                msk, slot_main, rot_wrap, max_size, st_len, block, simd_lid);
+        }
+    }
+"""
+
+_STAGED_S2_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    uint bh = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint tix = thread_position_in_threadgroup.x;
+    int b = int(bh) / HQ;
+    int h = int(bh) % HQ;
+    if (meta[b * MW] >= 1024) {
+        sdpa2_reduce<T, D, true>(
+            partials + (size_t)bh * BLOCKS * D, sums + (size_t)bh * BLOCKS,
+            maxs + (size_t)bh * BLOCKS,
+            qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D,
+            out + (size_t)bh * D,
+            BLOCKS, outputs, simd_gid, simd_lid);
+    } else if (tix < D) {
+        out[(size_t)bh * D + tix] = o1[(size_t)bh * D + tix];
+    }
+"""
+
+_staged_kernels: dict = {}
+_STAGED_META_CACHE: dict = {}
+_ST_INFO_CACHE: dict = {}
+
+
+def _get_staged_kernels(B):
+    ks = _staged_kernels.get(B)
+    if ks is None:
+        sel = "switch (b) {\n" + "".join(
+            f"        case {i}: K = k{i}; V = v{i}; break;\n" for i in range(B)
+        ) + "        default: K = k0; V = v0; break;\n    }"
+        kv_names = [f"k{i}" for i in range(B)] + [f"v{i}" for i in range(B)]
+        ins_base = ["q", "pb", "qkv", "meta", "scale", "st_info", "stage", "kv_new"] + kv_names
+        s1_short = mx.fast.metal_kernel(
+            name=f"rows_sdpa_staged_short_b{B}",
+            input_names=ins_base,
+            output_names=["o1"],
+            source=_STAGED_SHORT_SRC.replace("SELECT_KV", sel),
+            header=_STAGED_HEADER,
+            ensure_row_contiguous=False,
+        )
+        s1_2p = mx.fast.metal_kernel(
+            name=f"rows_sdpa_staged_2p_b{B}",
+            input_names=ins_base,
+            output_names=["partials", "sums", "maxs"],
+            source=_STAGED_2PASS_SRC.replace("SELECT_KV", sel),
+            header=_STAGED_HEADER,
+            ensure_row_contiguous=False,
+        )
+        s1_mix = mx.fast.metal_kernel(
+            name=f"rows_sdpa_staged_mix_b{B}",
+            input_names=ins_base,
+            output_names=["o1", "partials", "sums", "maxs"],
+            source=_STAGED_MIXED_SRC.replace("SELECT_KV", sel),
+            header=_STAGED_HEADER,
+            ensure_row_contiguous=False,
+        )
+        s2 = _staged_kernels.get("s2")
+        if s2 is None:
+            s2 = _staged_kernels["s2"] = mx.fast.metal_kernel(
+                name="rows_sdpa_staged_s2",
+                input_names=["partials", "sums", "maxs", "o1", "meta", "qkv"],
+                output_names=["out"],
+                source=_STAGED_S2_SRC,
+                header=_HEADER,
+                ensure_row_contiguous=False,
+            )
+        ks = _staged_kernels[B] = (s1_short, s1_2p, s1_mix, s2)
+    return ks
+
+
+def sdpa_rows_staged(
+    q, ks_main, vs_main, stage, kv_new, pb, qkv_flat, gate_off, gate_stride, sink_off, sink_stride, meta,
+    *, scale, window, kv_layer_idx, st_len, scap=32, meta_arr=None, Ss=None,
+):
+    """Exact B-row decode attention over unpacked main KV + 32-slot stage + current kv_new, fused with gate epilogue."""
+    B = q.shape[0]
+    assert 1 <= B <= MAX_ROWS
+    assert q.dtype == mx.bfloat16 and q.shape[-1] == 128
+    Hq = q.shape[1]
+    Hkv = ks_main[0].shape[1]
+    gqa = Hq // Hkv
+    assert Hq == gqa * Hkv and 3 <= gqa <= 5
+    R = pb.shape[-1]
+    if q.ndim != 3:
+        q = q.reshape(B, Hq, 128)
+    qc = mx.contiguous(q)
+    pbc = mx.contiguous(pb.reshape(B, Hq, R) if pb.ndim != 3 else pb)
+    if meta_arr is not None:
+        mta = meta_arr
+        assert Ss is not None and len(Ss) == B
+    else:
+        mt_key = tuple(meta)
+        mta = _STAGED_META_CACHE.get(mt_key)
+        if mta is None:
+            if len(_STAGED_META_CACHE) >= 256:
+                _STAGED_META_CACHE.clear()
+            mt = np.empty((B, _SMW), np.int32)
+            for i, row in enumerate(meta):
+                mt[i] = row
+            mta = _STAGED_META_CACHE[mt_key] = mx.array(mt)
+        Ss = tuple(int(row[0]) for row in meta)
+    max_s = max(Ss)
+    blocks = _blocks(max_s, gqa)
+    assert blocks == 128
+    has2 = max_s >= _TWO_PASS_N
+    all2 = min(Ss) >= _TWO_PASS_N
+    sck = float(scale)
+    sc = _SCALE_CACHE.get(sck)
+    if sc is None:
+        sc = _SCALE_CACHE[sck] = mx.array([sck], mx.float32)
+    st_key = (int(kv_layer_idx), int(scap), int(st_len))
+    st_info = _ST_INFO_CACHE.get(st_key)
+    if st_info is None:
+        if len(_ST_INFO_CACHE) >= 4096:
+            _ST_INFO_CACHE.clear()
+        st_info = _ST_INFO_CACHE[st_key] = mx.array(st_key, mx.int32)
+    s1_short, s1_2p, s1_mix, s2 = _get_staged_kernels(B)
+    ins = [qc, pbc, qkv_flat, mta, sc, st_info, stage, kv_new] + list(ks_main) + list(vs_main)
+    if not has2:
+        ns_env = os.environ.get("LOOPLING_SDPA1_NS", "0")
+        ns = int(ns_env) if ns_env and ns_env != "0" else (32 if B <= 2 else 8)
+        tmpl = [
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", B), ("MW", _SMW),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("R", R), ("WIN", int(window)),
+            ("NS", ns), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", int(gate_stride)),
+            ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+        ]
+        (o1,) = s1_short(
+            inputs=ins,
+            template=tmpl,
+            grid=(B * Hq * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(B, Hq * 128)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return o1
+    n2 = B * Hq * blocks
+    if all2:
+        ns = gqa
+        tgpk = (blocks * gqa + ns - 1) // ns
+        ntg = B * Hkv * tgpk
+        tmpl = [
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", B), ("MW", _SMW),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("BLOCKS", blocks), ("R", R),
+            ("WIN", int(window)), ("NS", ns), ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+        ]
+        partials, sums, maxs = s1_2p(
+            inputs=ins,
+            template=tmpl,
+            grid=(ntg * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(n2 * 128,), (n2,), (n2,)],
+            output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+        )
+        o1 = _DUMMY_GATE
+    else:
+        ns = 32
+        tgpk = (blocks * gqa + ns - 1) // ns
+        ntg = sum(Hkv * tgpk if s >= _TWO_PASS_N else Hq for s in Ss)
+        tmpl = [
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", B), ("MW", _SMW),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("BLOCKS", blocks), ("R", R),
+            ("WIN", int(window)), ("NS", ns), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", int(gate_stride)),
+            ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+        ]
+        o1, partials, sums, maxs = s1_mix(
+            inputs=ins,
+            template=tmpl,
+            grid=(ntg * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(B, Hq * 128), (n2 * 128,), (n2,), (n2,)],
+            output_dtypes=[mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
+        )
+    (out,) = s2(
+        inputs=[partials, sums, maxs, o1, mta, qkv_flat],
+        template=[
+            ("T", mx.bfloat16), ("MW", _SMW), ("HQ", Hq), ("BLOCKS", blocks),
+            ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", int(gate_stride)),
+        ],
+        grid=(B * Hq * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(B, Hq * 128)],
         output_dtypes=[mx.bfloat16],
     )
     return out

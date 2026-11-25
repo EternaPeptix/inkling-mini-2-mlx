@@ -17,8 +17,8 @@ from mlx_lm.models.inkling2.rows import rowlocal as RL
 
 f32 = mx.float32
 import os as _os
-K1 = "k1" in set(filter(None, _os.environ.get("LOOPLING_BD_FUSED", "").split(",")))
-ROUTE = _os.environ.get("LOOPLING_BD_ROUTE", "kernel")
+K1 = "k1" in set(filter(None, _os.environ.get("LOOPLING_BD_FUSED", "pre,k1,post,head").split(",")))
+ROUTE = _os.environ.get("LOOPLING_BD_ROUTE", "auto")
 # timing-only ablation (NOT exact; needs LOOPLING_COMPILE_DECODE=2): stages listed in LOOPLING_BD_FREEZE return their
 # first output forever (so their kernels drop out of later steps).  Stages: k1 qkv mid rel oproj k10 gates moe sdpa
 FREEZE = set(filter(None, _os.environ.get("LOOPLING_BD_FREEZE", "").split(",")))
@@ -46,10 +46,19 @@ def frz(name, key, fn, *a, **k):
         leaves = [x for x in (extra if isinstance(extra, (tuple, list)) else
                               (extra.values() if isinstance(extra, dict) else [extra])) if isinstance(x, mx.array)]
         if isinstance(out, dict):
-            ks = list(out)
-            return dict(zip(ks, mx.depends([out[q] for q in ks], leaves)))
+            ks = [q for q in out if isinstance(out[q], mx.array)]
+            if not ks or not leaves:
+                return out
+            res = dict(out)
+            res.update(zip(ks, mx.depends([out[q] for q in ks], leaves)))
+            return res
         if isinstance(out, (tuple, list)):
-            return type(out)(mx.depends(list(out), leaves))
+            arr_i = [i for i, x in enumerate(out) if isinstance(x, mx.array)]
+            dep = mx.depends([out[i] for i in arr_i], leaves) if arr_i and leaves else []
+            res = list(out)
+            for i, d in zip(arr_i, dep):
+                res[i] = d
+            return type(out)(res)
         return mx.depends([out], leaves)[0]
     if name not in FREEZE:
         return fn(*a, **k)
@@ -95,10 +104,12 @@ def _inputs(layer, h, bs, msg, sliding):
 
 def _gates(gs, srcs, msg2, slots, gate_ins):
     """MessageGates for G gates: K2 down (one launch) + K3 forget/message + combine (one launch). Returns (B,G,D) f32."""
-    x = gate_ins[0][:, None] if len(gate_ins) == 1 else mx.stack(gate_ins, axis=1)
-    down = RP.gate_down_rows(x, [g.down_proj.weight for g in gs])
-    return RP.gate_mix_rows(down, list(srcs), msg2, slots, [g.forget_gate_proj.weight for g in gs],
-                            [g.message_gate_proj.weight for g in gs])
+    x = gate_ins if isinstance(gate_ins, mx.array) else (
+        gate_ins[0][:, None] if len(gate_ins) == 1 else mx.stack(gate_ins, axis=1)
+    )
+    down = RP.gate_down_rows(x, [g["down_proj"]["weight"] for g in gs])
+    return RP.gate_mix_rows(down, list(srcs), msg2, slots, [g["forget_gate_proj"]["weight"] for g in gs],
+                            [g["message_gate_proj"]["weight"] for g in gs])
 
 
 def _inputs_k1(layer, h, bs, msg):
@@ -111,14 +122,14 @@ def _inputs_k1(layer, h, bs, msg):
     if msg is None:
         return nr, r["q_in"], r["k_in"], r["v_in"]
     gs = (layer.q_message_gate, layer.k_message_gate, layer.v_message_gate)
-    mixed = _gates(gs, (r["s_q"], r["s_k"], r["s_v"]), m2, (0, 1, 2), (r["q_gate_in"], r["k_gate_in"], r["v_gate_in"]))
+    mixed = _gates(gs, (r["s_q"], r["s_k"], r["s_v"]), m2, (0, 1, 2), r["qkv_gate_in"])
     q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
     return nr, q_in, k_in, v_in
 
 
-def make_post(layer, has_bs, has_msg):
-    """K9 (attn*sigmoid(gate) ops + qmv_rows o_proj) + K10 POST + [mlp gate + K3b] + K11-13 moe_rows.
-    Same signature / outputs as fastdecode.make_s2."""
+def make_post(layer, has_bs, has_msg, *, gated=False):
+    """K9 (o_proj) + K10 POST + [mlp gate + K3b] + K11-13 moe_rows.
+    When `gated=True`, SDPA already multiplied attn_out by sigmoid(gate) on store, so o_proj uses plain qmv_rows."""
 
     def post(layer, h, nr, attn_out, gate, w0, w1, cs2, cs3, *rest):
         a = layer.self_attn
@@ -127,19 +138,22 @@ def make_post(layer, has_bs, has_msg):
         msg = rest.pop(0) if has_msg else None
         B, D = h.shape[0], h.shape[-1]
         lk = (id(layer), has_msg)
-        op = frz("oproj", lk, RP.oproj_rows, attn_out.reshape(B, -1), gate.reshape(B, -1), *_qw(a.o_proj))
+        if gated:
+            op = frz("oproj", lk, RQ.qmv_rows, attn_out.reshape(B, -1), *_qw(a.o_proj))
+        else:
+            op = frz("oproj", lk, RP.oproj_rows, attn_out.reshape(B, -1), gate.reshape(B, -1), *_qw(a.o_proj))
         bs2 = None if bs is None else bs.reshape(bs.shape[0], B, D)
         m2 = None if msg is None else msg.reshape(B, 4, D)
-        r = frz("k10", lk, RL.k10_post_layer, layer, op, h.reshape(B, D), nr.reshape(B, D), bs2, cs2, m2)
+        r = frz("k10", lk, RL.k10_post_layer, layer, op, h.reshape(B, D), nr.reshape(B, D), bs2, cs2, m2, debug=False)
         if layer.is_block_boundary:
             block = nr[None]
             bs = block if bs is None else mx.concatenate([bs, block])
         if msg is None:
-            x = r["mlp_x"]
-        else:
-            mixed = frz("gates", lk + ("mlp",), _gates, (layer.mlp_message_gate,), (r["mlp_src"],), m2, (3,),
-                        (r["mlp_gate_in"],))
-            (x,) = frz("gates", lk + ("mlpn",), RL.k3b_norm_layer, layer, mixed, mlp=True)
+            e = frz("moe", lk, RMo.moe_rows, layer, r["mlp_x"], r["residual"], cs3, route=ROUTE)
+            return (e["out"].reshape(B, 1, D), bs, w0, w1, r["w2"], e["w3"])
+        mixed = frz("gates", lk + ("mlp",), _gates, (layer.mlp_message_gate,), (r["mlp_src"],), m2, (3,),
+                    (r["mlp_gate_in"],))
+        (x,) = frz("gates", lk + ("mlpn",), RL.k3b_norm_layer, layer, mixed, mlp=True)
         if not MOE:
             from mlx_lm.models.inkling2 import fastdecode as FD
             hid, w3 = FD._sc(layer.post_mlp_convolution, layer.mlp(x[:, None]), cs3)
@@ -154,6 +168,11 @@ def make_post(layer, has_bs, has_msg):
 def make_pre(layer, has_bs, has_msg):
     """K1 (module ops) + K4 (qmv_rows_multi, 1-3 launches) + K5 (mid_rows, 1 launch) + K6 (rel_logits_rows, 1 launch)."""
     sliding = isinstance(layer, L.SlidingDecoderLayer)
+    rel_w_bf = mx.contiguous(layer.self_attn.rel_logits_proj.proj.astype(mx.bfloat16))
+    fuse_rel = (
+        rel_w_bf.dtype == mx.bfloat16 and rel_w_bf.shape == (16, 1024) and layer.self_attn.num_heads == 24
+        and "rel" not in DUP and "rel" not in FREEZE and not SYNC
+    )
 
     def pre(layer, h, *rest):
         a = layer.self_attn
@@ -170,25 +189,44 @@ def make_pre(layer, has_bs, has_msg):
             nr, q_in, k_in, v_in = _inputs(layer, h, bs, msg, sliding)
         kw = vw = None
         if K1:
-            d = frz("qkv", lk, RP.qkv_rows, a, q_in.reshape(B, D), k_in.reshape(B, D), v_in.reshape(B, D))
-            qp, rp, gate, sinks, kp, vp = (d[n] for n in ("q_proj", "r_proj", "gate", "sinks", "k_proj", "v_proj"))
-            kw, vw = d.get("k_wproj"), d.get("v_wproj")
-        elif sliding and q_in is k_in and k_in is v_in:
-            xq = q_in.reshape(B, D)
-            qp, rp, gate, sinks, kp, vp = RQ.qmv_rows_multi(
-                xq, [_qw(a.q_proj), _qw(a.r_proj), _qw(a.gate_proj), _qw(a.sink_proj), _qw(a.k_proj), _qw(a.v_proj)])
-        else:
-            xq = q_in.reshape(B, D)
-            qp, rp, gate, sinks = RQ.qmv_rows_multi(xq, [_qw(a.q_proj), _qw(a.r_proj), _qw(a.gate_proj), _qw(a.sink_proj)])
-            if sliding:
-                (kp,) = RQ.qmv_rows_multi(k_in.reshape(B, D), [_qw(a.k_proj)])
-                (vp,) = RQ.qmv_rows_multi(v_in.reshape(B, D), [_qw(a.v_proj)])
+            qkv_flat, qkv_lay = frz("qkv", lk, RP.qkv_rows, a, q_in.reshape(B, D), k_in.reshape(B, D), v_in.reshape(B, D),
+                                    flat=True)
+            dm = {item[0]: (item[1], item[2], item[-1]) for item in qkv_lay}
+            def _ext_qkv(nm):
+                off, st, nc = dm[nm]
+                if B == 1 or st == nc:
+                    return qkv_flat[off:off + B * nc].reshape(B, nc)
+                return mx.stack([qkv_flat[off + b * st : off + b * st + nc] for b in range(B)], axis=0)
+            gate = _ext_qkv("gate")
+            sinks = _ext_qkv("sinks")
+            if fuse_rel:
+                q, k, v, pb, w0, w1 = frz(
+                    "mid", lk, RM.mid_rows_flat, layer, qkv_flat, qkv_lay, cs0, cs1,
+                    tau=None if sliding else tau.reshape(-1), rel_w=rel_w_bf)
             else:
-                kp, kw = RQ.qmv_rows_multi(k_in.reshape(B, D), [_qw(a.k_proj), _qw(a.k_sconv.weight_proj)])
-                vp, vw = RQ.qmv_rows_multi(v_in.reshape(B, D), [_qw(a.v_proj), _qw(a.v_sconv.weight_proj)])
-        q, k, v, rel, w0, w1 = frz("mid", lk, RM.mid_rows, layer, qp, rp, kp, vp, cs0, cs1,
-                                   tau=None if sliding else tau.reshape(-1), k_wproj=kw, v_wproj=vw)
-        pb = frz("rel", lk, RG.rel_logits_rows, rel, a.rel_logits_proj.proj.astype(rel.dtype))
+                q, k, v, rel, w0, w1 = frz(
+                    "mid", lk, RM.mid_rows_flat, layer, qkv_flat, qkv_lay, cs0, cs1,
+                    tau=None if sliding else tau.reshape(-1))
+                rw = rel_w_bf if rel.dtype == mx.bfloat16 else a.rel_logits_proj.proj.astype(rel.dtype)
+                pb = frz("rel", lk, RG.rel_logits_rows, rel, rw)
+        else:
+            if sliding and q_in is k_in and k_in is v_in:
+                xq = q_in.reshape(B, D)
+                qp, rp, gate, sinks, kp, vp = RQ.qmv_rows_multi(
+                    xq, [_qw(a.q_proj), _qw(a.r_proj), _qw(a.gate_proj), _qw(a.sink_proj), _qw(a.k_proj), _qw(a.v_proj)])
+            else:
+                xq = q_in.reshape(B, D)
+                qp, rp, gate, sinks = RQ.qmv_rows_multi(xq, [_qw(a.q_proj), _qw(a.r_proj), _qw(a.gate_proj), _qw(a.sink_proj)])
+                if sliding:
+                    (kp,) = RQ.qmv_rows_multi(k_in.reshape(B, D), [_qw(a.k_proj)])
+                    (vp,) = RQ.qmv_rows_multi(v_in.reshape(B, D), [_qw(a.v_proj)])
+                else:
+                    kp, kw = RQ.qmv_rows_multi(k_in.reshape(B, D), [_qw(a.k_proj), _qw(a.k_sconv.weight_proj)])
+                    vp, vw = RQ.qmv_rows_multi(v_in.reshape(B, D), [_qw(a.v_proj), _qw(a.v_sconv.weight_proj)])
+            q, k, v, rel, w0, w1 = frz("mid", lk, RM.mid_rows, layer, qp, rp, kp, vp, cs0, cs1,
+                                       tau=None if sliding else tau.reshape(-1), k_wproj=kw, v_wproj=vw)
+            rw = rel_w_bf if rel.dtype == mx.bfloat16 else a.rel_logits_proj.proj.astype(rel.dtype)
+            pb = frz("rel", lk, RG.rel_logits_rows, rel, rw)
         # layouts of fastdecode s1: q/k/v (B,H,1,128), pb (B,1,H,R), sinks (B,1,H), gate (B,1,q_dim)
         return (q[:, :, None, :], k[:, :, None, :], v[:, :, None, :], pb[:, None], sinks[:, None], gate[:, None],
                 w0, w1, nr)

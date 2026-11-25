@@ -415,6 +415,24 @@ def generate_step(
         nonlocal tokens
 
         with mx.stream(stream):
+            if (
+                not logits_processors
+                and input_tokens.size == 1
+                and input_embeddings is None
+                and hasattr(model, "decode_step_logprobs")
+            ):
+                res = model.decode_step_logprobs(
+                    input_tokens[None],
+                    cache=prompt_cache,
+                    greedy=(sampler is greedy_sampler),
+                )
+                if res is not None:
+                    sampled, logprobs = res
+                    quantize_cache_fn(prompt_cache)
+                    if sampled is None:
+                        sampled = sampler(logprobs)
+                    return sampled, logprobs.squeeze(0)
+
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(

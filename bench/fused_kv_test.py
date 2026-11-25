@@ -49,13 +49,13 @@ def bits(a):
     return np.array(a.view(mx.uint16)).reshape(-1)
 
 
-def run(kind, B, seed, lens, steps=T, pbdt=mx.bfloat16):
+def run(kind, B, seed, lens, steps=T, pbdt=mx.bfloat16, gated=False, paged=None):
     window = WIN if kind == "s" else 0
     layer = SimpleNamespace(self_attn=SimpleNamespace(sliding_window=window, scaling=SCALE))
     specs = lens[:B]
     rows = [build(kind, sp, seed * 100 + i) for i, sp in enumerate(specs)]
     ref = [r[0] for r in rows]
-    store = RowKV([r[1] for r in rows])
+    store = RowKV([r[1] for r in rows], paged=paged)
     rs = np.random.RandomState(seed + 5)
     bad = 0
     nel = 0
@@ -65,10 +65,14 @@ def run(kind, B, seed, lens, steps=T, pbdt=mx.bfloat16):
         v = mx.array((rs.randn(B, HKV, 1, D) * 1.5).astype(np.float32)).astype(mx.bfloat16)
         pb = mx.array((2 * rs.randn(B, 1, H, R)).astype(np.float32)).astype(pbdt)
         sk = mx.array(rs.randn(B, 1, H).astype(np.float32)).astype(mx.bfloat16)
+        gate = mx.array(rs.randn(B, 1, H * D).astype(np.float32)).astype(mx.bfloat16) if gated else None
         outs = [fastdecode._core(layer, q[i : i + 1], k[i : i + 1], v[i : i + 1], pb[i : i + 1], sk[i : i + 1], ref[i])
                 for i in range(B)]
+        if gated:
+            g4 = gate.reshape(B, 1, H, D).astype(mx.float32)
+            outs = [(outs[i].astype(mx.float32) * mx.sigmoid(g4[i : i + 1])).astype(mx.bfloat16) for i in range(B)]
         store.update(k.reshape(B, HKV, D), v.reshape(B, HKV, D))
-        o = store.sdpa(q, pb, sk, scale=SCALE, window=window)
+        o = store.sdpa(q, pb, sk, scale=SCALE, window=window, gate=gate)
         mx.eval(outs + [o])
         for i in range(B):
             a, b = bits(outs[i]), bits(o[i : i + 1])
@@ -86,6 +90,9 @@ def run(kind, B, seed, lens, steps=T, pbdt=mx.bfloat16):
             assert x.shape == y.shape, (kind, i, x.shape, y.shape)
             cbad += int((bits(x) != bits(y)).sum())
     return bad, cbad, nel, [s[0] for s in specs]
+
+
+STAGGERED = [(17, 0), (255, 0), (256, 0), (257, 0), (1023, 0), (1024, 0), (2049, 0), (8192, 0)]
 
 
 def main():
@@ -113,6 +120,13 @@ def main():
         bad, cbad, nel, pl = run(kind, 4, 77, [(1500, 0), (5000, 0), (1100, 0), (2048, 512)])
         allok &= bad == 0 and cbad == 0
         print(f"{kind} all>=1024 B=4: attn {bad} cache {cbad}", flush=True)
+    # staggered page (256) and 2-pass (1024) boundary crossing over T=300 decode steps, gated & ungated
+    if not quick:
+        for kind in ("f", "s"):
+            for g in (False, True):
+                bad, cbad, nel, _ = run(kind, 8, 123 + int(g), STAGGERED, steps=300, gated=g)
+                allok &= bad == 0 and cbad == 0
+                print(f"{kind} staggered-300 gate={g}: attn {bad} / {nel // 1000}k cache {cbad}", flush=True)
     # a plan shared by two stores with identical row state (as the lead would use it: one plan per visit kind)
     shared()
     print(f"SUMMARY {'ALL PASS' if allok else 'FAIL'} ({time.time() - t0:.0f}s)")
@@ -131,8 +145,18 @@ def shared():
         p = s1.plan()
         s1.update(k, k, p)
         s2.update(k, k, p)
-    mx.eval(s1.K, s2.K)
-    assert (bits(s1.K) == bits(s2.K)).all()
+    if s1.paged:
+        mx.eval(s1.base_K, s1.ov_K, s1.act_K, s2.base_K, s2.ov_K, s2.act_K)
+        assert (bits(s1.base_K) == bits(s2.base_K)).all()
+        assert (bits(s1.ov_K) == bits(s2.ov_K)).all()
+        assert (bits(s1.act_K) == bits(s2.act_K)).all()
+        s1.to_caches()
+        s2.to_caches()
+        for c1, c2 in zip(s1.caches, s2.caches):
+            assert (bits(c1.keys) == bits(c2.keys)).all()
+    else:
+        mx.eval(s1.K, s2.K)
+        assert (bits(s1.K) == bits(s2.K)).all()
     print("shared plan ok", flush=True)
 
 

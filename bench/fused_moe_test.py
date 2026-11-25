@@ -15,6 +15,7 @@ from mlx_lm import load
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2 import fused_ref as FR
 from mlx_lm.models.inkling2.rows import moe as M
+from mlx_lm.models.inkling2.rows import rowlocal as RL
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--layers", default=",".join(str(i) for i in range(24)))

@@ -21,9 +21,54 @@ import mlx.core as mx
 _MODE = os.environ.get("LOOPLING_COMPILE_DECODE", "1")
 _COMPILE = _MODE == "1"
 _FCONV = os.environ.get("LOOPLING_FUSED_CONV", "1") not in ("0", "")
+_FD_FUSED = os.environ.get("LOOPLING_FD_FUSED", "1") not in ("0", "")
 _ctx: dict = {}
 _tau: dict = {}
+_wpos_cache: dict = {}
 _fds: dict = {}  # id(layer) -> compiled segments; the entry is removed when the layer dies
+_RM_MODS = None
+
+
+def _mods():
+    global _RM_MODS
+    if _RM_MODS is None:
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+        from mlx_lm.models.inkling2 import layers as L
+        from mlx_lm.models.inkling2.rows import mid as RM
+        from mlx_lm.models.inkling2.rows import moe as RMo
+        from mlx_lm.models.inkling2.rows import proj as RP
+        from mlx_lm.models.inkling2.rows import qmv as RQ
+        from mlx_lm.models.inkling2.rows import rowlocal as RL
+        from mlx_lm.models.inkling2.rows import sdpa as RS
+        from mlx_lm.models.inkling2.rows import visit as RV
+        _RM_MODS = (KVCache, RotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV)
+    return _RM_MODS
+
+
+def _wpos(pos: int) -> mx.array:
+    a = _wpos_cache.get(pos)
+    if a is None:
+        if len(_wpos_cache) >= 256:
+            _wpos_cache.clear()
+        a = _wpos_cache[pos] = mx.array([pos], mx.int32)
+    return a
+
+
+def _rel_w_bf(rel_proj) -> mx.array:
+    p = rel_proj.proj
+    c = getattr(rel_proj, "_fd_bf_cache", None)
+    if c is None or c[0] is not p:
+        c = rel_proj._fd_bf_cache = (p, mx.contiguous(p.astype(mx.bfloat16)))
+    return c[1]
+
+
+def _is_aff8(m) -> bool:
+    return (
+        getattr(m, "mode", None) == "affine"
+        and getattr(m, "bits", None) == 8
+        and getattr(m, "group_size", None) == 64
+        and "bias" not in m
+    )
 
 
 def eligible(h, cache, conv_mask) -> bool:
@@ -42,7 +87,7 @@ def eligible(h, cache, conv_mask) -> bool:
     kv = cache[0]
     if isinstance(kv.offset, mx.array) and getattr(kv, "_fd_delta", None) is None:
         return False
-    return kv.keys is not None
+    return getattr(kv, "_packed", None) is not None or isinstance(kv.keys, mx.array)
 
 
 def _end(kv):
@@ -289,7 +334,169 @@ def _core(layer, q, k, v, pb, sinks, kv):
     return o.transpose(0, 2, 1, 3)
 
 
+def _fused_b1_ok_layer(layer) -> bool:
+    _, _, L, _, _, _, _, _, _, _ = _mods()
+    if not L._use_kernels():
+        return False
+    a = layer["self_attn"]
+    if a.num_heads != 24 or a.num_key_value_heads != 8 or a.head_dim != 128:
+        return False
+    if (
+        a["q_l2_clip"]["scale"].shape != (24, 128)
+        or a["rel_l2_clip"]["scale"].shape != (24, 16)
+        or a["rel_logits_proj"]["proj"].shape != (16, 1024)
+    ):
+        return False
+    ks, vs = a["k_sconv"], a["v_sconv"]
+    pac, pmc = layer["post_attention_convolution"], layer["post_mlp_convolution"]
+    if ks.kernel_size != 4 or vs.kernel_size != 4 or pac.kernel_size != 4 or pmc.kernel_size != 4:
+        return False
+    ai = dict.get(layer, "attention_input")
+    if (
+        pac["conv1d"]["weight"].dtype != mx.bfloat16
+        or pmc["conv1d"]["weight"].dtype != mx.bfloat16
+        or layer["post_attention_layernorm"]["weight"].dtype != mx.bfloat16
+        or layer["mlp_input"]["query"].dtype != mx.float32
+        or (ai is not None and ai["query"].dtype != mx.float32)
+    ):
+        return False
+    projs = [a["q_proj"], a["r_proj"], a["gate_proj"], a["sink_proj"], a["k_proj"], a["v_proj"], a["o_proj"]]
+    if isinstance(layer, L.SlidingDecoderLayer):
+        if (
+            layer["input_layernorm"]["weight"].dtype != mx.bfloat16
+            or ks["conv1d"]["weight"].dtype != mx.bfloat16
+            or vs["conv1d"]["weight"].dtype != mx.bfloat16
+        ):
+            return False
+    else:
+        if (
+            layer["q_input_layernorm"]["weight"].dtype != mx.bfloat16
+            or layer["k_input_layernorm"]["weight"].dtype != mx.bfloat16
+            or layer["v_input_layernorm"]["weight"].dtype != mx.bfloat16
+        ):
+            return False
+        projs += [ks["weight_proj"], vs["weight_proj"]]
+    if not all(_is_aff8(m) for m in projs):
+        return False
+    mlp = layer["mlp"]
+    if getattr(mlp, "sharding_group", None) is not None:
+        return False
+    gate = mlp["gate"]
+    if gate["weight"].dtype != mx.float32 or gate["weight"].shape != (128, 2304) or gate.top_k != 8:
+        return False
+    ex = mlp["experts"]
+    gu_m, dn_m = ex["gate_up_proj"], ex["down_proj"]
+    if (
+        getattr(gu_m, "mode", None) not in ("nvfp4", "mxfp8")
+        or getattr(dn_m, "mode", None) != gu_m.mode
+        or "biases" in gu_m
+        or "biases" in dn_m
+    ):
+        return False
+    return True
+
+
+def _fused_b1_ok(layer, h, conv) -> bool:
+    return (
+        _FD_FUSED
+        and _FCONV
+        and h.dtype == mx.bfloat16
+        and h.shape == (1, 1, 2304)
+        and not getattr(conv, "record", False)
+        and all(c.dtype == mx.float32 for c in conv.cache)
+        and _fused_b1_ok_layer(layer)
+    )
+
+
+def _decode_layer_fused_b1(layer, h, bs, cache, messages):
+    KVCache, RotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV = _mods()
+    conv = cache[1]
+    kv = cache[0]
+    cs = conv.cache
+    a = layer["self_attn"]
+    sliding = "input_layernorm" in layer
+    h2 = h.reshape(1, 2304)
+    bs_is_list = isinstance(bs, list)
+    bs_in = None if (bs is None or (bs_is_list and not bs)) else (bs if bs_is_list else bs.reshape(bs.shape[0], 1, 2304))
+    m2 = None if messages is None else messages.reshape(1, 4, 2304)
+
+    r1 = RL.k1_pre_layer(layer, h2, bs_in, m2)
+    nr = r1["normed_residual"]
+    if m2 is None:
+        q_in, k_in, v_in = r1["q_in"], r1["k_in"], r1["v_in"]
+    else:
+        gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
+        mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), m2, (0, 1, 2), r1["qkv_gate_in"])
+        q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
+
+    qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
+    if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
+        gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
+    else:
+        dm = {nm: off for nm, off, _ in qkv_lay}
+        gate_off, sink_off = dm["gate"], dm["sinks"]
+    tau_1d = None if sliding else _full_tau(layer, _end(kv)).reshape(-1)
+    rel_w_bf = _rel_w_bf(a["rel_logits_proj"])
+
+    use_packed_kv = (
+        type(kv) in (KVCache, RotatingKVCache)
+        and getattr(kv, "keep", 0) == 0
+        and getattr(kv, "_fd_delta", None) is None
+        and (
+            (kv._packed is not None and kv._packed.dtype == mx.bfloat16 and kv._packed.shape[1] == 8 and kv._packed.shape[3] == 128)
+            or (kv._keys is not None and kv._keys.dtype == mx.bfloat16 and kv._keys.shape[0] == 1 and kv._keys.shape[1] == 8 and kv._keys.shape[3] == 128)
+        )
+    )
+    op_m = a["o_proj"]
+    if use_packed_kv:
+        if kv._packed is None:
+            kv.pack_b1()
+        q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
+            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=True
+        )
+        kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, _wpos)
+        attn_out = RS.sdpa_b1_packed(
+            q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap,
+            scale=a.scaling, window=a.sliding_window or 0,
+        )
+        op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
+    else:
+        q, kk, vv, pb, w0, w1 = RM.mid_rows_flat(
+            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=False
+        )
+        gate = qkv_flat[gate_off : gate_off + 3072].reshape(1, 3072)
+        sinks = qkv_flat[sink_off : sink_off + 24].reshape(1, 1, 24)
+        attn_out = _core(layer, q[:, :, None, :], kk[:, :, None, :], vv[:, :, None, :], pb[:, None], sinks, kv)
+        op = RP.oproj_rows(attn_out, gate, op_m["weight"], op_m["scales"], op_m["biases"])
+
+    r10 = RL.k10_post_layer(layer, op, h2, nr, bs_in, cs[2], m2, debug=False)
+    if layer.is_block_boundary:
+        if bs_is_list:
+            bs_new = bs + [nr]
+        else:
+            block = nr.reshape(1, 1, 1, 2304)
+            bs_new = block if bs is None else mx.concatenate([bs, block])
+    else:
+        bs_new = bs
+
+    if m2 is None:
+        x_mlp = r10["mlp_x"]
+    else:
+        mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), m2, (3,), (r10["mlp_gate_in"],))
+        (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
+    e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE)
+    conv[0], conv[1], conv[2], conv[3] = w0, w1, r10["w2"], e["w3"]
+    conv.advance(1)
+    return e["out"].reshape(1, 1, 2304), bs_new
+
+
 def decode_layer(layer, h, bs, cache, messages):
+    if _fused_b1_ok(layer, h, cache[1]):
+        return _decode_layer_fused_b1(layer, h, bs, cache, messages)
+    if isinstance(bs, list):
+        bs = None if not bs else mx.stack(bs, axis=0)[:, :, None, :]
+    if messages is not None and messages.ndim == 3:
+        messages = messages[:, None, :, :]
     fd = _get_fd(layer)
     from mlx_lm.models.inkling2 import layers as L
 

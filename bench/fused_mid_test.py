@@ -9,7 +9,8 @@ from mlx_lm import load
 from mlx_lm.models.inkling2 import fused_ref as FR
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2 import layers as L
-from mlx_lm.models.inkling2.rows.mid import mid_rows
+from mlx_lm.models.inkling2.rows.mid import mid_rows, mid_rows_flat
+from mlx_lm.models.inkling2.rows import gemv as RG, proj as RP
 
 VD = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/loopling-opt/runs/visits_p3")
 model, tok = load(os.path.expanduser("~/loopling/models/loopling-p3"))
@@ -57,8 +58,8 @@ def real_row(i):
     d = mx.load(os.path.join(VD, v["file"]))
     cs = [d["cs%d" % j] for j in range(4)]
     T = FR.visit_ref(layers[v["layer"]], d["h"], d.get("bs"), d.get("msg"), cs, d["attn_out"], d.get("tau"))
-    row = dict(q=T["q_proj"], r=T["r_proj"], kr=T["k_proj"], vr=T["v_proj"], k_in=T["k_in"], v_in=T["v_in"],
-               cs0=cs[0], cs1=cs[1], tau=d.get("tau"), T=T)
+    row = dict(q=T["q_proj"], r=T["r_proj"], kr=T["k_proj"], vr=T["v_proj"], q_in=T["q_in"], k_in=T["k_in"],
+               v_in=T["v_in"], cs0=cs[0], cs1=cs[1], tau=d.get("tau"), T=T)
     mx.eval([x for x in row.values() if isinstance(x, mx.array)] + [T[k] for k in ("q", "k", "v", "rel", "w0", "w1")])
     _cacheT[i] = row
     return row
@@ -150,4 +151,33 @@ for li, layer in enumerate(layers):
 print("\n%-12s %3s %6s %12s %10s" % ("source/kind", "B", "cases", "elements", "mismatch"))
 for (kind, B), (c, m, e) in sorted(table.items()):
     print("%-12s %3d %6d %12d %10d" % (kind, B, c, e, m))
+
+# ---- fused flat + rel_w MMA test (sliding and full, B in {1,2,3,5,8})
+for li in (0, 5, 6, 11, 18, 23):
+    layer = layers[li]
+    a = layer.self_attn
+    full = isinstance(layer, L.FullDecoderLayer)
+    H, HK = a.num_heads, a.num_key_value_heads
+    rw = mx.contiguous(a.rel_logits_proj.proj.astype(bf16))
+    ids_l = [i for i, v in enumerate(idx) if v["layer"] == li]
+    for B in BS:
+        rows = [real_row(ids_l[j % len(ids_l)]) for j in range(B)]
+        cat = lambda k, shp: mx.concatenate([r[k].reshape((1,) + shp) for r in rows], axis=0)
+        qi = cat("q_in", (2304,)); ki = cat("k_in", (2304,)); vi = cat("v_in", (2304,))
+        qf, ql = RP.qkv_rows(a, qi, ki, vi, flat=True)
+        tau = mx.concatenate([r["tau"].reshape(1) for r in rows]) if full else None
+        q, k, v, pb, w0, w1 = mid_rows_flat(layer, qf, ql, cat("cs0", (3, HK * 128)), cat("cs1", (3, HK * 128)), tau=tau, rel_w=rw)
+        mx.eval(q, k, v, pb, w0, w1)
+        refs = [mid_ref(layer, r["q"], r["r"], r["kr"], r["vr"], r["k_in"], r["v_in"], r["cs0"], r["cs1"], r["tau"]) for r in rows]
+        for ref in refs:
+            ref["pb"] = RG.rel_logits_rows(ref["rel"].reshape(1, H, 16), rw).reshape(H, -1)
+        mis = sum(nmis(out_t[b].reshape(refs[b][nm].shape), refs[b][nm])
+                  for out_t, nm in ((q, "q"), (k, "k"), (v, "v"), (pb, "pb"), (w0, "w0"), (w1, "w1"))
+                  for b in range(B))
+        cnt = sum(refs[b][nm].size for nm in ("q", "k", "v", "pb", "w0", "w1") for b in range(B))
+        total["cases"] += 1; total["mis"] += mis; total["elems"] += cnt
+        if mis:
+            print("MISMATCH fused_mid_rel L%d B=%d mis=%d" % (li, B, mis), flush=True)
+
 print("TOTAL cases %d elements %d mismatches %d -> %s" % (total["cases"], total["elems"], total["mis"], "PASS" if total["mis"] == 0 else "FAIL"))
+sys.exit(1 if total["mis"] else 0)

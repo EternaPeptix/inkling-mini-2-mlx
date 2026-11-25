@@ -338,15 +338,117 @@ class QuantizedKVCache(_BaseCache):
 
 class KVCache(_BaseCache):
     step = 256
+    _keys = None
+    _values = None
+    _packed = None
 
     def __init__(self):
-        self.keys = None
-        self.values = None
+        self._keys = None
+        self._values = None
+        self._packed = None
         self.offset = 0
 
-    def update_and_fetch(self, keys, values):
+    @property
+    def keys(self):
+        return self._packed[0][None] if self._packed is not None else self._keys
+
+    @keys.setter
+    def keys(self, v):
+        if self._packed is not None:
+            self._values = mx.contiguous(self._packed[1][None])
+            self._packed = None
+        self._keys = v
+
+    @property
+    def values(self):
+        return self._packed[1][None] if self._packed is not None else self._values
+
+    @values.setter
+    def values(self, v):
+        if self._packed is not None:
+            self._keys = mx.contiguous(self._packed[0][None])
+            self._packed = None
+        self._values = v
+
+    def pack_b1(self):
+        if self._packed is not None or self._keys is None:
+            return
+        self._packed = mx.contiguous(mx.stack([self._keys[0], self._values[0]], axis=0))
+        self._keys = self._values = None
+
+    def unpack_b1(self):
+        if self._packed is not None:
+            self._keys = mx.contiguous(self._packed[0][None])
+            self._values = mx.contiguous(self._packed[1][None])
+            self._packed = None
+
+    def update_packed_b1(self, kv_new, wpos_fn):
         prev = self.offset
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+        buf = self._packed
+        self._packed = None
+        cap = buf.shape[2]
+        if prev + 1 > cap:
+            if prev % self.step != 0:
+                buf = buf[:, :, :prev, :]
+            ext = mx.zeros((2, buf.shape[1], self.step, buf.shape[3]), buf.dtype)
+            buf = mx.concatenate([buf, ext], axis=2)
+            cap = buf.shape[2]
+        self.offset = prev + 1
+        self._packed = mx.slice_update(buf, kv_new, wpos_fn(prev), axes=(2,))
+        return self._packed, self.offset, self.offset, 0, 0, cap
+
+    def commit_packed_w(self, kv_new, keep, wpos_fn):
+        """Commit first `keep` slots from kv_new (2, Hkv, W, 128) into packed KV buffer."""
+        src = kv_new[:, :, :keep, :]
+        prev = self.offset
+        buf = self._packed
+        self._packed = None
+        cap = buf.shape[2]
+        if prev + keep > cap:
+            if prev % self.step != 0:
+                buf = buf[:, :, :prev, :]
+            need = prev + keep - buf.shape[2]
+            n_steps = (need + self.step - 1) // self.step
+            ext = mx.zeros((2, buf.shape[1], n_steps * self.step, buf.shape[3]), buf.dtype)
+            buf = mx.concatenate([buf, ext], axis=2)
+        self.offset = prev + keep
+        self._packed = mx.slice_update(buf, src, wpos_fn(prev), axes=(2,))
+        return self._packed
+
+    def commit_unpacked_w(self, k_chunk, v_chunk):
+        """Commit `(B, Hkv, keep, D)` keys/values into unpacked `_keys`/`_values`, advancing `offset`."""
+        if self._packed is not None:
+            self.unpack_b1()
+        keep = int(k_chunk.shape[2])
+        prev = self.offset
+        if self._keys is None or (prev + keep) > self._keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = k_chunk.shape
+            v_head_dim = v_chunk.shape[3]
+            if self._keys is None:
+                n_steps = (self.step + keep - 1) // self.step
+                self._keys = mx.zeros((B, n_kv_heads, n_steps * self.step, k_head_dim), k_chunk.dtype)
+                self._values = mx.zeros((B, n_kv_heads, n_steps * self.step, v_head_dim), v_chunk.dtype)
+            else:
+                cap = self._keys.shape[2]
+                if prev % self.step != 0 and cap % self.step != 0:
+                    self._keys = self._keys[..., :prev, :]
+                    self._values = self._values[..., :prev, :]
+                    cap = prev
+                target_cap = ((prev + keep + self.step - 1) // self.step) * self.step
+                add = target_cap - cap
+                ext_k = mx.zeros((B, n_kv_heads, add, k_head_dim), k_chunk.dtype)
+                ext_v = mx.zeros((B, n_kv_heads, add, v_head_dim), v_chunk.dtype)
+                self._keys = mx.concatenate([self._keys, ext_k], axis=2)
+                self._values = mx.concatenate([self._values, ext_v], axis=2)
+        self.offset = prev + keep
+        self._keys[..., prev : self.offset, :] = k_chunk
+        self._values[..., prev : self.offset, :] = v_chunk
+
+    def update_and_fetch(self, keys, values):
+        if self._packed is not None:
+            self.unpack_b1()
+        prev = self.offset
+        if self._keys is None or (prev + keys.shape[2]) > self._keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
             n_steps = (self.step + keys.shape[2] - 1) // self.step
@@ -354,25 +456,26 @@ class KVCache(_BaseCache):
             v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
+            if self._keys is not None:
                 if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
+                    self._keys = self._keys[..., :prev, :]
+                    self._values = self._values[..., :prev, :]
+                self._keys = mx.concatenate([self._keys, new_k], axis=2)
+                self._values = mx.concatenate([self._values, new_v], axis=2)
             else:
-                self.keys, self.values = new_k, new_v
+                self._keys, self._values = new_k, new_v
 
         self.offset += keys.shape[2]
-        self.keys[..., prev : self.offset, :] = keys
-        self.values[..., prev : self.offset, :] = values
+        self._keys[..., prev : self.offset, :] = keys
+        self._values[..., prev : self.offset, :] = values
         return self.keys_and_values()
 
     def keys_and_values(self):
-        if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        k, v = self.keys, self.values
+        if self.offset < k.shape[2]:
+            return k[..., : self.offset, :], v[..., : self.offset, :]
         else:
-            return self.keys, self.values
+            return k, v
 
     def size(self):
         return self.offset
@@ -383,7 +486,8 @@ class KVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset = v
+        self._packed = None
+        self._keys, self._values, self.offset = v
 
     def is_trimmable(self):
         return True
@@ -394,12 +498,14 @@ class KVCache(_BaseCache):
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        if self._packed is not None:
+            self.unpack_b1()
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
-        if self.keys is not None:
-            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+        if self._keys is not None:
+            quant_cache.keys = mx.quantize(self._keys, group_size=group_size, bits=bits)
             quant_cache.values = mx.quantize(
-                self.values, group_size=group_size, bits=bits
+                self._values, group_size=group_size, bits=bits
             )
         return quant_cache
 
@@ -411,25 +517,157 @@ class KVCache(_BaseCache):
         return BatchKVCache.merge(caches)
 
     def empty(self):
-        return self.keys is None
+        return self._packed is None and self._keys is None
 
     @property
     def nbytes(self):
-        if self.keys is None:
+        if self._packed is not None:
+            return self._packed.nbytes
+        if self._keys is None:
             return 0
-        return self.keys.nbytes + self.values.nbytes
+        return self._keys.nbytes + self._values.nbytes
 
 
 class RotatingKVCache(_BaseCache):
     step = 256
+    _keys = None
+    _values = None
+    _packed = None
 
     def __init__(self, max_size, keep=0):
         self.keep = keep
-        self.keys = None
-        self.values = None
+        self._keys = None
+        self._values = None
+        self._packed = None
         self.offset = 0
         self.max_size = max_size
         self._idx = 0
+
+    @property
+    def keys(self):
+        return self._packed[0][None] if self._packed is not None else self._keys
+
+    @keys.setter
+    def keys(self, v):
+        if self._packed is not None:
+            self._values = mx.contiguous(self._packed[1][None])
+            self._packed = None
+        self._keys = v
+
+    @property
+    def values(self):
+        return self._packed[1][None] if self._packed is not None else self._values
+
+    @values.setter
+    def values(self, v):
+        if self._packed is not None:
+            self._keys = mx.contiguous(self._packed[0][None])
+            self._packed = None
+        self._values = v
+
+    def pack_b1(self):
+        if self._packed is not None or self._keys is None:
+            return
+        k, v = self._keys, self._values
+        trim_size = k.shape[2] - self.max_size
+        if trim_size > 0:
+            k = self._trim(trim_size, k)
+            v = self._trim(trim_size, v)
+            self._idx = self.max_size
+        self._packed = mx.contiguous(mx.stack([k[0], v[0]], axis=0))
+        self._keys = self._values = None
+
+    def unpack_b1(self):
+        if self._packed is not None:
+            self._keys = mx.contiguous(self._packed[0][None])
+            self._values = mx.contiguous(self._packed[1][None])
+            self._packed = None
+
+    def update_packed_b1(self, kv_new, wpos_fn):
+        prev = self.offset
+        buf = self._packed
+        self._packed = None
+        cap = buf.shape[2]
+        if prev >= cap and cap < self.max_size:
+            new_size = min(self.step, self.max_size - prev)
+            ext = mx.zeros((2, buf.shape[1], new_size, buf.shape[3]), buf.dtype)
+            buf = mx.concatenate([buf, ext], axis=2)
+            cap = buf.shape[2]
+            self._idx = prev
+        if self._idx == self.max_size:
+            self._idx = self.keep
+        pos = self._idx
+        self.offset = prev + 1
+        self._idx = pos + 1
+        self._packed = mx.slice_update(buf, kv_new, wpos_fn(pos), axes=(2,))
+        S = min(self.offset, self.max_size)
+        return self._packed, S, self.offset, self._idx, 1, cap
+
+    def commit_packed_w(self, kv_new, keep, wpos_fn):
+        """Commit first `keep` slots from kv_new (2, Hkv, W, 128) into rotating packed KV buffer."""
+        assert self.keep == 0
+        src = kv_new[:, :, :keep, :]
+        prev = self.offset
+        buf = self._packed
+        self._packed = None
+        cap = buf.shape[2]
+        if cap < self.max_size and prev + keep > cap:
+            target_cap = min(self.max_size, ((prev + keep + self.step - 1) // self.step) * self.step)
+            ext = mx.zeros((2, buf.shape[1], target_cap - cap, buf.shape[3]), buf.dtype)
+            buf = mx.concatenate([buf, ext], axis=2)
+            self._idx = prev
+        slot0 = 0 if self._idx == self.max_size else self._idx
+        if slot0 + keep <= self.max_size:
+            buf = mx.slice_update(buf, src, wpos_fn(slot0), axes=(2,))
+        else:
+            n1 = self.max_size - slot0
+            buf = mx.slice_update(buf, src[:, :, :n1, :], wpos_fn(slot0), axes=(2,))
+            buf = mx.slice_update(buf, src[:, :, n1:, :], wpos_fn(0), axes=(2,))
+        self.offset = prev + keep
+        self._idx = ((slot0 + keep - 1) % self.max_size) + 1
+        self._packed = buf
+        return self._packed
+
+    def commit_unpacked_w(self, k_chunk, v_chunk):
+        """Commit `(B, Hkv, keep, D)` keys/values into unpacked rotating buffers, preserving ring slots."""
+        assert self.keep == 0
+        if self._packed is not None:
+            self.unpack_b1()
+        B, n_kv_heads, keep, k_head_dim = k_chunk.shape
+        v_head_dim = v_chunk.shape[3]
+        prev = self.offset
+        if self._keys is None:
+            cap = min(self.max_size, ((keep + self.step - 1) // self.step) * self.step)
+            self._keys = mx.zeros((B, n_kv_heads, cap, k_head_dim), k_chunk.dtype)
+            self._values = mx.zeros((B, n_kv_heads, cap, v_head_dim), v_chunk.dtype)
+            self._idx = 0
+        else:
+            trim_size = self._keys.shape[2] - self.max_size
+            if trim_size > 0:
+                self._keys = self._trim(trim_size, self._keys)
+                self._values = self._trim(trim_size, self._values)
+                self._idx = self.max_size
+            cap = self._keys.shape[2]
+            if cap < self.max_size and prev + keep > cap:
+                add = min(self.max_size - cap, ((prev + keep - cap + self.step - 1) // self.step) * self.step)
+                if self._idx >= cap:
+                    self._idx = prev
+                ext_k = mx.zeros((B, n_kv_heads, add, k_head_dim), k_chunk.dtype)
+                ext_v = mx.zeros((B, n_kv_heads, add, v_head_dim), v_chunk.dtype)
+                self._keys = mx.concatenate([self._keys, ext_k], axis=2)
+                self._values = mx.concatenate([self._values, ext_v], axis=2)
+        slot0 = 0 if self._idx == self.max_size else self._idx
+        if slot0 + keep <= self.max_size:
+            self._keys[..., slot0 : slot0 + keep, :] = k_chunk
+            self._values[..., slot0 : slot0 + keep, :] = v_chunk
+        else:
+            n1 = self.max_size - slot0
+            self._keys[..., slot0 : self.max_size, :] = k_chunk[..., :n1, :]
+            self._keys[..., 0 : keep - n1, :] = k_chunk[..., n1:, :]
+            self._values[..., slot0 : self.max_size, :] = v_chunk[..., :n1, :]
+            self._values[..., 0 : keep - n1, :] = v_chunk[..., n1:, :]
+        self.offset = prev + keep
+        self._idx = ((slot0 + keep - 1) % self.max_size) + 1
 
     def _trim(self, trim_size, v, append=None):
         to_cat = []
@@ -460,32 +698,36 @@ class RotatingKVCache(_BaseCache):
             return v[..., : self._idx, :]
 
     def _update_concat(self, keys, values):
-        if self.keys is None:
-            self.keys = keys
-            self.values = values
+        if self._packed is not None:
+            self.unpack_b1()
+        if self._keys is None:
+            self._keys = keys
+            self._values = values
         else:
             # Put the keys/values in temporal order to
             # preserve context
-            self.keys = self._temporal_order(self.keys)
-            self.values = self._temporal_order(self.values)
-            self._idx = self.keys.shape[2]
+            self._keys = self._temporal_order(self._keys)
+            self._values = self._temporal_order(self._values)
+            self._idx = self._keys.shape[2]
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
             trim_size = self._idx - self.max_size + 1
-            self.keys = self._trim(trim_size, self.keys, keys)
-            self.values = self._trim(trim_size, self.values, values)
+            self._keys = self._trim(trim_size, self._keys, keys)
+            self._values = self._trim(trim_size, self._values, values)
         self.offset += keys.shape[2]
-        self._idx = self.keys.shape[2]
-        return self.keys, self.values
+        self._idx = self._keys.shape[2]
+        return self._keys, self._values
 
     def _update_in_place(self, keys, values):
+        if self._packed is not None:
+            self.unpack_b1()
         # May not have hit the max size yet, so potentially
         # keep growing the cache
         B, n_kv_heads, S, k_head_dim = keys.shape
         prev = self.offset
-        if self.keys is None or (
-            prev >= self.keys.shape[2] and self.keys.shape[2] < self.max_size
+        if self._keys is None or (
+            prev >= self._keys.shape[2] and self._keys.shape[2] < self.max_size
         ):
             v_head_dim = values.shape[3]
             new_size = min(self.step, self.max_size - prev)
@@ -493,18 +735,18 @@ class RotatingKVCache(_BaseCache):
             v_shape = (B, n_kv_heads, new_size, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
+            if self._keys is not None:
+                self._keys = mx.concatenate([self._keys, new_k], axis=2)
+                self._values = mx.concatenate([self._values, new_v], axis=2)
             else:
-                self.keys, self.values = new_k, new_v
+                self._keys, self._values = new_k, new_v
             self._idx = prev
 
         # Trim if needed
-        trim_size = self.keys.shape[2] - self.max_size
+        trim_size = self._keys.shape[2] - self.max_size
         if trim_size > 0:
-            self.keys = self._trim(trim_size, self.keys)
-            self.values = self._trim(trim_size, self.values)
+            self._keys = self._trim(trim_size, self._keys)
+            self._values = self._trim(trim_size, self._values)
             self._idx = self.max_size
 
         # Rotate
@@ -512,8 +754,8 @@ class RotatingKVCache(_BaseCache):
             self._idx = self.keep
 
         # Assign
-        self.keys[..., self._idx : self._idx + S, :] = keys
-        self.values[..., self._idx : self._idx + S, :] = values
+        self._keys[..., self._idx : self._idx + S, :] = keys
+        self._values[..., self._idx : self._idx + S, :] = values
         self.offset += S
         self._idx += S
 
@@ -525,10 +767,11 @@ class RotatingKVCache(_BaseCache):
         return self._update_concat(keys, values)
 
     def keys_and_values(self):
-        if self.offset < self.keys.shape[2]:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        k, v = self.keys, self.values
+        if self.offset < k.shape[2]:
+            return k[..., : self.offset, :], v[..., : self.offset, :]
         else:
-            return self.keys, self.values
+            return k, v
 
     def size(self):
         return min(self.offset, self.max_size)
@@ -539,7 +782,8 @@ class RotatingKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.keep, self.max_size, self._idx = v
+        self._packed = None
+        self._keys, self._values, self.offset, self.keep, self.max_size, self._idx = v
 
     def is_trimmable(self):
         return self.offset < self.max_size
@@ -584,13 +828,15 @@ class RotatingKVCache(_BaseCache):
         return BatchRotatingKVCache.merge(caches)
 
     def empty(self):
-        return self.keys is None
+        return self._packed is None and self._keys is None
 
     @property
     def nbytes(self):
-        if self.keys is None:
+        if self._packed is not None:
+            return self._packed.nbytes
+        if self._keys is None:
             return 0
-        return self.keys.nbytes + self.values.nbytes
+        return self._keys.nbytes + self._values.nbytes
 
 
 class ArraysCache(_BaseCache):

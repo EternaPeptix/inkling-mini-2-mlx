@@ -1,0 +1,5366 @@
+{
+ "p1": {
+  "speed": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "generate_step_c1_tok_s": 203.85,
+    "bd_c1_tok_s": 208.1,
+    "bd_c1_ms": 4.81,
+    "bd_c8_agg_tok_s": 619.17,
+    "bd_c8_ms": 12.92,
+    "prefill_512_tok_s": 2971.0
+   }
+  },
+  "gen": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.8333,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1617,
+    "mean_len": 306.3,
+    "correct_mask": [
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "ll rate = 18 \u2212 12 = 6 L/min. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " 2\\), \\(a_n = a_{n-1} + a_{n-2}\\)  Compute: \\[ a_2=2,\\ a_3=3,\\ a_4=5,\\ a_5=8,\\ a_6=13,\\ a_7=21,\\ a_8=34,\\ a_9=55,\\ a_{10}=89 \\]  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "ponent modulo 6.**  $20 = 3 \\cdot 6 + 2$, so $20 \\equiv 2 \\pmod{6}$.  **Step 3: Compute $3^{20} \\equiv 3^2 \\equiv 2 \\pmod{7}$.**  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "-1 + 2*2 = 3 - i=3: odd, x = 3 - 3 = 0 - i=4: even, x = 0 + 4*4 = 16 - i=5: odd, x = 16 - 5 = 11 - i=6: even, x = 11 + 6*6 = 47  Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "rs satisfying the condition: - (0,1): 2 < 5 - (0,3): 2 < 8 - (0,4): 2 < 3 - (1,3): 5 < 8 - (2,3): 1 < 8 - (2,4): 1 < 3  Total: 6  Final Answer: 6<|end_message|>"
+     }
+    }
+   }
+  },
+  "mcq": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6057,
+      "route_acc": 0.7943,
+      "reason_recall": 0.0,
+      "nonreason_to_small": 0.0211
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.4706,
+      "route_acc": 0.7353,
+      "reason_recall": 0.3333,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.36,
+     "nll": 1.9428,
+     "by_type": {
+      "choice": 0.39,
+      "noul": 0.4,
+      "score": 0.29
+     }
+    }
+   }
+  }
+ },
+ "p2": {
+  "speed": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "generate_step_c1_tok_s": 134.89,
+    "bd_c1_tok_s": 136.79,
+    "bd_c1_ms": 7.31,
+    "bd_c8_agg_tok_s": 420.29,
+    "bd_c8_ms": 19.03,
+    "prefill_512_tok_s": 2052.3
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "generate_step_c1_tok_s": 134.14,
+    "bd_c1_tok_s": 135.4,
+    "bd_c1_ms": 7.39,
+    "bd_c8_agg_tok_s": 419.81,
+    "bd_c8_ms": 19.06,
+    "prefill_512_tok_s": 2051.8
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "generate_step_c1_tok_s": 125.79,
+    "bd_c1_tok_s": 125.57,
+    "bd_c1_ms": 7.96,
+    "bd_c8_agg_tok_s": 338.56,
+    "bd_c8_ms": 23.63,
+    "prefill_512_tok_s": 1622.2
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "generate_step_c1_tok_s": 123.06,
+    "bd_c1_tok_s": 122.55,
+    "bd_c1_ms": 8.16,
+    "bd_c8_agg_tok_s": 331.95,
+    "bd_c8_ms": 24.1,
+    "prefill_512_tok_s": 1484.2
+   }
+  },
+  "gen": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.75,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1459,
+    "mean_len": 335.0,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "= 18 \u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " a_5 = 13 + 8 = 21$ - $a_8 = a_7 + a_6 = 21 + 13 = 34$ - $a_9 = a_8 + a_7 = 34 + 21 = 55$ - $a_{10} = a_9 + a_8 = 55 + 34 = 89$  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "= 104$ remainder $1$. Then $3^{18} = (3^6)^3 \\equiv 1 \\pmod 7$, and $3^{20} = 3^{18}\\cdot 3^2 \\equiv 1\\cdot 9 \\equiv 2 \\pmod 7$.  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": ">i=1: x = -1   i=2: x = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 16 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": " < a[j]\\).  Pairs satisfying condition: - (0,1): 2<5 - (0,3): 2<8 - (0,4): 2<3 - (1,3): 5<8 - (2,3): 1<8 - (2,4): 1<3  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.2": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.2
+    },
+    "n": 40,
+    "acc": 0.8,
+    "correct": 32,
+    "arith_acc": 0.875,
+    "logic_acc": 0.8333,
+    "code_acc": 0.6667,
+    "eos_rate": 0.775,
+    "mean_rep4": 0.1262,
+    "mean_len": 341.6,
+    "correct_mask": [
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "= 18 \u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "so \\(a_",
+      "gold": "89",
+      "tail": "e2\\), the last move is either a 1-step from \\(n-1\\) or a 2-step from \\(n-2\\):   \\[   a_n=a_{n-1}+a_{n-2}   \\]  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\] So \\(a_"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "iv 6\\) - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20}=(3^6)^3\\cdot 3^2 \\equiv 1^3\\cdot 2 \\equiv 2 \\pmod 7. \\] Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": ">i=1: x = -1   i=2: x = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 16 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs satisfying the condition: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  Total count: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.3": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.3
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.6667,
+    "eos_rate": 0.9,
+    "mean_rep4": 0.1227,
+    "mean_len": 341.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "= 18 \u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "n-1\\) or a 2-step from \\(n-2\\):  \\[ a_n = a_{n-1} + a_{n-2} \\]  Compute:  \\[ 1,1,2,3,5,8,13,21,34,55,89 \\]  So \\(a_{10} = 89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "equiv 6\\) - \\(3^6 \\equiv 1\\)  Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": ".  Pairs satisfying `a[i] < a[j]`: - `(2, 5)`, `(2, 8)`, `(2, 3)` - `(5, 8)` - `(1, 8)`, `(1, 3)`  Total count: `3 + 1 + 2 = 6`.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.8333,
+    "code_acc": 0.75,
+    "eos_rate": 0.825,
+    "mean_rep4": 0.1224,
+    "mean_len": 355.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " = 18 \u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes. Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "2s and two 1s: 6!/(2!*4!)=15? 720/(2*24)=15; j=5: five 2s: 5!/(0!*5!)=1. Sum 1+9+28+35+15+1=89. Good. Need final answer exactly line: Final Answer: 89. Keep con"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": ") - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 3\\cdot 6 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "he loop counts pairs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.75": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.75
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.75,
+    "code_acc": 0.8333,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1324,
+    "mean_len": 357.1,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "Pipe A adds 18 L/min and drain B removes 12 L/min, so net fill rate = 18 \u2212 12 = 6 L/min.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "s from step \\(n-2\\): \\(f(n-2)\\) ways.  So \\(f(n)=f(n-1)+f(n-2)\\).  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\] Thus \\(f(10)=89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "rime, \\(3^6 \\equiv 1 \\pmod 7\\).  \\(20 = 3\\cdot 6 + 2\\), so \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 9 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 2*2 = 3 - i=3 (odd): x = 3 - 3 = 0 - i=4 (even): x = 0 + 4*4 = 16 - i=5 (odd): x = 16 - 5 = 11 - i=6 (even): x = 11 + 6*6 = 47  Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "< j` and `a[j] > a[i]`.  Pairs where `a[i] < a[j]`: - (2, 5), (2, 8), (2, 3) - (5, 8) - (1, 8), (1, 3)  That gives 6 increments.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_bs_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5,
+     "blend_bs": true
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.825,
+    "mean_rep4": 0.1236,
+    "mean_len": 347.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " = 6 liters per minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "2s and two 1s: 6!/(2!*4!)=15? 720/(2*24)=15; j=5: five 2s: 5!/(0!*5!)=1. Sum 1+9+28+35+15+1=89. Good. Need final answer exactly line: Final Answer: 89. Keep con"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": ") - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 3\\cdot 6 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "-1 + 2*2 = 3 - i=3: odd, x = 3 - 3 = 0 - i=4: even, x = 0 + 4*4 = 16 - i=5: odd, x = 16 - 5 = 11 - i=6: even, x = 11 + 6*6 = 47  Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "s \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs that satisfy: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  That's 6 pairs.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_w0.2": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.2,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.8333,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1315,
+    "mean_len": 332.4,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "= 18 \u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "10",
+      "gold": "89",
+      "tail": "\\), the last move is either a 1-step from \\(n-1\\) or a 2-step from \\(n-2\\):  \\[ a_n=a_{n-1}+a_{n-2} \\]  Compute:  \\[ 1,1,2,3,5,8,13,21,34,55,89 \\]  So \\(a_{10}="
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": ") - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "(i<j)\\) where \\(a[i] < a[j]\\).  Pairs: - (2,5), (2,8), (2,3) \u2192 3 - (5,8) \u2192 1 - (1,8), (1,3) \u2192 2 - (8,3) \u2192 0  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.85,
+    "correct": 34,
+    "arith_acc": 0.9375,
+    "logic_acc": 1.0,
+    "code_acc": 0.5833,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1396,
+    "mean_len": 334.0,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     0,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "\u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 / 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "compute:",
+      "gold": "89",
+      "tail": " last move is either:   - 1 step from step \\(n-1\\): \\(a_{n-1}\\) ways   - 2 steps from step \\(n-2\\): \\(a_{n-2}\\) ways  So \\(a_n = a_{n-1} + a_{n-2}\\).  Compute: "
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": ") - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": " < a[j]\\).  Pairs satisfying condition: - (0,1): 2<5 - (0,3): 2<8 - (0,4): 2<3 - (1,3): 5<8 - (2,3): 1<8 - (2,4): 1<3  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.5,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.5833,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1311,
+    "mean_len": 327.8,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "\u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " step \\(n-2\\): \\(a_{n-2}\\) ways  So \\(a_n = a_{n-1} + a_{n-2}\\).  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\] Thus \\(a_{10}=89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": " 2 - 3^3 \u2261 6 - 3^4 \u2261 4 - 3^5 \u2261 5 - 3^6 \u2261 1  The cycle length is 6. Since 20 = 6\u00b73 + 2, 3^20 = (3^6)^3 \u00b7 3^2 \u2261 1^3 \u00b7 2 \u2261 2 mod 7.  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "((i<j)\\) where \\(a[i] < a[j]\\).  Pairs satisfying \\(a[i] < a[j]\\): - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  That's 6 pairs.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_ad_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.3
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 0.9375,
+    "logic_acc": 1.0,
+    "code_acc": 0.6667,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1361,
+    "mean_len": 336.4,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "\u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 / 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "compute:",
+      "gold": "89",
+      "tail": " last move is either:   - 1 step from step \\(n-1\\): \\(a_{n-1}\\) ways   - 2 steps from step \\(n-2\\): \\(a_{n-2}\\) ways  So \\(a_n = a_{n-1} + a_{n-2}\\).  Compute: "
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": ") - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": " < a[j]\\).  Pairs satisfying condition: - (0,1): 2<5 - (0,3): 2<8 - (0,4): 2<3 - (1,3): 5<8 - (2,3): 1<8 - (2,4): 1<3  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.5833,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1332,
+    "mean_len": 332.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     0,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "\u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " step \\(n-2\\): \\(a_{n-2}\\) ways  So \\(a_n = a_{n-1} + a_{n-2}\\).  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\] Thus \\(a_{10}=89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": ") - \\(3^6 \\equiv 1 \\pmod 7\\)  Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "= -1 + 4 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 16 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "((i<j)\\) where \\(a[i] < a[j]\\).  Pairs satisfying \\(a[i] < a[j]\\): - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  That's 6 pairs.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_ad_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.75
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.6667,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1345,
+    "mean_len": 334.1,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "r needed to fill = 900 \u2212 360 = 540 L   Net fill rate with both open = 18 \u2212 12 = 6 L/min   Time = 540 \u00f7 6 = 90 minutes    Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " step \\(n-2\\): \\(a_{n-2}\\) ways  So \\(a_n = a_{n-1} + a_{n-2}\\).  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\] Thus \\(a_{10}=89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "  The cycle length is 6. Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " = 3   i = 3: odd, x = 3 - 3 = 0   i = 4: even, x = 0 + 16 = 16   i = 5: odd, x = 16 - 5 = 11   i = 6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "o - (2,8): yes - (2,3): yes - (5,1): no - (5,8): yes - (5,3): no - (1,8): yes - (1,3): yes - (8,3): no  There are 6 \u201cyes\u201d pairs.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_ad_w1.0": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.0
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 0.9375,
+    "logic_acc": 1.0,
+    "code_acc": 0.6667,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1285,
+    "mean_len": 340.5,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "water: 360 L   Empty space: 900 \u2212 360 = 540 L   Net fill rate: 18 \u2212 12 = 6 L/min   Time to fill: 540 \u00f7 6 = 90 minutes    Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "1123581321345589",
+      "gold": "89",
+      "tail": "- For \\(n \\ge 2\\), the last move is either 1 step from \\(n-1\\) or 2 steps from \\(n-2\\):  \\[ a_n = a_{n-1} + a_{n-2} \\]  Compute:  \\[ 1,1,2,3,5,8,13,21,34,55,89 "
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "  The cycle length is 6. Since \\(20 = 6\\cdot 3 + 2\\), \\[ 3^{20} \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " + 2*2 = 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4*4 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6*6 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "01",
+      "gold": "6",
+      "tail": "s (0,2):2>1 no (a[i]<a[j] false) (0,3):2<8 yes (0,4):2<3 yes (1,2):5>1 no (1,3):5<8 yes (1,4):5>3 no (2,3):1<8 yes (2,4):1<3 yes (3,4):8>3 no Yes count: (0,1),("
+     }
+    }
+   }
+  },
+  "mcq": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6571,
+      "route_acc": 0.8229,
+      "reason_recall": 0.5758,
+      "nonreason_to_small": 0.1197
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.8529,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.42,
+     "nll": 1.6898,
+     "by_type": {
+      "choice": 0.54,
+      "noul": 0.34,
+      "score": 0.38
+     }
+    }
+   },
+   "hidden_w0.2": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.2
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6286,
+      "route_acc": 0.8114,
+      "reason_recall": 0.5758,
+      "nonreason_to_small": 0.1338
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5,
+      "nonreason_to_small": 0.0
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.42,
+     "nll": 1.7064,
+     "by_type": {
+      "choice": 0.55,
+      "noul": 0.32,
+      "score": 0.39
+     }
+    }
+   },
+   "hidden_w0.3": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.3
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6,
+      "route_acc": 0.7886,
+      "reason_recall": 0.5758,
+      "nonreason_to_small": 0.162
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.7941,
+      "reason_recall": 0.4167,
+      "nonreason_to_small": 0.0
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4167,
+     "nll": 1.7385,
+     "by_type": {
+      "choice": 0.56,
+      "noul": 0.31,
+      "score": 0.38
+     }
+    }
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6114,
+      "route_acc": 0.8057,
+      "reason_recall": 0.6061,
+      "nonreason_to_small": 0.1479
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.7941,
+      "reason_recall": 0.4167,
+      "nonreason_to_small": 0.0
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.3933,
+     "nll": 1.8097,
+     "by_type": {
+      "choice": 0.55,
+      "noul": 0.3,
+      "score": 0.33
+     }
+    }
+   },
+   "hidden_w0.75": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.75
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6057,
+      "route_acc": 0.7943,
+      "reason_recall": 0.6061,
+      "nonreason_to_small": 0.162
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.7941,
+      "reason_recall": 0.4167,
+      "nonreason_to_small": 0.0
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.3867,
+     "nll": 1.9572,
+     "by_type": {
+      "choice": 0.54,
+      "noul": 0.29,
+      "score": 0.33
+     }
+    }
+   },
+   "hidden_w1.0": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 1.0
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5771,
+      "route_acc": 0.7257,
+      "reason_recall": 0.4848,
+      "nonreason_to_small": 0.2183
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.7647,
+      "reason_recall": 0.4167,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.3767,
+     "nll": 2.1235,
+     "by_type": {
+      "choice": 0.51,
+      "noul": 0.31,
+      "score": 0.31
+     }
+    }
+   },
+   "hidden_bs_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5,
+     "blend_bs": true
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5943,
+      "route_acc": 0.7886,
+      "reason_recall": 0.4848,
+      "nonreason_to_small": 0.1408
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5,
+      "nonreason_to_small": 0.0
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4033,
+     "nll": 1.8379,
+     "by_type": {
+      "choice": 0.55,
+      "noul": 0.31,
+      "score": 0.35
+     }
+    }
+   },
+   "logits_w0.2": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.2,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6343,
+      "route_acc": 0.8,
+      "reason_recall": 0.6364,
+      "nonreason_to_small": 0.162
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.44,
+     "nll": 1.689,
+     "by_type": {
+      "choice": 0.57,
+      "noul": 0.34,
+      "score": 0.41
+     }
+    }
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6114,
+      "route_acc": 0.7771,
+      "reason_recall": 0.6667,
+      "nonreason_to_small": 0.1972
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4433,
+     "nll": 1.6935,
+     "by_type": {
+      "choice": 0.57,
+      "noul": 0.34,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.5,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5829,
+      "route_acc": 0.7486,
+      "reason_recall": 0.697,
+      "nonreason_to_small": 0.2394
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.45,
+     "nll": 1.7114,
+     "by_type": {
+      "choice": 0.59,
+      "noul": 0.33,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.75,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5029,
+      "route_acc": 0.6686,
+      "reason_recall": 0.7879,
+      "nonreason_to_small": 0.3592
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.7941,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0909
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4467,
+     "nll": 1.749,
+     "by_type": {
+      "choice": 0.59,
+      "noul": 0.33,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_ad_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.3
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6171,
+      "route_acc": 0.7829,
+      "reason_recall": 0.6667,
+      "nonreason_to_small": 0.1901
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.44,
+     "nll": 1.6928,
+     "by_type": {
+      "choice": 0.57,
+      "noul": 0.33,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6057,
+      "route_acc": 0.7714,
+      "reason_recall": 0.697,
+      "nonreason_to_small": 0.2113
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.8235,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.44,
+     "nll": 1.7014,
+     "by_type": {
+      "choice": 0.57,
+      "noul": 0.32,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.75
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5429,
+      "route_acc": 0.7086,
+      "reason_recall": 0.7576,
+      "nonreason_to_small": 0.3028
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.7941,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0909
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.45,
+     "nll": 1.7188,
+     "by_type": {
+      "choice": 0.59,
+      "noul": 0.33,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w1.0": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.0
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4914,
+      "route_acc": 0.6629,
+      "reason_recall": 0.8485,
+      "nonreason_to_small": 0.3803
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.7941,
+      "reason_recall": 0.5833,
+      "nonreason_to_small": 0.0909
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4567,
+     "nll": 1.7429,
+     "by_type": {
+      "choice": 0.59,
+      "noul": 0.34,
+      "score": 0.44
+     }
+    }
+   },
+   "logits_ad_w1.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4057,
+      "route_acc": 0.5714,
+      "reason_recall": 0.8788,
+      "nonreason_to_small": 0.5
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.7941,
+      "reason_recall": 0.6667,
+      "nonreason_to_small": 0.1364
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.45,
+     "nll": 1.8072,
+     "by_type": {
+      "choice": 0.58,
+      "noul": 0.34,
+      "score": 0.43
+     }
+    }
+   }
+  }
+ },
+ "p3": {
+  "speed": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "generate_step_c1_tok_s": 100.34,
+    "bd_c1_tok_s": 101.77,
+    "bd_c1_ms": 9.83,
+    "bd_c8_agg_tok_s": 317.79,
+    "bd_c8_ms": 25.17,
+    "prefill_512_tok_s": 1570.4
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "generate_step_c1_tok_s": 100.14,
+    "bd_c1_tok_s": 101.37,
+    "bd_c1_ms": 9.86,
+    "bd_c8_agg_tok_s": 318.34,
+    "bd_c8_ms": 25.13,
+    "prefill_512_tok_s": 1568.5
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "generate_step_c1_tok_s": 95.34,
+    "bd_c1_tok_s": 95.39,
+    "bd_c1_ms": 10.48,
+    "bd_c8_agg_tok_s": 268.24,
+    "bd_c8_ms": 29.82,
+    "prefill_512_tok_s": 1303.4
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "generate_step_c1_tok_s": 93.47,
+    "bd_c1_tok_s": 93.64,
+    "bd_c1_ms": 10.68,
+    "bd_c8_agg_tok_s": 264.51,
+    "bd_c8_ms": 30.24,
+    "prefill_512_tok_s": 1214.7
+   }
+  },
+  "gen": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.75,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1388,
+    "mean_len": 297.0,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "= 18 \u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": " \u2261 5 (since 3*4=12 mod 7=5) 3^6 \u2261 1 (since 3*5=15 mod 7=1) Order is 6. 20 = 3*6 + 2, so 3^20 \u2261 (3^6)^3 * 3^2 \u2261 1^3 * 2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "\\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs satisfying condition: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.2": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.2
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.8333,
+    "eos_rate": 0.9,
+    "mean_rep4": 0.1349,
+    "mean_len": 301.1,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "ded to fill: 900 \u2212 360 = 540 liters.   Net fill rate: 18 \u2212 12 = 6 liters/minute.   Time required: 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "8 mod 7 = 4) 3^5 \u2261 5 (since 3*4=12 mod 7 = 5) 3^6 \u2261 1 (since 3*5=15 mod 7 = 1) Order is 6. 20 mod 6 = 2, so 3^20 \u2261 3^2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": ") where \\(a[i] < a[j]\\).  Pairs satisfying condition: - (2,5), (2,8), (2,3): 3 - (5,8): 1 - (1,8), (1,3): 2  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.3": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.3
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.8333,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.132,
+    "mean_len": 302.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "fill rate = 18 \u2212 12 = 6 liters/minute. Water needed to fill tank = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "8 mod 7 = 4) 3^5 \u2261 5 (since 3*4=12 mod 7 = 5) 3^6 \u2261 1 (since 3*5=15 mod 7 = 1) Order is 6. 20 mod 6 = 2, so 3^20 \u2261 3^2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "2",
+      "gold": "6",
+      "tail": "nd_message|><|message_model|><|content_text|>Count pairs \\((i<j)\\) where \\(a[i] < a[j]\\):  - i=0 (2): j=1,3,4 \u2192 3 pairs - i=1 (5): j=3 \u2192 1 pair - i=2 (1): j=3,4"
+     }
+    }
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.5833,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1367,
+    "mean_len": 305.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " fill rate = 18 \u2212 12 = 6 liters/minute. Water needed to fill tank = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes. Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": " 1 \\pmod 7$  Since $20 = 3\\cdot 6 + 2$, $3^{20} = 3^{18}\\cdot 3^2 \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7$.  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "3",
+      "gold": "6",
+      "tail": "]\\).  Increasing pairs: - (2,5), (2,8), (2,3) from index 0: 3 - (5,8) from index 1: 1 - (1,8), (1,3) from index 2: 2 - none from index 3: 0  Total: \\(3+1+2=6\\)."
+     }
+    }
+   },
+   "hidden_w0.75": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.75
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.75,
+    "eos_rate": 0.925,
+    "mean_rep4": 0.1251,
+    "mean_len": 297.8,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": " 1 \\pmod 7$  Since $20 = 3\\cdot 6 + 2$, $3^{20} = 3^{18}\\cdot 3^2 \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7$.  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "ith 5, 8, 3 \u2192 3 pairs - i=1 (5): with 8 \u2192 1 pair - i=2 (1): with 8, 3 \u2192 2 pairs - i=3 (8): with 3 \u2192 0 pairs  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_bs_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5,
+     "blend_bs": true
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.75,
+    "eos_rate": 0.925,
+    "mean_rep4": 0.1475,
+    "mean_len": 310.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": " 1 \\pmod 7$  Since $20 = 3\\cdot 6 + 2$, $3^{20} = 3^{18}\\cdot 3^2 \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7$.  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3` \u2192 `x = 0` - `i=4`: even, `x += 4*4=16` \u2192 `x = 16` - `i=5`: odd, `x -= 5` \u2192 `x = 11` - `i=6`: even, `x += 6*6=36` \u2192 `x = 47`  Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": ").  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 - i=1 (5): with 8 \u2192 1 - i=2 (1): with 8, 3 \u2192 2 - i=3 (8): with 3 \u2192 0  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_w0.2": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.2,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1391,
+    "mean_len": 286.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " \u2212 12 = 6 liters/minute.   Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "8 mod 7 = 4) 3^5 \u2261 5 (since 3*4=12 mod 7 = 5) 3^6 \u2261 1 (since 3*5=15 mod 7 = 1) Order is 6. 20 mod 6 = 2, so 3^20 \u2261 3^2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "3",
+      "gold": "6",
+      "tail": "(i<j)\\) with \\(a[i] < a[j]\\):  - i=0 (2): pairs with 5, 8, 3 \u2192 3 - i=1 (5): pair with 8 \u2192 1 - i=2 (1): pairs with 8, 3 \u2192 2 - i=3 (8): none \u2192 0  Total: \\(3+1+2=6"
+     }
+    }
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.75,
+    "eos_rate": 0.9,
+    "mean_rep4": 0.1402,
+    "mean_len": 289.4,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " \u2212 12 = 6 liters/minute.   Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "8 mod 7 = 4) 3^5 \u2261 5 (since 3*4=12 mod 7 = 5) 3^6 \u2261 1 (since 3*5=15 mod 7 = 1) Order is 6. 20 mod 6 = 2, so 3^20 \u2261 3^2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "nts pairs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Qualifying pairs: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.5,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.75,
+    "eos_rate": 0.925,
+    "mean_rep4": 0.1281,
+    "mean_len": 276.3,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 / 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": " (since 4*3=12 mod 7 = 5) 3^6 \u2261 1 (since 5*3=15 mod 7 = 1) Order is 6. 20 = 3*6 + 2, so 3^20 \u2261 (3^6)^3 * 3^2 \u2261 1^3 * 2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "count pairs \\(i<",
+      "gold": "6",
+      "tail": "tep. Ensure last line exactly Final Answer: 6. Could include bullets. No extra after final line.<|end_message|><|message_model|><|content_text|>Count pairs \\(i<"
+     }
+    }
+   },
+   "logits_ad_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.3
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.139,
+    "mean_len": 289.4,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " \u2212 12 = 6 liters/minute.   Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "8 mod 7 = 4) 3^5 \u2261 5 (since 3*4=12 mod 7 = 5) 3^6 \u2261 1 (since 3*5=15 mod 7 = 1) Order is 6. 20 mod 6 = 2, so 3^20 \u2261 3^2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "nts pairs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Qualifying pairs: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  Total: 6.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.75,
+    "eos_rate": 0.9,
+    "mean_rep4": 0.1432,
+    "mean_len": 293.5,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "8 mod 7 = 4) 3^5 \u2261 5 (since 3*4=12 mod 7 = 5) 3^6 \u2261 1 (since 3*5=15 mod 7 = 1) Order is 6. 20 mod 6 = 2, so 3^20 \u2261 3^2 \u2261 2 mod 7. Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": " pairs \\(i<j\\) where \\(a[i] < a[j]\\).  Pairs satisfying condition: - (2,5), (2,8), (2,3) - (5,8) - (1,8), (1,3)  That's 6 pairs.  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_ad_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.75
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.6667,
+    "eos_rate": 0.9,
+    "mean_rep4": 0.1386,
+    "mean_len": 297.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "lling = 18 \u2212 12 = 6 liters/minute.   Space needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "(3)=5+3=8 f(6)=f(5)+f(4)=8+5=13 f(7)=f(6)+f(5)=13+8=21 f(8)=f(7)+f(6)=21+13=34 f(9)=f(8)+f(7)=34+21=55 f(10)=f(9)+f(8)=55+34=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "th is $6$. Since $20 = 3\\cdot 6 + 2$, $$3^{20} = 3^{18}\\cdot 3^2 \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7.$$  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "2",
+      "gold": "6",
+      "tail": "Also (2? none after? 2<1 false? Actually a0=2 > a2=1 yes! Wait pair (0,2): a0=2 > a2=1, inversion. I counted no for <. Let's list inversions: (0,2):2>1 yes; (1,"
+     }
+    }
+   },
+   "logits_ad_w1.0": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.0
+    },
+    "n": 40,
+    "acc": 0.95,
+    "correct": 38,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.8333,
+    "eos_rate": 0.925,
+    "mean_rep4": 0.1357,
+    "mean_len": 286.8,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "lling = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "=3 f(4)=f(3)+f(2)=5 f(5)=f(4)+f(3)=8 f(6)=f(5)+f(4)=13 f(7)=f(6)+f(5)=21 f(8)=f(7)+f(6)=34 f(9)=f(8)+f(7)=55 f(10)=f(9)+f(8)=89  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "th is $6$. Since $20 = 3\\cdot 6 + 2$, $$3^{20} = 3^{18}\\cdot 3^2 \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod 7.$$  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "none; 5? maybe 5>? value? 2? no i<j only; also (2? no), (5? value5 >? 1 and3 =2), (8>3=1), (2? no), (1? no), (3? no), (5? value5 >? maybe 1,3 =2), (8? >3=1), (2"
+     }
+    }
+   }
+  },
+  "mcq": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6629,
+      "route_acc": 0.8057,
+      "reason_recall": 0.8788,
+      "nonreason_to_small": 0.2113
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.6765,
+      "route_acc": 0.7353,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.3636
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4933,
+     "nll": 1.345,
+     "by_type": {
+      "choice": 0.67,
+      "noul": 0.37,
+      "score": 0.44
+     }
+    }
+   },
+   "hidden_w0.2": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.2
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5657,
+      "route_acc": 0.6971,
+      "reason_recall": 0.9091,
+      "nonreason_to_small": 0.3521
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7059,
+      "route_acc": 0.7647,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.3182
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.49,
+     "nll": 1.3241,
+     "by_type": {
+      "choice": 0.67,
+      "noul": 0.4,
+      "score": 0.4
+     }
+    }
+   },
+   "hidden_w0.3": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.3
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4914,
+      "route_acc": 0.6057,
+      "reason_recall": 0.9091,
+      "nonreason_to_small": 0.4648
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.6765,
+      "route_acc": 0.7353,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.3636
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4967,
+     "nll": 1.309,
+     "by_type": {
+      "choice": 0.64,
+      "noul": 0.42,
+      "score": 0.43
+     }
+    }
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4171,
+      "route_acc": 0.4743,
+      "reason_recall": 0.9394,
+      "nonreason_to_small": 0.6338
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5882,
+      "route_acc": 0.6471,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.5
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.52,
+     "nll": 1.2895,
+     "by_type": {
+      "choice": 0.66,
+      "noul": 0.46,
+      "score": 0.44
+     }
+    }
+   },
+   "hidden_w0.75": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.75
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.2857,
+      "route_acc": 0.32,
+      "reason_recall": 0.9394,
+      "nonreason_to_small": 0.8239
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.5294,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6818
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.52,
+     "nll": 1.2723,
+     "by_type": {
+      "choice": 0.66,
+      "noul": 0.44,
+      "score": 0.46
+     }
+    }
+   },
+   "hidden_w1.0": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 1.0
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.2571,
+      "route_acc": 0.28,
+      "reason_recall": 0.9394,
+      "nonreason_to_small": 0.8732
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.5588,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6364
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.54,
+     "nll": 1.2733,
+     "by_type": {
+      "choice": 0.67,
+      "noul": 0.47,
+      "score": 0.48
+     }
+    }
+   },
+   "hidden_bs_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5,
+     "blend_bs": true
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4171,
+      "route_acc": 0.48,
+      "reason_recall": 0.9394,
+      "nonreason_to_small": 0.6268
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.6176,
+      "route_acc": 0.6471,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.5
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5067,
+     "nll": 1.2829,
+     "by_type": {
+      "choice": 0.65,
+      "noul": 0.45,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_w0.2": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.2,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5486,
+      "route_acc": 0.6571,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.4155
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7059,
+      "route_acc": 0.7647,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.3182
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4833,
+     "nll": 1.3276,
+     "by_type": {
+      "choice": 0.65,
+      "noul": 0.39,
+      "score": 0.41
+     }
+    }
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5143,
+      "route_acc": 0.6171,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.4648
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7353,
+      "route_acc": 0.7647,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.3636
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5,
+     "nll": 1.3278,
+     "by_type": {
+      "choice": 0.64,
+      "noul": 0.44,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.5,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.3829,
+      "route_acc": 0.4571,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.662
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7059,
+      "route_acc": 0.7059,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.4545
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5167,
+     "nll": 1.3438,
+     "by_type": {
+      "choice": 0.64,
+      "noul": 0.46,
+      "score": 0.45
+     }
+    }
+   },
+   "logits_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.75,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.2971,
+      "route_acc": 0.36,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.7817
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.6765,
+      "route_acc": 0.6765,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.5
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5133,
+     "nll": 1.3887,
+     "by_type": {
+      "choice": 0.63,
+      "noul": 0.46,
+      "score": 0.45
+     }
+    }
+   },
+   "logits_ad_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.3
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5371,
+      "route_acc": 0.64,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.4366
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7059,
+      "route_acc": 0.7353,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.3636
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4933,
+     "nll": 1.3277,
+     "by_type": {
+      "choice": 0.65,
+      "noul": 0.42,
+      "score": 0.41
+     }
+    }
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4514,
+      "route_acc": 0.5543,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.5423
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7059,
+      "route_acc": 0.7059,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.4545
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5033,
+     "nll": 1.3311,
+     "by_type": {
+      "choice": 0.64,
+      "noul": 0.44,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.75
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.3829,
+      "route_acc": 0.4514,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.669
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.7059,
+      "route_acc": 0.7059,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.4545
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5067,
+     "nll": 1.3496,
+     "by_type": {
+      "choice": 0.64,
+      "noul": 0.45,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w1.0": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.0
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.3257,
+      "route_acc": 0.4057,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.7254
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.6765,
+      "route_acc": 0.6765,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.5
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5,
+     "nll": 1.3812,
+     "by_type": {
+      "choice": 0.63,
+      "noul": 0.44,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w1.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.28,
+      "route_acc": 0.3429,
+      "reason_recall": 0.9697,
+      "nonreason_to_small": 0.8028
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.6765,
+      "route_acc": 0.6765,
+      "reason_recall": 1.0,
+      "nonreason_to_small": 0.5
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.51,
+     "nll": 1.4736,
+     "by_type": {
+      "choice": 0.64,
+      "noul": 0.45,
+      "score": 0.44
+     }
+    }
+   }
+  }
+ },
+ "p5": {
+  "speed": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "generate_step_c1_tok_s": 66.47,
+    "bd_c1_tok_s": 66.94,
+    "bd_c1_ms": 14.94,
+    "bd_c8_agg_tok_s": 213.5,
+    "bd_c8_ms": 37.47,
+    "prefill_512_tok_s": 1066.7
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "generate_step_c1_tok_s": 66.42,
+    "bd_c1_tok_s": 66.88,
+    "bd_c1_ms": 14.95,
+    "bd_c8_agg_tok_s": 212.84,
+    "bd_c8_ms": 37.59,
+    "prefill_512_tok_s": 1067.8
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "generate_step_c1_tok_s": 61.98,
+    "bd_c1_tok_s": 64.55,
+    "bd_c1_ms": 15.49,
+    "bd_c8_agg_tok_s": 190.29,
+    "bd_c8_ms": 42.04,
+    "prefill_512_tok_s": 937.9
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "generate_step_c1_tok_s": 59.79,
+    "bd_c1_tok_s": 63.26,
+    "bd_c1_ms": 15.81,
+    "bd_c8_agg_tok_s": 187.74,
+    "bd_c8_ms": 42.61,
+    "prefill_512_tok_s": 891.1
+   }
+  },
+  "gen": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "n": 40,
+    "acc": 0.85,
+    "correct": 34,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1352,
+    "mean_len": 314.2,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "\u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "0",
+      "gold": "89",
+      "tail": "inct ways to climb a staircase with 10 steps, taking steps of size 1 or 2.  Let $a_n$ be the number of ways to reach step $n$.  Base cases: - $a_0 = 1$ (one way"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "} = 3^{6\\cdot 3 + 2} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod{7}.$$  **Step 3: Conclusion.**  The remainder is $2$.  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "<|message_model|><|content_text|>i=1: x=-1   i=2: x=-1+4=3   i=3: x=3-3=0   i=4: x=0+16=16   i=5: x=16-5=11   i=6: x=11+36=47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": " \\(a[i] < a[j]\\).  Pairs satisfying the condition: - \\(2<5, 2<8, 2<3\\) \u2192 3 - \\(5<8\\) \u2192 1 - \\(1<8, 1<3\\) \u2192 2  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "hidden_w0.2": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.2
+    },
+    "n": 40,
+    "acc": 0.825,
+    "correct": 33,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.5833,
+    "eos_rate": 0.825,
+    "mean_rep4": 0.1263,
+    "mean_len": 314.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": "\u2212 12 = 6 liters/minute. Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 liters. Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "let",
+      "gold": "89",
+      "tail": "essage_model|><|content_text|>We need to count the number of distinct ways to climb a staircase with 10 steps, where each move is either 1 step or 2 steps.  Let"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "tively. Keep concise.<|end_message|><|message_model|><|content_text|>Compute powers of \\(3\\) modulo \\(7\\):  \\[ 3^1 \\equiv 3,\\quad 3^2 \\equiv 2,\\quad 3^3 \\equiv "
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "<|message_model|><|content_text|>i=1: x=-1   i=2: x=-1+4=3   i=3: x=3-3=0   i=4: x=0+16=16   i=5: x=16-5=11   i=6: x=11+36=47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "2",
+      "gold": "6",
+      "tail": "op counts pairs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 pairs - i=1 (5): with 8 \u2192 1 pair - i=2 (1): with 8, 3 \u2192 2 pairs "
+     }
+    }
+   },
+   "hidden_w0.3": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.3
+    },
+    "n": 40,
+    "acc": 0.825,
+    "correct": 33,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.5833,
+    "eos_rate": 0.825,
+    "mean_rep4": 0.134,
+    "mean_len": 317.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " \u2212 12 = 6 liters/minute.   Water needed to fill from 360 L to 900 L = 900 \u2212 360 = 540 L.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "let f",
+      "gold": "89",
+      "tail": "|message_model|><|content_text|>We need to count the number of distinct ways to climb a staircase with 10 steps, where each move is either 1 or 2 steps.  Let $f"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "tively. Keep concise.<|end_message|><|message_model|><|content_text|>Compute powers of \\(3\\) modulo \\(7\\):  \\[ 3^1 \\equiv 3,\\quad 3^2 \\equiv 2,\\quad 3^3 \\equiv "
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "<|message_model|><|content_text|>i=1: x=-1   i=2: x=-1+4=3   i=3: x=3-3=0   i=4: x=0+16=16   i=5: x=16-5=11   i=6: x=11+36=47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "3",
+      "gold": "6",
+      "tail": "ere \\(a[i] < a[j]\\).  - \\(i=0\\) (2): less than 5, 8, 3 \u2192 3 pairs - \\(i=1\\) (5): less than 8 \u2192 1 pair - \\(i=2\\) (1): less than 8, 3 \u2192 2 pairs - \\(i=3\\) (8): less"
+     }
+    }
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.75,
+    "eos_rate": 0.825,
+    "mean_rep4": 0.1379,
+    "mean_len": 330.1,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "the",
+      "gold": "89",
+      "tail": "$ - $f(7) = f(6) + f(5) = 13 + 8 = 21$ - $f(8) = f(7) + f(6) = 21 + 13 = 34$ - $f(9) = f(8) + f(7) = 34 + 21 = 55$ - $f(10) = f(9) + f(8) = 55 + 34 = 8989$  The"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "natively. Keep concise.<|end_message|><|message_model|><|content_text|>Compute powers of $3$ modulo $7$: - $3^1 \\equiv 3$ - $3^2 \\equiv 2$ - $3^3 \\equiv 6$ - $3"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "x = -1 + 2\u00b2 = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 4\u00b2 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "final",
+      "gold": "6",
+      "tail": ").  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 pairs - i=1 (5): with 8 \u2192 1 pair - i=2 (1): with 8, 3 \u2192 2 pairs - i=3 (8): with 3 \u2192 0 pairs  Total: \\(3+1+2+0=6\\).  Final"
+     }
+    }
+   },
+   "hidden_w0.75": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.75
+    },
+    "n": 40,
+    "acc": 0.825,
+    "correct": 33,
+    "arith_acc": 1.0,
+    "logic_acc": 0.8333,
+    "code_acc": 0.5833,
+    "eos_rate": 0.825,
+    "mean_rep4": 0.1374,
+    "mean_len": 319.7,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "2\\) by a 2-step move:  \\[ a_n = a_{n-1} + a_{n-2} \\]  Compute:  \\[ 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89 \\]  So \\(a_{10} = 89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "ontent_text|>Compute powers of $3$ modulo $7$: - $3^1 \\equiv 3$ - $3^2 \\equiv 2$ - $3^3 \\equiv 6$ - $3^6 \\equiv 1 \\pmod{7}$  Since $20 = 3\\cdot 6 + 2$, $$3^{20}"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "- 1 = -1   i=2: x = -1 + 2^2 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 4^2 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 6^2 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "total",
+      "gold": "6",
+      "tail": "airs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 - i=1 (5): with 8 \u2192 1 - i=2 (1): with 8, 3 \u2192 2 - i=3 (8): with 3 \u2192 0  Total"
+     }
+    }
+   },
+   "hidden_bs_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5,
+     "blend_bs": true
+    },
+    "n": 40,
+    "acc": 0.775,
+    "correct": 31,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.8333,
+    "code_acc": 0.5,
+    "eos_rate": 0.775,
+    "mean_rep4": 0.1361,
+    "mean_len": 328.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     0,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "9",
+      "gold": "89",
+      "tail": "ne is wrong. Let's correct: - $f(6) = f(5) + f(4) = 8 + 5 = 13$ - $f(7) = f(6) + f(5) = 13 + 8 = 21$ - $f(8) = f(7) + f(6) = 21 + 13 = 34$ - $f(9) = f(8) + f(7)"
+     },
+     "16": {
+      "ok": false,
+      "pred": "6",
+      "gold": "2",
+      "tail": ">Compute powers of $3$ modulo $7$: - $3^1 \\equiv 3$ - $3^2 \\equiv 2$ - $3^3 \\equiv 6$ - $3^4 \\equiv 4$ - $3^5 \\equiv 5$ - $3^6 \\equiv 1$  The cycle length is $6"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "x = -1 + 2\u00b2 = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 4\u00b2 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "the loop counts pairs \\((ij)\\) with \\(i<j\\) where \\(a[i] <",
+      "gold": "6",
+      "tail": "ly Final Answer: 6. Ensure no extra after final line.<|end_message|><|message_model|><|content_text|>The loop counts pairs \\((i,j)\\) with \\(i<j\\) where \\(a[i] <"
+     }
+    }
+   },
+   "logits_w0.2": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.2,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.5833,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1434,
+    "mean_len": 316.1,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "e line Final Answer: <value>. Need ensure final line exactly. Problem: staircase 10 steps, climb 1 or 2 steps. Count distinct ways to reach step 10 from step 0."
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "{7}$  The cycle length is $6$. Since $20 = 6\\cdot 3 + 2$, \\[ 3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod{7}. \\]  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "<|message_model|><|content_text|>i=1: x=-1   i=2: x=-1+4=3   i=3: x=3-3=0   i=4: x=0+16=16   i=5: x=16-5=11   i=6: x=11+36=47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "2",
+      "gold": "6",
+      "tail": "op counts pairs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 pairs - i=1 (5): with 8 \u2192 1 pair - i=2 (1): with 8, 3 \u2192 2 pairs "
+     }
+    }
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.75,
+    "eos_rate": 0.875,
+    "mean_rep4": 0.1304,
+    "mean_len": 310.5,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "10",
+      "gold": "89",
+      "tail": "<|message_model|><|content_text|>We need to count the number of distinct ways to climb a staircase with 10 steps, where each move is either 1 step or 2 steps.  "
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "en 3^20=3^(18)*3^2=(3^6)^3*9 \u22611*2=2. Good.<|end_message|><|message_model|><|content_text|>Using Fermat\u2019s little theorem, since 7 is prime, \\[ 3^6 \\equiv 1 \\pmod"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "x = -1 + 2\u00b2 = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 4\u00b2 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "]\\).  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 - i=1 (5): with 8 \u2192 1 - i=2 (1): with 8, 3 \u2192 2 - i=3 (8): none \u2192 0  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   },
+   "logits_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.5,
+     "adaptive": false
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1271,
+    "mean_len": 308.5,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "mb 1 or 2 steps at a time. Number distinct ways to reach step 10 from step 0. This is Fibonacci: a_n = a_{n-1}+a_{n-2}, with a_0=1, a_1=1. Then a_10 = F_11 if F"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "m alternatively. Keep concise.<|end_message|><|message_model|><|content_text|>Compute powers of \\(3\\) modulo \\(7\\):  \\[ 3^1 \\equiv 3,\\quad 3^2 \\equiv 2,\\quad 3^"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "2",
+      "gold": "6",
+      "tail": "2, j=2 a=1 => 2>1 inversion! I counted a[i]<a[j] no for that pair, so it's inversion. Let's list inversions: (2,1), (5,1), (5,3), (8,3). Also (2? with? 2> ? no "
+     }
+    }
+   },
+   "logits_ad_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.3
+    },
+    "n": 40,
+    "acc": 0.85,
+    "correct": 34,
+    "arith_acc": 0.9375,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1311,
+    "mean_len": 311.9,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": false,
+      "pred": "let a_n be the number of ways",
+      "gold": "89",
+      "tail": "|>We need to count the number of distinct ways to climb a staircase with 10 steps, where each move is either 1 step or 2 steps.  Let $a_n$ be the number of ways"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "en 3^20=3^(18)*3^2=(3^6)^3*9 \u22611*2=2. Good.<|end_message|><|message_model|><|content_text|>Using Fermat\u2019s little theorem, since 7 is prime, \\[ 3^6 \\equiv 1 \\pmod"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "x = -1 + 2\u00b2 = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 4\u00b2 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "2",
+      "gold": "6",
+      "tail": "ontent_text|>The loop counts pairs \\((i,j)\\) with \\(i<j\\) and \\(a[i] < a[j]\\).  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 - i=1 (5): with 8 \u2192 1 - i=2 (1): with 8, 3 \u2192 "
+     }
+    }
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "n": 40,
+    "acc": 0.875,
+    "correct": 35,
+    "arith_acc": 1.0,
+    "logic_acc": 0.9167,
+    "code_acc": 0.6667,
+    "eos_rate": 0.85,
+    "mean_rep4": 0.1169,
+    "mean_len": 306.8,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " <value>. Need compute number of ways. This is Fibonacci. Let's verify: a_0=1, a_1=1, a_n=a_{n-1}+a_{n-2}. Then a_10 = F_11 if F_1=1,F_2=1? Let's compute: a_0=1"
+     },
+     "16": {
+      "ok": false,
+      "pred": "3",
+      "gold": "2",
+      "tail": "m alternatively. Keep concise.<|end_message|><|message_model|><|content_text|>Compute powers of \\(3\\) modulo \\(7\\):  \\[ 3^1 \\equiv 3,\\quad 3^2 \\equiv 2,\\quad 3^"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": "x = -1 + 2\u00b2 = -1 + 4 = 3   i=3: x = 3 - 3 = 0   i=4: x = 0 + 4\u00b2 = 16   i=5: x = 16 - 5 = 11   i=6: x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "3",
+      "gold": "6",
+      "tail": "airs: - (2,5), (2,8), (2,3) from index 0: 3 pairs - (5,8) from index 1: 1 pair - (1,8), (1,3) from index 2: 2 pairs - none from index 3: 0 pairs  Total: \\(3+1+2"
+     }
+    }
+   },
+   "logits_ad_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.75
+    },
+    "n": 40,
+    "acc": 0.925,
+    "correct": 37,
+    "arith_acc": 1.0,
+    "logic_acc": 1.0,
+    "code_acc": 0.75,
+    "eos_rate": 0.925,
+    "mean_rep4": 0.1333,
+    "mean_len": 306.6,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " rate = 18 \u2212 12 = 6 liters/minute.   Water needed to fill tank = 900 \u2212 360 = 540 liters.   Time = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": " step \\(n-2\\) by 2 steps:     \\[   a_n = a_{n-1} + a_{n-2}   \\]  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\]  So \\(a_{10} = 89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "od{7}$  The cycle length is $6$. Since $20 = 6\\cdot 3 + 2$, $$3^{20} = (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod{7}.$$  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " 3   i=3: odd, x = 3 - 3 = 0   i=4: even, x = 0 + 4\u00b2 = 16   i=5: odd, x = 16 - 5 = 11   i=6: even, x = 11 + 6\u00b2 = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": false,
+      "pred": "3",
+      "gold": "6",
+      "tail": "count pairs \\((i<j)\\) with \\(a[i] < a[j]\\).  Pairs: - i=0 (2): with 5, 8, 3 \u2192 3 - i=1 (5): with 8 \u2192 1 - i=2 (1): with 8, 3 \u2192 2 - i=3 (8): with 3 \u2192 0  Total: \\(3"
+     }
+    }
+   },
+   "logits_ad_w1.0": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.0
+    },
+    "n": 40,
+    "acc": 0.9,
+    "correct": 36,
+    "arith_acc": 0.9375,
+    "logic_acc": 1.0,
+    "code_acc": 0.75,
+    "eos_rate": 0.9,
+    "mean_rep4": 0.135,
+    "mean_len": 305.1,
+    "correct_mask": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     0,
+     0,
+     1,
+     1,
+     1,
+     0,
+     1,
+     1
+    ],
+    "samples": {
+     "2": {
+      "ok": true,
+      "pred": "90",
+      "gold": "90",
+      "tail": " = 18 \u2212 12 = 6 liters/minute. Space needed to fill tank = 900 \u2212 360 = 540 liters. Time required = 540 \u00f7 6 = 90 minutes.  Final Answer: 90 minutes<|end_message|>"
+     },
+     "13": {
+      "ok": true,
+      "pred": "89",
+      "gold": "89",
+      "tail": "step \\(n-2\\) (2 steps), so     \\[   a_n = a_{n-1} + a_{n-2}   \\]  Compute: \\[ 1,1,2,3,5,8,13,21,34,55,89 \\] Thus \\(a_{10}=89\\).  Final Answer: 89<|end_message|>"
+     },
+     "16": {
+      "ok": true,
+      "pred": "2",
+      "gold": "2",
+      "tail": "pmod{7}$  Since $20 = 3\\cdot 6 + 2$, $$3^{20} = 3^{18}\\cdot 3^2 \\equiv (3^6)^3 \\cdot 3^2 \\equiv 1^3 \\cdot 2 \\equiv 2 \\pmod{7}.$$  Final Answer: 2<|end_message|>"
+     },
+     "28": {
+      "ok": true,
+      "pred": "47",
+      "gold": "47",
+      "tail": " = 3   i = 3: odd, x = 3 - 3 = 0   i = 4: even, x = 0 + 16 = 16   i = 5: odd, x = 16 - 5 = 11   i = 6: even, x = 11 + 36 = 47    Final Answer: 47<|end_message|>"
+     },
+     "30": {
+      "ok": true,
+      "pred": "6",
+      "gold": "6",
+      "tail": "0 (2): pairs with 5, 8, 3 \u2192 3 - i=1 (5): pair with 8 \u2192 1 - i=2 (1): pairs with 8, 3 \u2192 2 - i=3 (8): none \u2192 0  Total: \\(3+1+2=6\\).  Final Answer: 6<|end_message|>"
+     }
+    }
+   }
+  },
+  "mcq": {
+   "off": {
+    "cfg": {
+     "mode": "off"
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.7086,
+      "route_acc": 0.88,
+      "reason_recall": 0.6364,
+      "nonreason_to_small": 0.0634
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5882,
+      "route_acc": 0.6176,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.5455
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4933,
+     "nll": 1.3376,
+     "by_type": {
+      "choice": 0.66,
+      "noul": 0.36,
+      "score": 0.46
+     }
+    }
+   },
+   "hidden_w0.2": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.2
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6857,
+      "route_acc": 0.84,
+      "reason_recall": 0.7879,
+      "nonreason_to_small": 0.1479
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.5882,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.5909
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4833,
+     "nll": 1.323,
+     "by_type": {
+      "choice": 0.66,
+      "noul": 0.37,
+      "score": 0.42
+     }
+    }
+   },
+   "hidden_w0.3": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.3
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6229,
+      "route_acc": 0.7714,
+      "reason_recall": 0.7576,
+      "nonreason_to_small": 0.2254
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.5294,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6818
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4967,
+     "nll": 1.3109,
+     "by_type": {
+      "choice": 0.68,
+      "noul": 0.37,
+      "score": 0.44
+     }
+    }
+   },
+   "hidden_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.52,
+      "route_acc": 0.6343,
+      "reason_recall": 0.8485,
+      "nonreason_to_small": 0.4155
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.5588,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6364
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5067,
+     "nll": 1.2944,
+     "by_type": {
+      "choice": 0.67,
+      "noul": 0.39,
+      "score": 0.46
+     }
+    }
+   },
+   "hidden_w0.75": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.75
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4114,
+      "route_acc": 0.4857,
+      "reason_recall": 0.8788,
+      "nonreason_to_small": 0.6056
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.5294,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6818
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5167,
+     "nll": 1.2805,
+     "by_type": {
+      "choice": 0.65,
+      "noul": 0.45,
+      "score": 0.45
+     }
+    }
+   },
+   "hidden_w1.0": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 1.0
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.3371,
+      "route_acc": 0.3771,
+      "reason_recall": 0.9091,
+      "nonreason_to_small": 0.7465
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.5294,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6818
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.54,
+     "nll": 1.2691,
+     "by_type": {
+      "choice": 0.66,
+      "noul": 0.47,
+      "score": 0.49
+     }
+    }
+   },
+   "hidden_bs_w0.5": {
+    "cfg": {
+     "mode": "hidden",
+     "omega": 0.5,
+     "blend_bs": true
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.48,
+      "route_acc": 0.5886,
+      "reason_recall": 0.8182,
+      "nonreason_to_small": 0.4648
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.5588,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6364
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.51,
+     "nll": 1.2797,
+     "by_type": {
+      "choice": 0.67,
+      "noul": 0.41,
+      "score": 0.45
+     }
+    }
+   },
+   "logits_w0.2": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.2,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6857,
+      "route_acc": 0.8571,
+      "reason_recall": 0.7879,
+      "nonreason_to_small": 0.1268
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.5588,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6364
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4967,
+     "nll": 1.3243,
+     "by_type": {
+      "choice": 0.69,
+      "noul": 0.37,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.3,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6514,
+      "route_acc": 0.8114,
+      "reason_recall": 0.7879,
+      "nonreason_to_small": 0.1831
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5882,
+      "route_acc": 0.5882,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.5909
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.49,
+     "nll": 1.3264,
+     "by_type": {
+      "choice": 0.68,
+      "noul": 0.37,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.5,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5429,
+      "route_acc": 0.6914,
+      "reason_recall": 0.8182,
+      "nonreason_to_small": 0.338
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.5294,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6818
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5167,
+     "nll": 1.3456,
+     "by_type": {
+      "choice": 0.68,
+      "noul": 0.45,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "omega": 0.75,
+     "adaptive": false
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4629,
+      "route_acc": 0.6,
+      "reason_recall": 0.8788,
+      "nonreason_to_small": 0.4648
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.5,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.7273
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5233,
+     "nll": 1.3927,
+     "by_type": {
+      "choice": 0.68,
+      "noul": 0.46,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w0.3": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.3
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.68,
+      "route_acc": 0.84,
+      "reason_recall": 0.7879,
+      "nonreason_to_small": 0.1479
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5588,
+      "route_acc": 0.5588,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6364
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4933,
+     "nll": 1.3278,
+     "by_type": {
+      "choice": 0.69,
+      "noul": 0.37,
+      "score": 0.42
+     }
+    }
+   },
+   "logits_ad_w0.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.6343,
+      "route_acc": 0.7829,
+      "reason_recall": 0.8182,
+      "nonreason_to_small": 0.2254
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.5,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.7273
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.4933,
+     "nll": 1.3353,
+     "by_type": {
+      "choice": 0.68,
+      "noul": 0.4,
+      "score": 0.4
+     }
+    }
+   },
+   "logits_ad_w0.75": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 0.75
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.5429,
+      "route_acc": 0.6857,
+      "reason_recall": 0.8485,
+      "nonreason_to_small": 0.3521
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5294,
+      "route_acc": 0.5294,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.6818
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5033,
+     "nll": 1.3577,
+     "by_type": {
+      "choice": 0.68,
+      "noul": 0.42,
+      "score": 0.41
+     }
+    }
+   },
+   "logits_ad_w1.0": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.0
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.4743,
+      "route_acc": 0.6,
+      "reason_recall": 0.8485,
+      "nonreason_to_small": 0.4577
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.5,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.7273
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.5167,
+     "nll": 1.3918,
+     "by_type": {
+      "choice": 0.67,
+      "noul": 0.45,
+      "score": 0.43
+     }
+    }
+   },
+   "logits_ad_w1.5": {
+    "cfg": {
+     "mode": "logits",
+     "adaptive": true,
+     "omega_max": 1.5
+    },
+    "routing": {
+     "transcripts": {
+      "n": 175,
+      "acc3": 0.3943,
+      "route_acc": 0.5086,
+      "reason_recall": 0.9091,
+      "nonreason_to_small": 0.5845
+     },
+     "hard": {
+      "n": 34,
+      "acc3": 0.5,
+      "route_acc": 0.5,
+      "reason_recall": 0.9167,
+      "nonreason_to_small": 0.7273
+     }
+    },
+    "opendecisions": {
+     "n": 300,
+     "acc": 0.54,
+     "nll": 1.4859,
+     "by_type": {
+      "choice": 0.7,
+      "noul": 0.46,
+      "score": 0.46
+     }
+    }
+   }
+  }
+ }
+}

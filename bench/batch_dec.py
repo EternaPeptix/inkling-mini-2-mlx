@@ -20,6 +20,7 @@ ap.add_argument("--tokens", type=int, default=128)
 ap.add_argument("--warm", type=int, default=4)
 ap.add_argument("--no-check", action="store_true")
 ap.add_argument("--out", default="")
+ap.add_argument("--ctx", type=int, default=0, help="prepend N synthetic filler tokens to every prompt (long-context runs)")
 a = ap.parse_args()
 
 PROMPTS = ["Write a Python function that parses an ISO-8601 duration like P3DT4H12M into total seconds, with tests.",
@@ -52,6 +53,8 @@ for P in map(int, a.passes.split(",")):
     mx.eval(model.parameters())
     ids = [tok.encode(tok.apply_chat_template([{"role": "user", "content": t}], add_generation_prompt=True, tokenize=False)
                       + "<|message_model|><|content_text|>", add_special_tokens=False) for t in PROMPTS]
+    if a.ctx:
+        ids = [[(17 * j * j + 3 * j + 7 * i) % 40000 + 1000 for j in range(a.ctx)] + x for i, x in enumerate(ids)]
     Cs = list(map(int, a.C.split(",")))
     ref = {}
     if not a.no_check:
@@ -74,8 +77,11 @@ for P in map(int, a.passes.split(",")):
         y = dec.step(y)
         mx.async_eval(y)
         t0 = None
+        sync = os.environ.get("BD_SYNC_STEP", "") not in ("", "0")  # diagnostic: no CPU/GPU step overlap
         for n in range(a.tokens):
             ny = None
+            if sync:
+                mx.eval(y)
             if n + 1 < a.tokens:
                 ny = dec.step(y)
                 mx.async_eval(ny)

@@ -13,7 +13,7 @@ if os.environ.get("LOOPLING_CMDBUF", "1") not in ("0", ""):
         print("[mlx_lm] note: mlx.core imported before mlx_lm; LOOPLING_CMDBUF buffer sizes not applied",
               file=sys.stderr)
     else:
-        os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "200")
+        os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "32")
         os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "1000000")
 
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"

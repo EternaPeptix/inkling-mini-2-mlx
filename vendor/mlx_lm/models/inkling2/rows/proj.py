@@ -10,6 +10,8 @@ once per launch.  Not wired into the decode path.  Notes and results: docs/FUSED
 * gate_down_rows(x, ws)                    K2: x (B,G,4608) bf16, G weights (64,4608) bf16 -> (B,G,64) bf16
 * gate_mix_rows(down, ss, msg, slots, wf, wm)  K3 -> (B,G,D) f32
 """
+import os
+import weakref
 import mlx.core as mx
 
 from . import gemv as _gemv
@@ -64,15 +66,17 @@ def _qheader(pro):
         if pro:
             _qh[pro] = _qmv.base_header() + GLUE_HEADER + _PRO + _qmv.tile_source(_XLOAD_PRO, _STG_FILL)
         else:
-            _qh[pro] = _qmv.base_header() + _qmv.tile_source()
+            _qh[pro] = _qmv.base_header() + _qmv.tile_source(include_rout=True, include_ro=True)
     return _qh[pro]
 
 
 _kernels = {}
 
 
-def _qkernel(nw, xmap, pro):
-    key = (nw, xmap, pro)
+def _qkernel(nw, xmap, pro, rout=False, ro=False):
+    use_rout = rout and not pro
+    use_ro = ro and not pro and not use_rout
+    key = (nw, xmap, pro, use_rout, use_ro)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -86,24 +90,48 @@ def _qkernel(nw, xmap, pro):
         "uint sg = simdgroup_index_in_threadgroup;",
         "uint sl = thread_index_in_simdgroup;",
     ]
-    if pro:
-        lines.insert(0, "threadgroup bfloat16_t sx[2 * RB * 256];")
-    prev = "0"
-    for i in range(nw):
-        end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
-        if i == nw - 1:
-            head = "if (true)" if i == 0 else "else"
-        else:
-            head = ("if" if i == 0 else "else if") + f" (ty < {end})"
-        gt = "gt" if pro else f"x{xmap[i]}"
-        yoff = "+".join(f"N{j}" for j in range(i)) or "0"
+    fn = "rows_qmv_ro" if use_ro else ("rows_qmv_rout" if use_rout else "rows_qmv_tile")
+    tail_t = "" if (use_rout or use_ro) else ", STG"
+    if not pro:
+        lines += [
+            "const device uint32_t* wp; const device bfloat16_t* sp; const device bfloat16_t* bp;",
+            "const device bfloat16_t* xp; device bfloat16_t* yp; int Ni; uint tyl;",
+        ]
+        prev = "0"
+        for i in range(nw):
+            end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
+            if i == nw - 1:
+                head = "if (true)" if i == 0 else "else"
+            else:
+                head = ("if" if i == 0 else "else if") + f" (ty < {end})"
+            yoff = "+".join(f"N{j}" for j in range(i)) or "0"
+            lines.append(
+                f"{head} {{ wp = w{i}; sp = s{i}; bp = b{i}; xp = x{xmap[i]}; yp = y + B * ({yoff}); Ni = N{i}; tyl = ty - ({prev}); }}"
+            )
+            prev = end
         lines.append(
-            f"{head} {{ rows_qmv_tile<B, K, (N{i} % (RPS * NSG)) != 0, RPS, NSG, RB, STG>"
-            f"(w{i}, s{i}, b{i}, x{xmap[i]}, {gt}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl, {'sx' if pro else '(threadgroup bfloat16_t*)0'}); }}"
+            f"{fn}<B, K, true, RPS, NSG, RB{tail_t}>(wp, sp, bp, xp, xp, yp, Ni, tyl, rb0, sg, sl, (threadgroup bfloat16_t*)0);"
         )
-        prev = end
+    else:
+        if pro:
+            lines.insert(0, "threadgroup bfloat16_t sx[2 * RB * 256];")
+        prev = "0"
+        for i in range(nw):
+            end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
+            if i == nw - 1:
+                head = "if (true)" if i == 0 else "else"
+            else:
+                head = ("if" if i == 0 else "else if") + f" (ty < {end})"
+            gt = "gt"
+            yoff = "+".join(f"N{j}" for j in range(i)) or "0"
+            lines.append(
+                f"{head} {{ {fn}<B, K, (N{i} % (RPS * NSG)) != 0, RPS, NSG, RB{tail_t}>"
+                f"(w{i}, s{i}, b{i}, x{xmap[i]}, {gt}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl, sx); }}"
+            )
+            prev = end
+    suf = "_pro" if pro else ("_ro" if use_ro else ("_rout" if use_rout else ""))
     k = mx.fast.metal_kernel(
-        name="f3_qmv_x%s_n%d%s" % ("".join(map(str, xmap)), nw, "_pro" if pro else ""),
+        name="f3_qmv_x%s_n%d%s" % ("".join(map(str, xmap)), nw, suf),
         input_names=ins,
         output_names=["y"],
         source="\n".join(lines),
@@ -134,23 +162,32 @@ def _launch_q(xs, weights, gate=None):
             xmap.append(len(uniq))
             uniq.append(x)
     args = list(uniq) + ([gate] if gate is not None else [])
-    rps, nsg, rb, stg = _qmv._cfg(B, gate is not None)
-    tmpl = [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb), ("STG", stg)]
-    shapes, tiles = [], 0  # shapes: (B, N_i)
+    tot_n = 0
+    for w, _, _ in weights:
+        tot_n += w.shape[0]
+    pro = gate is not None
+    rout = _qmv._use_rout(B, tot_n, len(weights), pro=pro)
+    ro = _qmv._use_ro(B, tot_n, pro=pro, rout=rout)
+    rps, nsg, rb, stg = _qmv._cfg(B, pro, N=tot_n, rout=rout, ro=ro)
+    tmpl = [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb)]
+    if not ((rout or ro) and not pro):
+        tmpl.append(("STG", stg))
+    tile_w = rps * nsg
+    kg = K // 64
+    tiles = 0
     for i, (w, s, b) in enumerate(weights):
         N = w.shape[0]
-        if w.shape[1] * 4 != K or s.shape != (N, K // 64) or b.shape != (N, K // 64) or s.dtype != mx.bfloat16:
+        if w.shape[1] * 4 != K or s.shape != (N, kg) or b.shape != (N, kg) or s.dtype != mx.bfloat16:
             raise ValueError(f"weight {i}: bad shapes/dtype w{w.shape} s{s.shape}")
         args += [w, s, b]
         tmpl.append((f"N{i}", N))
-        shapes.append((B, N))
-        tiles += (N + rps * nsg - 1) // (rps * nsg)
-    return _qkernel(len(weights), tuple(xmap), gate is not None)(
+        tiles += (N + tile_w - 1) // tile_w
+    return _qkernel(len(weights), tuple(xmap), pro, rout=rout, ro=ro)(
         inputs=args,
         template=tmpl,
         grid=(32, nsg * tiles, (B + rb - 1) // rb),
         threadgroup=(32, nsg, 1),
-        output_shapes=[(B * sum(n for _, n in shapes),)],
+        output_shapes=[(B * tot_n,)],
         output_dtypes=[mx.bfloat16],
     )[0]
 
@@ -173,7 +210,77 @@ def qmv_rows_multi_x(xs, weights, flat=False):
 
 
 def _P(m):
-    return (m.weight, m.scales, m.biases)
+    return (m["weight"], m["scales"], m["biases"])
+
+
+_qkv_cat_cache: dict = {}
+
+
+def _aff8_ok(m):
+    return (
+        getattr(m, "mode", None) == "affine"
+        and getattr(m, "bits", None) == 8
+        and getattr(m, "group_size", None) == 64
+        and "bias" not in m
+        and m["scales"].dtype == mx.bfloat16
+        and (m["weight"].shape[1] * 4) % 256 == 0
+        and (m["weight"].shape[1] * 4) not in (64, 128)
+    )
+
+
+def _get_qkv_cat(a, single_x, full):
+    """Build or reuse concatenated QKV weights for Attention `a`, invalidated immediately on weight mutation."""
+    is_dict = isinstance(a, dict)
+    if is_dict and not hasattr(a, "q_proj"):
+        q_m, r_m, g_m, s_m, k_m, v_m = a["q_proj"], a["r_proj"], a["gate_proj"], a["sink_proj"], a["k_proj"], a["v_proj"]
+        mod_pairs = [("q_proj", q_m), ("r_proj", r_m), ("gate", g_m), ("sinks", s_m), ("k_proj", k_m), ("v_proj", v_m)]
+        if full:
+            mod_pairs += [("k_wproj", a["k_sconv"]["weight_proj"]), ("v_wproj", a["v_sconv"]["weight_proj"])]
+    else:
+        mod_pairs = [("q_proj", a.q_proj), ("r_proj", a.r_proj), ("gate", a.gate_proj), ("sinks", a.sink_proj),
+                     ("k_proj", a.k_proj), ("v_proj", a.v_proj)]
+        if full:
+            mod_pairs += [("k_wproj", a.k_sconv.weight_proj), ("v_wproj", a.v_sconv.weight_proj)]
+    if not all(_aff8_ok(m) for _, m in mod_pairs):
+        return None
+    cur_refs = tuple(t for _, m in mod_pairs for t in (m["weight"], m["scales"], m["biases"]))
+    key = (id(a), bool(single_x), bool(full))
+    ent = _qkv_cat_cache.get(key)
+    if ent is not None and len(ent[0]) == len(cur_refs) and all(x is y for x, y in zip(ent[0], cur_refs)):
+        return ent[1]
+    if len(_qkv_cat_cache) >= 512:
+        _qkv_cat_cache.clear()
+    if single_x and not full:
+        grps = [mod_pairs]
+    else:
+        g0 = mod_pairs[:4]
+        g1 = [mod_pairs[4], mod_pairs[6]] if full else [mod_pairs[4]]
+        g2 = [mod_pairs[5], mod_pairs[7]] if full else [mod_pairs[5]]
+        grps = [g0, g1, g2]
+    cat_groups = []
+    grp_widths = []
+    fields = []
+    for gi, grp in enumerate(grps):
+        cw = grp[0][1]["weight"] if len(grp) == 1 else mx.contiguous(mx.concatenate([m["weight"] for _, m in grp], axis=0))
+        cs = grp[0][1]["scales"] if len(grp) == 1 else mx.contiguous(mx.concatenate([m["scales"] for _, m in grp], axis=0))
+        cb = grp[0][1]["biases"] if len(grp) == 1 else mx.contiguous(mx.concatenate([m["biases"] for _, m in grp], axis=0))
+        cat_groups.append((cw, cs, cb))
+        gw = cw.shape[0]
+        grp_widths.append(gw)
+        loc = 0
+        for nm, m in grp:
+            n = m["weight"].shape[0]
+            fields.append((nm, gi, loc, gw, n))
+            loc += n
+    mx.eval(cat_groups)
+    val = (tuple(cat_groups), tuple(grp_widths), tuple(fields))
+    _qkv_cat_cache[key] = (cur_refs, val)
+    if not is_dict or hasattr(a, "__weakref__"):
+        try:
+            weakref.finalize(a, _qkv_cat_cache.pop, key, None)
+        except TypeError:
+            pass
+    return val
 
 
 def qkv_rows(a, q_in, k_in, v_in, full=None, flat=False):
@@ -181,14 +288,49 @@ def qkv_rows(a, q_in, k_in, v_in, full=None, flat=False):
     layers). Full-attention layers (a has k_sconv.weight_proj) also get k_wproj (from k_in) and v_wproj (from v_in).
     Returns dict: q_proj (B,3072), r_proj (B,384), gate (B,3072), sinks (B,24), k_proj (B,1024), v_proj (B,1024)
     [, k_wproj (B,32), v_wproj (B,32)].
-    flat=True returns (buf, layout) instead: the single output buffer (B*sum(N),) and [(name, offset, N)] (what a fused
-    consumer kernel should read; the dict form returns zero-copy slice views of the same buffer)."""
+    flat=True returns (buf, layout) instead: 1D buffer and [(name, offset, [stride,] N)]."""
+    is_dict = isinstance(a, dict)
     if full is None:
-        full = hasattr(a.k_sconv, "weight_proj")
-    mods = [("q_proj", a.q_proj, q_in), ("r_proj", a.r_proj, q_in), ("gate", a.gate_proj, q_in),
-            ("sinks", a.sink_proj, q_in), ("k_proj", a.k_proj, k_in), ("v_proj", a.v_proj, v_in)]
-    if full:
-        mods += [("k_wproj", a.k_sconv.weight_proj, k_in), ("v_wproj", a.v_sconv.weight_proj, v_in)]
+        ks = a["k_sconv"] if is_dict else a.k_sconv
+        full = ("weight_proj" in ks) if isinstance(ks, dict) else hasattr(ks, "weight_proj")
+    if os.environ.get("LOOPLING_QKV_CAT", "1") not in ("0", ""):
+        single_x = (not full) and (q_in is k_in) and (k_in is v_in)
+        cat = _get_qkv_cat(a, single_x, full)
+        if cat is not None:
+            cat_groups, grp_widths, fields = cat
+            B, K = q_in.shape
+            if single_x:
+                if B == 1:
+                    w0, s0, b0 = cat_groups[0]
+                    buf = mx.quantized_matmul(
+                        q_in.reshape(1, 1, K), w0, scales=s0, biases=b0, transpose=True,
+                        group_size=64, bits=8, mode="affine",
+                    ).reshape(-1)
+                else:
+                    buf = _qmv.qmv_rows(q_in, *cat_groups[0]).reshape(-1)
+                grp_bases = (0,)
+            else:
+                buf = _launch_q([q_in, k_in, v_in], list(cat_groups))
+                grp_bases = (0, B * grp_widths[0], B * (grp_widths[0] + grp_widths[1]))
+            if flat:
+                lay = [(nm, grp_bases[gi] + loc, gw, nc) for nm, gi, loc, gw, nc in fields]
+                return buf, lay
+            out = {}
+            for nm, gi, loc, gw, nc in fields:
+                gb = grp_bases[gi]
+                view = buf[gb : gb + B * gw].reshape(B, gw)[:, loc : loc + nc]
+                out[nm] = view if (loc == 0 and gw == nc) else mx.contiguous(view)
+            return out
+    if is_dict:
+        mods = [("q_proj", a["q_proj"], q_in), ("r_proj", a["r_proj"], q_in), ("gate", a["gate_proj"], q_in),
+                ("sinks", a["sink_proj"], q_in), ("k_proj", a["k_proj"], k_in), ("v_proj", a["v_proj"], v_in)]
+        if full:
+            mods += [("k_wproj", a["k_sconv"]["weight_proj"], k_in), ("v_wproj", a["v_sconv"]["weight_proj"], v_in)]
+    else:
+        mods = [("q_proj", a.q_proj, q_in), ("r_proj", a.r_proj, q_in), ("gate", a.gate_proj, q_in),
+                ("sinks", a.sink_proj, q_in), ("k_proj", a.k_proj, k_in), ("v_proj", a.v_proj, v_in)]
+        if full:
+            mods += [("k_wproj", a.k_sconv.weight_proj, k_in), ("v_wproj", a.v_sconv.weight_proj, v_in)]
     outs = qmv_rows_multi_x([m[2] for m in mods], [_P(m[1]) for m in mods], flat=flat)
     if flat:  # (flat (B*sum N,) bf16, [(name, element offset, N)]): output i is (B, N_i) row-major at its offset
         B, lay, off = q_in.shape[0], [], 0
@@ -226,6 +368,78 @@ for _old, _new in [
 _k2 = {}
 
 
+def _gd_tm1_src(G, B):
+    wsel = "\n".join(
+        ("%s (g == %d) wr = w%d;" % ("if" if g == 0 else "else if", g, g)) if g < G - 1 else ("else wr = w%d;" % g)
+        for g in range(G)
+    )
+    if G == 1:
+        wsel = "const device bfloat16_t* wr = w0;"
+    else:
+        wsel = "const device bfloat16_t* wr;\n    " + wsel
+    return f"""
+    const int t = (int)threadgroup_position_in_grid.x;
+    const int g = t / 64;
+    const int row = t % 64;
+    const int sgN = (int)simdgroup_index_in_threadgroup;
+    const int thrN = (int)thread_index_in_simdgroup;
+    const int bn0 = (sgN * 32 + thrN) * 4;
+    {wsel}
+    wr += (size_t)row * 4608 + bn0;
+    const device bfloat16_t* xb0 = x + (size_t)g * 4608 + bn0;
+    const size_t xbs = (size_t){G} * 4608;
+    float result[{B}];
+    for (int b = 0; b < {B}; b++) result[b] = 0.0f;
+    for (int it = 0; it < 4; it++) {{
+      const int off = it * 1024;
+      const device bfloat16_t* wp = wr + off;
+      bfloat16_t w0v = wp[0], w1v = wp[1], w2v = wp[2], w3v = wp[3];
+      for (int b = 0; b < {B}; b++) {{
+        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+        float v0 = static_cast<float>(xp[0]);
+        float v1 = static_cast<float>(xp[1]);
+        float v2 = static_cast<float>(xp[2]);
+        float v3 = static_cast<float>(xp[3]);
+        result[b] += w0v * v0;
+        result[b] += w1v * v1;
+        result[b] += w2v * v2;
+        result[b] += w3v * v3;
+      }}
+    }}
+    if (bn0 + 4096 < 4608) {{
+      const int off = 4096;
+      const device bfloat16_t* wp = wr + off;
+      bfloat16_t w0v = wp[0], w1v = wp[1], w2v = wp[2], w3v = wp[3];
+      for (int b = 0; b < {B}; b++) {{
+        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+        float v0 = static_cast<float>(xp[0]);
+        float v1 = static_cast<float>(xp[1]);
+        float v2 = static_cast<float>(xp[2]);
+        float v3 = static_cast<float>(xp[3]);
+        result[b] += w0v * v0;
+        result[b] += w1v * v1;
+        result[b] += w2v * v2;
+        result[b] += w3v * v3;
+      }}
+    }}
+    for (int b = 0; b < {B}; b++) {{
+      for (ushort sn = 16; sn >= 1; sn >>= 1) result[b] += simd_shuffle_down(result[b], sn);
+    }}
+    threadgroup float tgp[{B} * 8];
+    if (thrN == 0) {{
+      for (int b = 0; b < {B}; b++) tgp[b * 8 + sgN] = result[b];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgN == 0 && thrN == 0) {{
+      for (int b = 0; b < {B}; b++) {{
+        float s = result[b];
+        for (int k = 1; k < 8; k++) s += tgp[b * 8 + k];
+        o[((size_t)b * {G} + g) * 64 + row] = static_cast<bfloat16_t>(s);
+      }}
+    }}
+"""
+
+
 def gate_down_rows(x, ws):
     """K2. x (B,G,K) bf16 (row b, gate g = the 4608-vector of gate g), ws = G weights (64,K) bf16 as stored
     -> (B,G,64) bf16, == (x[b,g] @ ws[g].T) at M=1 for every (b,g); one launch."""
@@ -236,6 +450,25 @@ def gate_down_rows(x, ws):
     for w in ws:
         if w.shape != (N, K) or w.dtype != mx.bfloat16:
             raise ValueError("weights must all be (N,K) bf16")
+    tm1 = (os.environ.get("LOOPLING_GD_TM1", "1") not in ("0", "")) and N == 64 and K == 4608 and B <= 16
+    if tm1:
+        key = ("tm1", B, G, N, K)
+        kern = _k2.get(key)
+        if kern is None:
+            kern = _k2[key] = mx.fast.metal_kernel(
+                name="f3_gate_down_tm1_b%d_g%d" % (B, G),
+                input_names=["x"] + ["w%d" % g for g in range(G)],
+                output_names=["o"],
+                source=_gd_tm1_src(G, B),
+                ensure_row_contiguous=True,
+            )
+        return kern(
+            inputs=[x] + list(ws),
+            grid=(G * 64 * 32, 8, 1),
+            threadgroup=(32, 8, 1),
+            output_shapes=[(B, G, N)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
     cfg = _gemv._cfg(N, K)
     bm, bn, sm, sn, tm, tn = cfg
     blockM = bm * sm * tm
@@ -270,50 +503,50 @@ def gate_down_rows(x, ws):
 
 
 # =============================================================================================== K3 (gate mix)
-# forget/message_gate_proj (D=2304, 64) f32 at M=1: MLX gemv bm1 bn1 sm8 sn4 tm4 tn4 -> a 32-thread threadgroup owns 32
-# output rows; the 4 lanes of a quad share 4 rows and reduce with shuffle_down(2), (1); lane quad%4==0 holds the result.
+# forget/message_gate_proj (D=2304, 64) f32 at M=1: MLX gemv bm1 bn1 sm8 sn4 tm4 tn4 -> each quad of 4 lanes owns 1 row
+# (K=64 split 4 lanes x 4 uint4/float4 loads), 8 rows per simdgroup, 4 simdgroups (32 output rows) per threadgroup;
+# forget + message weights share one K-loop and reduce with shuffle_down(2), (1); lane (lane&3)==0 writes the epilogue.
 _H3 = r"""
-// GEMVKernel::run for the (2304,64) f32 weight; x is the bf16 gate_down row cast to f32 on load (== states.astype(f32)).
-// out: res[b*4+tm] (valid in lanes with lane%4==0).  Same expression order as rows/gemv.py gemv_rows_run.
-template <int B>
-METAL_FUNC void gate_gemv64(const device float* mat, const device bfloat16_t* xin, const int XS, const uint row0, const uint lane,
-                            thread float* res) {
-  constexpr int K = 64, TM = 4, TN = 4, SN = 4;
-  constexpr int blockN = SN * TN;
-  for (int i = 0; i < B * TM; i++) res[i] = 0.0f;
-  float v_coeff[B][TN];
-  float inter[TN];
-  int bn = int(lane % SN) * TN;
-  mat += size_t(row0 + (lane / SN) * TM) * K;
-  for (int i = 0; i < K / blockN; ++i) {
-    for (int b = 0; b < B; b++)
-      for (int tn = 0; tn < TN; tn++) v_coeff[b][tn] = static_cast<float>(xin[b * XS + bn + tn]);
-    int mat_offset = 0;
-    for (int tm = 0; tm < TM; tm++) {
-      for (int tn = 0; tn < TN; tn++) inter[tn] = mat[mat_offset + bn + tn];
-      for (int b = 0; b < B; b++)
-        for (int tn = 0; tn < TN; tn++) res[b * TM + tm] += inter[tn] * v_coeff[b][tn];
-      mat_offset += K;
-    }
-    bn += blockN;
-  }
-  for (int b = 0; b < B; b++)
-    for (int tm = 0; tm < TM; tm++)
-      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) res[b * TM + tm] += simd_shuffle_down(res[b * TM + tm], sn);
-}
-
-template <int B, int G, int D>
+template <int B, int RB, int G, int D>
 METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, const device bfloat16_t* down, const int g,
                              const device float* s, const device float* msg, const int slot, device float* out,
-                             const uint row0, const uint lane) {
-  float fr[B * 4], mr[B * 4];
-  gate_gemv64<B>(wf, down + g * 64, G * 64, row0, lane, fr);
-  gate_gemv64<B>(wm, down + g * 64, G * 64, row0, lane, mr);
-  if (lane % 4 == 0) {
-    for (int tm = 0; tm < 4; tm++) {
-      const int d = int(row0 + (lane / 4) * 4) + tm;
-      for (int b = 0; b < B; b++) {
-        out[(b * G + g) * D + d] = glue_msg_combine<0>(fr[b * 4 + tm], mr[b * 4 + tm], s[b * D + d], msg[(b * 4 + slot) * D + d]);
+                             const uint row0, const uint b0, const uint lane) {
+  const int nb = min(RB, B - (int)b0);
+  const int row = int(row0 + (lane >> 2));
+  const int qn = int(lane & 3) * 4;
+  float fr[RB], mr[RB];
+  for (int b = 0; b < RB; b++) {
+    fr[b] = 0.0f;
+    mr[b] = 0.0f;
+  }
+  const device float* wfr = wf + (size_t)row * 64 + qn;
+  const device float* wmr = wm + (size_t)row * 64 + qn;
+  const device bfloat16_t* dn0 = down + (b0 * G + g) * 64 + qn;
+  for (int i = 0; i < 4; i++) {
+    int off = i * 16;
+    float4 ff = ((const device float4*)(wfr + off))[0];
+    float4 mm = ((const device float4*)(wmr + off))[0];
+    #pragma unroll
+    for (int b = 0; b < RB; b++) {
+      if (b < nb) {
+        const device bfloat16_t* xp = dn0 + b * G * 64 + off;
+        float v0 = float(xp[0]), v1 = float(xp[1]), v2 = float(xp[2]), v3 = float(xp[3]);
+        fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
+        mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+      }
+    }
+  }
+  for (int b = 0; b < RB; b++) {
+    fr[b] += simd_shuffle_down(fr[b], 2);
+    fr[b] += simd_shuffle_down(fr[b], 1);
+    mr[b] += simd_shuffle_down(mr[b], 2);
+    mr[b] += simd_shuffle_down(mr[b], 1);
+  }
+  if ((lane & 3) == 0) {
+    for (int b = 0; b < RB; b++) {
+      if (b < nb) {
+        const int gb = (int)b0 + b;
+        out[(gb * G + g) * D + row] = glue_msg_combine<0>(fr[b], mr[b], s[gb * D + row], msg[(gb * 4 + slot) * D + row]);
       }
     }
   }
@@ -321,6 +554,7 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
 """
 
 _k3 = {}
+_GMIX_RB = int(os.environ.get("LOOPLING_GMIX_RB", "2"))
 
 
 def gate_mix_rows(down, ss, msg, slots, wf, wm):
@@ -332,7 +566,7 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
     D = wf[0].shape[0]
     if R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G:
         raise ValueError("down must be (B,G,64) bf16; one s/wf/wm per gate")
-    if _gemv._cfg(D, 64) != (1, 1, 8, 4, 4, 4) or D % 32:
+    if D % 32 or (D != 2304 and _gemv._cfg(D, 64) != (1, 1, 8, 4, 4, 4)):
         raise ValueError("gate_mix_rows is specialised for D % 32 == 0 and MLX's bm1 bn1 sm8 sn4 tm4 tn4 gemv config")
     for w in list(wf) + list(wm):
         if w.shape != (D, 64) or w.dtype != mx.float32:
@@ -349,22 +583,28 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
             smap.append(len(uniq))
             uniq.append(s)
     nt = D // 32
-    key = (B, G, D, tuple(smap), tuple(slots))
+    rb = min(B, max(1, _GMIX_RB))
+    key = (B, rb, G, D, tuple(smap), tuple(slots))
     kern = _k3.get(key)
     if kern is None:
-        lines = ["const uint t = threadgroup_position_in_grid.x;", "const uint lane = thread_index_in_simdgroup;",
-                 f"const uint row0 = (t % {nt}) * 32;"]
+        lines = [
+            "const uint t = threadgroup_position_in_grid.x;",
+            f"const uint b0 = threadgroup_position_in_grid.y * {rb};",
+            "const uint sg = simdgroup_index_in_threadgroup;",
+            "const uint lane = thread_index_in_simdgroup;",
+            f"const uint row0 = (t % {nt}) * 32 + sg * 8;",
+        ]
         for g in range(G):
             if g < G - 1:
                 head = ("if" if g == 0 else "else if") + f" (t < {(g + 1) * nt})"
             else:
                 head = "else" if g else ""
             lines.append(
-                "%s { gate_mix_one<%d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, row0, lane); }"
-                % (head, B, G, D, g, g, g, smap[g], slots[g])
+                "%s { gate_mix_one<%d, %d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, row0, b0, lane); }"
+                % (head, B, rb, G, D, g, g, g, smap[g], slots[g])
             )
         kern = mx.fast.metal_kernel(
-            name="f3_gate_mix_b%d_g%d_s%s_m%s" % (B, G, "".join(map(str, smap)), "".join(map(str, slots))),
+            name="f3_gate_mix_b%d_rb%d_g%d_s%s_m%s" % (B, rb, G, "".join(map(str, smap)), "".join(map(str, slots))),
             input_names=["down", "msg"] + ["s%d" % j for j in range(len(uniq))]
             + ["wf%d" % g for g in range(G)] + ["wm%d" % g for g in range(G)],
             output_names=["out"],
@@ -375,8 +615,8 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
         _k3[key] = kern
     return kern(
         inputs=[down, msg] + uniq + list(wf) + list(wm),
-        grid=(G * nt * 32, 1, 1),
-        threadgroup=(32, 1, 1),
+        grid=(G * nt * 128, (B + rb - 1) // rb, 1),
+        threadgroup=(128, 1, 1),
         output_shapes=[(B, G, D)],
         output_dtypes=[mx.float32],
     )[0]

@@ -321,7 +321,7 @@ _relative_attention_kernel = mx.fast.metal_kernel(
 _FAST_REL_ATTN = os.environ.get("LOOPLING_FAST_REL_ATTN", "1") not in ("0", "")
 _REL_CFG_ENV = os.environ.get("LOOPLING_REL_ATTN_CFG", "")
 _REL_GQA_BLK, _REL_QSG, _REL_TRANS_K, _REL_DBUF = (
-    (int(x) for x in _REL_CFG_ENV.split(",")) if _REL_CFG_ENV else (1, 0, 1, 1)
+    (int(x) for x in _REL_CFG_ENV.split(",")) if _REL_CFG_ENV else (1, 0, 1, 0)
 )
 
 _RELATIVE_ATTENTION_FAST_SOURCE = """
@@ -345,7 +345,7 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
     const int g_in_blk = int(sg) / QSG;
     const int q_sg = int(sg) % QSG;
     const int head = gy * GQA_BLK + g_in_blk;
-    const int q0 = threadgroup_position_in_grid.x * BQ;
+    const int q0 = (sizes[2] - 1 - int(threadgroup_position_in_grid.x)) * BQ;
     const int start = key_start[batch];
     const float qscale = scale * LOG2E;
 
@@ -414,10 +414,10 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
                 vv[1] = vp[1];
             }
             if constexpr (TRANS_K) {
-                for (int j = 0; j < 8; ++j) {
-                    Kc[r * LDV + col + j] = half(float(kv[j / 4][j % 4]));
-                    Vc[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
-                }
+                ((threadgroup half4*)(Kc + r * LDV + col))[0] = half4(float4(kv[0]));
+                ((threadgroup half4*)(Kc + r * LDV + col))[1] = half4(float4(kv[1]));
+                ((threadgroup half4*)(Vc + r * LDV + col))[0] = half4(float4(vv[0]));
+                ((threadgroup half4*)(Vc + r * LDV + col))[1] = half4(float4(vv[1]));
             } else {
                 for (int j = 0; j < 8; ++j) {
                     Kc[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
@@ -434,7 +434,9 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
         simdgroup_float8x8 scores[BK / 8];
         for (int kb = 0; kb < BK / 8; ++kb) {
             scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            for (int db = 0; db < D / 8; ++db) {
+        }
+        for (int db = 0; db < D / 8; ++db) {
+            for (int kb = 0; kb < BK / 8; ++kb) {
                 simdgroup_half8x8 k_frag;
                 if constexpr (TRANS_K) {
                     simdgroup_load(k_frag, Kc + kb * 8 * LDV + db * 8, LDV, ulong2(0, 0), true);
@@ -494,6 +496,7 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
         tile_max = max(tile_max, simd_shuffle_xor(tile_max, 8));
         const float new_max = max(row_max, tile_max);
         const float factor = fast::exp2(row_max - new_max);
+        const bool skip_pv = simd_all(tile_max - new_max < -25.0f);
         float tile_sum = 0.0f;
         simdgroup_half8x8 probs[BK / 8];
         for (int kb = 0; kb < BK / 8; ++kb) {
@@ -507,13 +510,19 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
         tile_sum += simd_shuffle_xor(tile_sum, 8);
         row_sum = row_sum * factor + tile_sum;
         row_max = new_max;
-        for (int db = 0; db < D / 8; ++db) {
-            acc[db].thread_elements()[0] *= factor;
-            acc[db].thread_elements()[1] *= factor;
-            for (int kb = 0; kb < BK / 8; ++kb) {
-                simdgroup_half8x8 v_frag;
-                simdgroup_load(v_frag, Vc + kb * 8 * LDV + db * 8, LDV);
-                simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+        if (factor != 1.0f) {
+            for (int db = 0; db < D / 8; ++db) {
+                acc[db].thread_elements()[0] *= factor;
+                acc[db].thread_elements()[1] *= factor;
+            }
+        }
+        if (!skip_pv) {
+            for (int db = 0; db < D / 8; ++db) {
+                for (int kb = 0; kb < BK / 8; ++kb) {
+                    simdgroup_half8x8 v_frag;
+                    simdgroup_load(v_frag, Vc + kb * 8 * LDV + db * 8, LDV);
+                    simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+                }
             }
         }
     }
@@ -556,6 +565,7 @@ def relative_attention(
     if _FAST_REL_ATTN and Hq % Hkv == 0 and (Hq // Hkv) % _REL_GQA_BLK == 0:
         qsg = _REL_QSG if _REL_QSG > 0 else (8 if S >= 4096 and L >= 256 else 4)
         bq = qsg * 8
+        nq_tiles = (L + bq - 1) // bq
         tg = _REL_GQA_BLK * qsg * 32
         ny = Hkv * ((Hq // Hkv) // _REL_GQA_BLK)
         return _relative_attention_fast_kernel(
@@ -566,7 +576,7 @@ def relative_attention(
                 mx.contiguous(rel),
                 mx.contiguous(sinks.astype(mx.float32)),
                 mx.contiguous(key_start.astype(mx.int32)),
-                mx.array([L, S], dtype=mx.int32),
+                mx.array([L, S, nq_tiles], dtype=mx.int32),
                 scalar(scale),
             ],
             template=[
@@ -581,7 +591,7 @@ def relative_attention(
                 ("TRANS_K", _REL_TRANS_K),
                 ("DBUF", _REL_DBUF),
             ],
-            grid=((L + bq - 1) // bq * tg, ny, B),
+            grid=(nq_tiles * tg, ny, B),
             threadgroup=(tg, 1, 1),
             output_shapes=[(B, L, Hq, D)],
             output_dtypes=[q.dtype],

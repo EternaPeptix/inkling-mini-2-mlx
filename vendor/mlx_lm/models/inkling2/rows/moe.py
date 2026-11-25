@@ -255,7 +255,7 @@ inline float dot_vals_bf16_u2val(uint2 xpk, const thread float* d, float scale) 
 HEADER = mlx_header() + _DOT_BF16 + GLUE_HEADER + _ROUTE_FN
 
 # --------------------------------------------------------------------------------------------------------------------
-# K11b: route + compact unique-expert table (1 lightweight threadgroup launch)
+# K11b: route + compact unique-expert table (1 parallel 128-thread threadgroup launch)
 _ROUTE_GROUP_SRC = r"""
     constexpr int NPAIR = BB * 8;
     uint sg = simdgroup_index_in_threadgroup;
@@ -263,83 +263,52 @@ _ROUTE_GROUP_SRC = r"""
     uint ttid = thread_index_in_threadgroup;
     threadgroup uint ind_s[64];
     threadgroup float wt_s[64];
-    threadgroup uint uniq_tmp[64];
-    threadgroup uint cnt_tmp[64];
-    threadgroup uint tmp_p[512];
-    threadgroup uint sorted_idx[64];
+    threadgroup uint cnt_e[128];
+    threadgroup uint64_t mask_e[128];
 
-    if ((int)sg < BB) {
-        moe_route_row(logits + sg * 128, bias, lane, ind_s + sg * 8, wt_s + sg * 8, eps, rscale);
+    for (int row = (int)sg; row < BB; row += 4) {
+        moe_route_row(logits + row * 128, bias, lane, ind_s + row * 8, wt_s + row * 8, eps, rscale);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = (int)ttid; i < NPAIR; i += 256) {
+    for (int i = (int)ttid; i < NPAIR; i += 128) {
         inds_o[i] = ind_s[i];
         wts_o[i] = wt_s[i];
     }
+    uint64_t my_mask = 0;
+    for (int p = 0; p < NPAIR; p++) {
+        if (ind_s[p] == ttid) my_mask |= (1ULL << p);
+    }
+    cnt_e[ttid] = (uint)metal::popcount(my_mask);
+    mask_e[ttid] = my_mask;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
-        int nu = 0;
-        for (int base = 0; base < NPAIR; base += 32) {
-            int p = base + (int)lane;
-            bool is_first = (p < NPAIR);
-            if (is_first) {
-                uint ep = ind_s[p];
-                for (int q = 0; q < p; q++) {
-                    if (ind_s[q] == ep) { is_first = false; break; }
-                }
-            }
-            int pre = simd_prefix_exclusive_sum(is_first ? 1 : 0);
-            if (is_first) uniq_tmp[nu + pre] = ind_s[p];
-            nu += simd_sum(is_first ? 1 : 0);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int base = 0; base < nu; base += 32) {
-            int u = base + (int)lane;
-            if (u < nu) {
-                uint eu = uniq_tmp[u];
-                uint c = 0;
-                for (int p = 0; p < NPAIR; p++) {
-                    if (ind_s[p] == eu) {
-                        tmp_p[u * 8 + c] = (uint)p;
-                        c++;
+        uint out_u = 0;
+        uint off_acc = 0;
+        for (int tc = BB; tc >= 1; tc--) {
+            for (int base = 0; base < 128; base += 32) {
+                uint e = uint(base) + lane;
+                uint c = cnt_e[e];
+                bool take = (int(c) == tc);
+                int pre = simd_prefix_exclusive_sum(take ? 1 : 0);
+                uint slot = out_u + uint(pre);
+                uint my_off = off_acc + uint(pre) * uint(tc);
+                if (take) {
+                    uniq_e[slot] = e;
+                    u_cnt[slot] = c;
+                    u_off[slot] = my_off;
+                    uint64_t m = mask_e[e];
+                    for (int j = 0; j < tc; j++) {
+                        uint p = uint(metal::ctz(m));
+                        pair_list[my_off + uint(j)] = p;
+                        m &= (m - 1ULL);
                     }
                 }
-                cnt_tmp[u] = c;
+                int taken = simd_sum(take ? 1 : 0);
+                out_u += uint(taken);
+                off_acc += uint(taken * tc);
             }
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        int out_u = 0;
-        for (int tc = BB; tc >= 1; tc--) {
-            for (int base = 0; base < nu; base += 32) {
-                int u = base + (int)lane;
-                bool take = (u < nu) && ((int)cnt_tmp[u] == tc);
-                int pre = simd_prefix_exclusive_sum(take ? 1 : 0);
-                if (take) sorted_idx[out_u + pre] = (uint)u;
-                out_u += simd_sum(take ? 1 : 0);
-            }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        uint off_acc = 0;
-        for (int base = 0; base < nu; base += 32) {
-            int u = base + (int)lane;
-            uint c = 0;
-            uint su = 0;
-            if (u < nu) {
-                su = sorted_idx[u];
-                c = cnt_tmp[su];
-            }
-            uint pre = simd_prefix_exclusive_sum(c);
-            uint my_off = off_acc + pre;
-            off_acc += simd_sum(c);
-            if (u < nu) {
-                uniq_e[u] = uniq_tmp[su];
-                u_cnt[u] = c;
-                u_off[u] = my_off;
-                for (uint j = 0; j < c; j++) {
-                    pair_list[my_off + j] = tmp_p[su * 8 + j];
-                }
-            }
-        }
-        if (lane == 0) num_uniq[0] = (uint)nu;
+        if (lane == 0) num_uniq[0] = out_u;
     }
 """
 
@@ -493,8 +462,8 @@ def route_group_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0):
     return list(_rg_kernel(
         inputs=[logits, bias, scalar(score_eps), scalar(route_scale)],
         template=[("BB", B)],
-        grid=(256, 1, 1),
-        threadgroup=(256, 1, 1),
+        grid=(128, 1, 1),
+        threadgroup=(128, 1, 1),
         output_shapes=[(B, 8), (B, 8), (1,), (npair,), (npair,), (npair,), (npair,)],
         output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32, mx.uint32, mx.uint32, mx.uint32],
     ))
@@ -526,28 +495,70 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src):
         const device uint8_t* ws = ws0;
         const device uint8_t* sc = sc0;
         for (int it = 0; it < NFULL; it++) {
-            thread U xt[VPT];
-            load_vector<T, U, VPT>(x + xo + it * BLOCK, xt);
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                thread U wv[VPT];
-                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                result[r] += dot_vals<BITS, VPT>(xt, wv, sv);
-            }
-            ws += BLOCK * 4 / PF;
-            sc += BLOCK / GS;
-        }
-        if constexpr (HAS_TAIL) {
-            if (tail_on) {
+            const uint k_off = (uint)it * (uint)BLOCK;
+            if constexpr (VPT == 8) {
+                uint4 x4 = ((const device uint4*)(x + xo + k_off))[0];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_bf16_u4val<BITS>(x4, wv, sv);
+                }
+            } else if constexpr (VPT == 4) {
+                uint2 x2 = ((const device uint2*)(x + xo + k_off))[0];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_bf16_u2val<BITS>(x2, wv, sv);
+                }
+            } else {
                 thread U xt[VPT];
-                load_vector<T, U, VPT>(x + xo + NFULL * BLOCK, xt);
+                load_vector<T, U, VPT>(x + xo + k_off, xt);
                 #pragma unroll
                 for (int r = 0; r < ROWS; r++) {
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
                     U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals<BITS, VPT>(xt, wv, sv);
+                }
+            }
+            ws += BLOCK * 4 / PF;
+            sc += BLOCK / GS;
+        }
+        if constexpr (HAS_TAIL) {
+            if (tail_on) {
+                const uint k_off = (uint)NFULL * (uint)BLOCK;
+                if constexpr (VPT == 8) {
+                    uint4 x4 = ((const device uint4*)(x + xo + k_off))[0];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals_bf16_u4val<BITS>(x4, wv, sv);
+                    }
+                } else if constexpr (VPT == 4) {
+                    uint2 x2 = ((const device uint2*)(x + xo + k_off))[0];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals_bf16_u2val<BITS>(x2, wv, sv);
+                    }
+                } else {
+                    thread U xt[VPT];
+                    load_vector<T, U, VPT>(x + xo + k_off, xt);
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals<BITS, VPT>(xt, wv, sv);
+                    }
                 }
             }
         }
@@ -573,35 +584,67 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src):
             for (int it = 0; it < NFULL; it++) {
                 const uint k_off = (uint)it * (uint)BLOCK;
                 if constexpr (VPT == 8) {
-                    thread uint4 x4[TMAX];
-                    #pragma unroll
-                    for (int t = 0; t < TMAX; t++) {
-                        if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
-                    }
-                    #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
-                        thread U wv[VPT];
-                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    if constexpr (STREAM_X) {
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[VPT];
+                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) {
+                                    uint4 xpk = ((const device uint4*)(x + xo[t] + k_off))[0];
+                                    result[t][r] += dot_vals_bf16_u4val<BITS>(xpk, wv, sv);
+                                }
+                            }
+                        }
+                    } else {
+                        thread uint4 x4[TMAX];
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
-                            if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
+                            if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[VPT];
+                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
+                            }
                         }
                     }
                 } else if constexpr (VPT == 4) {
-                    thread uint2 x2[TMAX];
-                    #pragma unroll
-                    for (int t = 0; t < TMAX; t++) {
-                        if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
-                    }
-                    #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
-                        thread U wv[VPT];
-                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    if constexpr (STREAM_X) {
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[VPT];
+                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) {
+                                    uint2 xpk = ((const device uint2*)(x + xo[t] + k_off))[0];
+                                    result[t][r] += dot_vals_bf16_u2val<BITS>(xpk, wv, sv);
+                                }
+                            }
+                        }
+                    } else {
+                        thread uint2 x2[TMAX];
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
-                            if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                            if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[VPT];
+                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                            }
                         }
                     }
                 } else {
@@ -631,35 +674,67 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src):
                 if (tail_on) {
                     const uint k_off = (uint)NFULL * (uint)BLOCK;
                     if constexpr (VPT == 8) {
-                        thread uint4 x4[TMAX];
-                        #pragma unroll
-                        for (int t = 0; t < TMAX; t++) {
-                            if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
-                        }
-                        #pragma unroll
-                        for (int r = 0; r < ROWS; r++) {
-                            thread U wv[VPT];
-                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        if constexpr (STREAM_X) {
+                            #pragma unroll
+                            for (int r = 0; r < ROWS; r++) {
+                                thread U wv[VPT];
+                                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                #pragma unroll
+                                for (int t = 0; t < TMAX; t++) {
+                                    if (t < nb) {
+                                        uint4 xpk = ((const device uint4*)(x + xo[t] + k_off))[0];
+                                        result[t][r] += dot_vals_bf16_u4val<BITS>(xpk, wv, sv);
+                                    }
+                                }
+                            }
+                        } else {
+                            thread uint4 x4[TMAX];
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
-                                if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
+                                if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
+                            }
+                            #pragma unroll
+                            for (int r = 0; r < ROWS; r++) {
+                                thread U wv[VPT];
+                                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                #pragma unroll
+                                for (int t = 0; t < TMAX; t++) {
+                                    if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
+                                }
                             }
                         }
                     } else if constexpr (VPT == 4) {
-                        thread uint2 x2[TMAX];
-                        #pragma unroll
-                        for (int t = 0; t < TMAX; t++) {
-                            if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
-                        }
-                        #pragma unroll
-                        for (int r = 0; r < ROWS; r++) {
-                            thread U wv[VPT];
-                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        if constexpr (STREAM_X) {
+                            #pragma unroll
+                            for (int r = 0; r < ROWS; r++) {
+                                thread U wv[VPT];
+                                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                #pragma unroll
+                                for (int t = 0; t < TMAX; t++) {
+                                    if (t < nb) {
+                                        uint2 xpk = ((const device uint2*)(x + xo[t] + k_off))[0];
+                                        result[t][r] += dot_vals_bf16_u2val<BITS>(xpk, wv, sv);
+                                    }
+                                }
+                            }
+                        } else {
+                            thread uint2 x2[TMAX];
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
-                                if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                                if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
+                            }
+                            #pragma unroll
+                            for (int r = 0; r < ROWS; r++) {
+                                thread U wv[VPT];
+                                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                #pragma unroll
+                                for (int t = 0; t < TMAX; t++) {
+                                    if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                                }
                             }
                         }
                     } else {
@@ -1214,24 +1289,66 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
     #pragma unroll
     for (int r = 0; r < ROWS; r++) result[r] = 0;
     for (int it = 0; it < NFULL; it++) {{
-        thread U xt[VPT];
-        load_vector<T, U, VPT>(xp + it * BLOCK, xt);
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) {{
-            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-            result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+        const uint k_off = (uint)it * (uint)BLOCK;
+        if constexpr (VPT == 8) {{
+            uint4 x4 = ((const device uint4*)(xp + k_off))[0];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {{
+                thread U wv[VPT];
+                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                result[r] += dot_vals_bf16_u4val<BITS>(x4, wv, sv);
+            }}
+        }} else if constexpr (VPT == 4) {{
+            uint2 x2 = ((const device uint2*)(xp + k_off))[0];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {{
+                thread U wv[VPT];
+                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                result[r] += dot_vals_bf16_u2val<BITS>(x2, wv, sv);
+            }}
+        }} else {{
+            thread U xt[VPT];
+            load_vector<T, U, VPT>(xp + k_off, xt);
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {{
+                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+            }}
         }}
         ws += BLOCK * 4 / PF;
         sc += BLOCK / GS;
     }}
     if constexpr (HAS_TAIL) {{
         if ((int)lane * VPT < TAILK) {{
-            thread U xt[VPT];
-            load_vector<T, U, VPT>(xp + NFULL * BLOCK, xt);
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {{
-                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+            const uint k_off = (uint)NFULL * (uint)BLOCK;
+            if constexpr (VPT == 8) {{
+                uint4 x4 = ((const device uint4*)(xp + k_off))[0];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {{
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_bf16_u4val<BITS>(x4, wv, sv);
+                }}
+            }} else if constexpr (VPT == 4) {{
+                uint2 x2 = ((const device uint2*)(xp + k_off))[0];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {{
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_bf16_u2val<BITS>(x2, wv, sv);
+                }}
+            }} else {{
+                thread U xt[VPT];
+                load_vector<T, U, VPT>(xp + k_off, xt);
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {{
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+                }}
             }}
         }}
     }}
@@ -1290,24 +1407,66 @@ def _down_b1_src(dbg, scale_lit):
         #pragma unroll
         for (int r = 0; r < ROWS; r++) result[r] = 0;
         for (int it = 0; it < NFULL; it++) {{
-            thread U xt[VPT];
-            load_vector<T, U, VPT>(xp + it * BLOCK, xt);
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {{
-                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+            const uint k_off = (uint)it * (uint)BLOCK;
+            if constexpr (VPT == 8) {{
+                uint4 x4 = ((const device uint4*)(xp + k_off))[0];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {{
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_bf16_u4val<BITS>(x4, wv, sv);
+                }}
+            }} else if constexpr (VPT == 4) {{
+                uint2 x2 = ((const device uint2*)(xp + k_off))[0];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {{
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_bf16_u2val<BITS>(x2, wv, sv);
+                }}
+            }} else {{
+                thread U xt[VPT];
+                load_vector<T, U, VPT>(xp + k_off, xt);
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {{
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+                }}
             }}
             ws += BLOCK * 4 / PF;
             sc += BLOCK / GS;
         }}
         if constexpr (HAS_TAIL) {{
             if (tail_on) {{
-                thread U xt[VPT];
-                load_vector<T, U, VPT>(xp + NFULL * BLOCK, xt);
-                #pragma unroll
-                for (int r = 0; r < ROWS; r++) {{
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                    result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+                const uint k_off = (uint)NFULL * (uint)BLOCK;
+                if constexpr (VPT == 8) {{
+                    uint4 x4 = ((const device uint4*)(xp + k_off))[0];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals_bf16_u4val<BITS>(x4, wv, sv);
+                    }}
+                }} else if constexpr (VPT == 4) {{
+                    uint2 x2 = ((const device uint2*)(xp + k_off))[0];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals_bf16_u2val<BITS>(x2, wv, sv);
+                    }}
+                }} else {{
+                    thread U xt[VPT];
+                    load_vector<T, U, VPT>(xp + k_off, xt);
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
+                    }}
                 }}
             }}
         }}
@@ -1358,10 +1517,17 @@ def _geom(w, scales, K, mode, group_size, bits):
 
 def _tmax(B, cap=None):
     c = TMAX_CAP if cap is None else cap
-    for t in (1, 2, 3, 4, 8, 16):
+    for t in (1, 2, 3, 4, 6, 8, 16):
         if B <= t or t >= c:
             return t
     return 16
+
+
+def _stream_x(tmax):
+    ov = os.environ.get("MOE_STREAM_X")
+    if ov is not None:
+        return ov not in ("0", "", "false", "False")
+    return tmax >= 4
 
 
 def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, bits, route_scale, gate_softcap,
@@ -1467,9 +1633,11 @@ def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, b
         shapes = [(B, 8, N // 2)] + ([(B, 8, N)] if debug else [])
         dts = [mx.bfloat16] + ([mx.bfloat16] if debug else [])
 
+    tmax_gu = _tmax(B, TMAX_CAP_GU)
+    stream_x = _stream_x(tmax_gu)
     outs = list(k(inputs=ins,
                   template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast),
-                            ("TMAX", _tmax(B, TMAX_CAP_GU)),
+                            ("TMAX", tmax_gu), ("STREAM_X", stream_x),
                             ("KK", K), ("NN", N), ("BB", B), ("NSG", nsg), ("ROWS", rows)],
                   grid=(32, nsg * (N // (rows * nsg)), B * 8), threadgroup=(32, nsg, 1),
                   output_shapes=shapes, output_dtypes=dts))
@@ -1567,9 +1735,12 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
             args_g = [w, scales, gsc, sw, num_uniq, uniq_e, u_off, u_cnt, pair_list]
         else:
             args_g = [w, scales, gsc, sw, inds.astype(mx.uint32)] + ([w_act.reshape(-1)] if has_wa else [])
+        tmax_dn = _tmax(B, TMAX_CAP_DN)
+        stream_x = _stream_x(tmax_dn)
         (down,) = kg(
             inputs=args_g,
-            template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast), ("TMAX", _tmax(B, TMAX_CAP_DN)),
+            template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast), ("TMAX", tmax_dn),
+                      ("STREAM_X", stream_x),
                       ("KK", K), ("NN", C), ("BB", B), ("NSG", nsg), ("ROWS", rows)],
             grid=(32, nsg * (C // (rows * nsg)), B * 8),
             threadgroup=(32, nsg, 1),
@@ -1652,8 +1823,10 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
         args = [w, scales, gsc, sw, num_uniq, uniq_e, u_off, u_cnt, pair_list, wts, residual, cs3, conv_w]
     else:
         args = [w, scales, gsc, sw, inds.astype(mx.uint32), wts, residual, cs3, conv_w]
+    tmax_dnf = _tmax(B, TMAX_CAP_DN)
     return list(k(inputs=args,
-                  template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast), ("TMAX", _tmax(B, TMAX_CAP_DN)),
+                  template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast), ("TMAX", tmax_dnf),
+                            ("STREAM_X", _stream_x(tmax_dnf)),
                             ("KK", K), ("NN", C), ("BB", B), ("NSG", nsg), ("CC", C)],
                   grid=(32, nsg * (C // 4), 1), threadgroup=(32, nsg, 1), output_shapes=shapes, output_dtypes=dts))
 
@@ -1675,8 +1848,8 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
         gu, dn, act = ex.gate_up_proj, ex.down_proj, ex.act_fn
         cw = layer.post_mlp_convolution.conv1d.weight
     B = x.shape[0]
-    rows_gu = 2 if (causal and 2 <= B <= 6 and "MOE_ROWS_GU" not in os.environ) else None
-    rows_dn = 2 if (causal and 2 <= B <= 6 and "MOE_ROWS_DN" not in os.environ) else None
+    rows_gu = 2 if (2 <= B <= 8 and "MOE_ROWS_GU" not in os.environ) else None
+    rows_dn = 2 if (2 <= B <= 8 and "MOE_ROWS_DN" not in os.environ) else None
     if w_act is not None:
         assert causal and B > 1
         route = "launch"

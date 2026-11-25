@@ -501,13 +501,23 @@ def gate_down_rows(x, ws):
 # (K=64 split 4 lanes x 4 uint4/float4 loads), 8 rows per simdgroup, 4 simdgroups (32 output rows) per threadgroup;
 # forget + message weights share one K-loop and reduce with shuffle_down(2), (1); lane (lane&3)==0 writes the epilogue.
 _H3 = r"""
-template <int B, int RB, int G, int D>
+template <int B, int RB, int G, int D, int NSG>
 METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, const device bfloat16_t* down, const int g,
                              const device float* s, const device float* msg, const int slot, device float* out,
-                             const uint row0, const uint b0, const uint lane) {
+                             const uint row0, const uint b0, const uint sg, const uint lane,
+                             threadgroup bfloat16_t* dn_s) {
   const int nb = min(RB, B - (int)b0);
   const int row = int(row0 + (lane >> 2));
   const int qn = int(lane & 3) * 4;
+  const uint tid = sg * 32 + lane;
+  const uint tg_threads = uint(NSG * 32);
+  for (uint idx = tid; idx < uint(nb * 16); idx += tg_threads) {
+    uint b = idx >> 4;
+    uint ch = (idx & 15u) * 4u;
+    ((threadgroup uint2*)(dn_s + b * 64 + ch))[0] =
+        ((const device uint2*)(down + ((b0 + b) * G + g) * 64 + ch))[0];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   float fr[RB], mr[RB];
   for (int b = 0; b < RB; b++) {
     fr[b] = 0.0f;
@@ -515,7 +525,6 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
   }
   const device float* wfr = wf + (size_t)row * 64 + qn;
   const device float* wmr = wm + (size_t)row * 64 + qn;
-  const device bfloat16_t* dn0 = down + (b0 * G + g) * 64 + qn;
   for (int i = 0; i < 4; i++) {
     int off = i * 16;
     float4 ff = ((const device float4*)(wfr + off))[0];
@@ -523,8 +532,7 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
     #pragma unroll
     for (int b = 0; b < RB; b++) {
       if (b < nb) {
-        const device bfloat16_t* xp = dn0 + b * G * 64 + off;
-        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+        bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
         float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
         fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
         mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
@@ -577,17 +585,20 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
         else:
             smap.append(len(uniq))
             uniq.append(s)
-    nt = D // 32
+    nsg = 2 if (G == 1 and D % 16 == 0) else 4
+    rows_tg = nsg * 8
+    nt = D // rows_tg
     rb = min(B, max(1, _GMIX_RB))
-    key = (B, rb, G, D, tuple(smap), tuple(slots))
+    key = (B, rb, G, D, nsg, tuple(smap), tuple(slots))
     kern = _k3.get(key)
     if kern is None:
         lines = [
+            f"threadgroup bfloat16_t dn_s[{rb} * 64];",
             "const uint t = threadgroup_position_in_grid.x;",
             f"const uint b0 = threadgroup_position_in_grid.y * {rb};",
             "const uint sg = simdgroup_index_in_threadgroup;",
             "const uint lane = thread_index_in_simdgroup;",
-            f"const uint row0 = (t % {nt}) * 32 + sg * 8;",
+            f"const uint row0 = (t % {nt}) * {rows_tg} + sg * 8;",
         ]
         for g in range(G):
             if g < G - 1:
@@ -595,11 +606,11 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
             else:
                 head = "else" if g else ""
             lines.append(
-                "%s { gate_mix_one<%d, %d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, row0, b0, lane); }"
-                % (head, B, rb, G, D, g, g, g, smap[g], slots[g])
+                "%s { gate_mix_one<%d, %d, %d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, row0, b0, sg, lane, dn_s); }"
+                % (head, B, rb, G, D, nsg, g, g, g, smap[g], slots[g])
             )
         kern = mx.fast.metal_kernel(
-            name="f3_gate_mix_b%d_rb%d_g%d_s%s_m%s" % (B, rb, G, "".join(map(str, smap)), "".join(map(str, slots))),
+            name="f3_gate_mix_b%d_rb%d_g%d_n%d_s%s_m%s" % (B, rb, G, nsg, "".join(map(str, smap)), "".join(map(str, slots))),
             input_names=["down", "msg"] + ["s%d" % j for j in range(len(uniq))]
             + ["wf%d" % g for g in range(G)] + ["wm%d" % g for g in range(G)],
             output_names=["out"],
@@ -608,10 +619,11 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
             ensure_row_contiguous=True,
         )
         _k3[key] = kern
+    tg_t = nsg * 32
     return kern(
         inputs=[down, msg] + uniq + list(wf) + list(wm),
-        grid=(G * nt * 128, (B + rb - 1) // rb, 1),
-        threadgroup=(128, 1, 1),
+        grid=(G * nt * tg_t, (B + rb - 1) // rb, 1),
+        threadgroup=(tg_t, 1, 1),
         output_shapes=[(B, G, D)],
         output_dtypes=[mx.float32],
     )[0]

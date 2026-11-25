@@ -128,14 +128,18 @@ def t_weights():
 def t_server():
     from mlx_lm.generate import BatchGenerator
     from mlx_lm.models.cache import make_prompt_cache
+    from mlx_lm.models.inkling2.batchdecode import BatchDecoder
     model, tok = load(3)
     orig = F.decode_layer
-    calls = {"n": 0}
+    orig_b1 = BatchDecoder._layer_b1
+    calls = {"n": 0, "bd": 0}
     F.decode_layer = lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), orig(*a, **k))[1]
+    BatchDecoder._layer_b1 = lambda self, *a, **k: (calls.__setitem__("bd", calls["bd"] + 1), orig_b1(self, *a, **k))[1]
 
     def run(prompt, fast, caches=None, n=24):
         L._FAST_ON = fast
         calls["n"] = 0
+        calls["bd"] = 0
         g = BatchGenerator(model, max_tokens=n, prefill_step_size=512)
         g.insert([prompt], max_tokens=[n], caches=caches)
         toks, lps = [], []
@@ -147,7 +151,7 @@ def t_server():
                 break
         g.close()
         L._FAST_ON = True
-        return toks, lps, calls["n"]
+        return toks, lps, calls["n"] + calls["bd"]
 
     for ctx, tag in ((200, "fresh B=1 request, ctx 200"), (1100, "fresh B=1 request, ctx 1100 (rotating window wraps)")):
         ids = [(17 * i * i + 3 * i) % 40000 + 1000 for i in range(ctx)]
@@ -155,7 +159,7 @@ def t_server():
         b, lb, nb = run(ids, True)
         same = a == b and all(mx.array_equal(x, y).item() for x, y in zip(la, lb))
         check("server: " + tag + ": tokens + logprobs identical", same, f"n={len(a)}")
-        check("server: " + tag + ": fast path taken", na == 0 and nb > 0, f"decode_layer calls ref {na} fast {nb}")
+        check("server: " + tag + ": fast path taken", na == 0 and nb > 0, f"fast calls ref {na} fast {nb}")
     # prompt-cache hit: merge of non-empty caches
     ids = [(17 * i * i + 3 * i) % 40000 + 1000 for i in range(1100)]
 
@@ -172,9 +176,10 @@ def t_server():
     same = a == b and all(mx.array_equal(x, y).item() for x, y in zip(la, lb))
     check("server: prompt-cache hit B=1: tokens + logprobs identical", same, f"n={len(a)}")
     check("server: prompt-cache hit B=1: fast path taken", na == 0 and nb > 0, f"calls ref {na} fast {nb}")
-    # two concurrent requests must NOT take the fast path (and stay correct)
+    # two concurrent requests must NOT take the FD.decode_layer B=1 fast path (and stay correct)
     L._FAST_ON = True
     calls["n"] = 0
+    calls["bd"] = 0
     g = BatchGenerator(model, max_tokens=8, prefill_step_size=512)
     g.insert([ids[:100], ids[:90]], max_tokens=[8, 8])
     out = []
@@ -183,6 +188,7 @@ def t_server():
     g.close()
     check("server: B=2 never takes the fast path", calls["n"] == 0, f"calls {calls['n']}")
     F.decode_layer = orig
+    BatchDecoder._layer_b1 = orig_b1
 
 
 if __name__ == "__main__":

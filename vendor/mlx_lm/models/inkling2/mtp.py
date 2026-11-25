@@ -1849,7 +1849,7 @@ def mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, prefill_st
     use_exact = (
         os.environ.get("LOOPLING_MTP_EXACT", "1") not in ("0", "")
         and os.environ.get("LOOPLING_MTP_LEGACY", "0") in ("0", "")
-        and not tm.loopcd.enabled_for(passes)
+        and not (tm.loopcd.enabled_for(passes) and tm.loopcd.mode != "hidden")
         and L._use_kernels()
         and {"pre", "k1", "post"}.issubset(_FUSED)
         and not _PLAIN

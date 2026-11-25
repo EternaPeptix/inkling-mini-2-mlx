@@ -94,6 +94,7 @@ def run_batch_with_checkpoints(model, prompt_cache, model_key, prompt, max_token
 def main():
     test_lru_checkpoint_eviction()
     from mlx_lm.models.inkling2 import fastdecode as FD
+    from mlx_lm.models.inkling2.batchdecode import BatchDecoder
     model, tok = load(os.path.expanduser("~/loopling/models/loopling-p3"))
     mx.eval(model.parameters())
 
@@ -109,14 +110,20 @@ def main():
 
     fd_calls = [0]
     orig_fd = FD.decode_layer
+    orig_b1 = BatchDecoder._layer_b1
     def counted_fd(*a, **k):
         fd_calls[0] += 1
         return orig_fd(*a, **k)
+    def counted_b1(self, *a, **k):
+        fd_calls[0] += 1
+        return orig_b1(self, *a, **k)
     FD.decode_layer = counted_fd
+    BatchDecoder._layer_b1 = counted_b1
     try:
         hit_b, ttft_b, toks_b = run_batch_with_checkpoints(model, pc_warm, "p3", prompt_b, max_tokens=32, ckpt_stride=2048)
     finally:
         FD.decode_layer = orig_fd
+        BatchDecoder._layer_b1 = orig_b1
     print(f"Prompt B (mutated tail @6200): hit={hit_b}/6400 ({hit_b/6400*100:.1f}%), ttft={ttft_b:.3f}s ({ttft_a/ttft_b:.1f}x faster), fastdecode_calls={fd_calls[0]}", flush=True)
     assert hit_b == 6144, f"expected checkpoint hit at 6144, got {hit_b}"
     assert fd_calls[0] > 0, "expected fastdecode to remain active after checkpoint resume!"

@@ -113,6 +113,14 @@ def from_env() -> LoopCDConfig:
     )
 
 
+from functools import partial
+
+@partial(mx.compile, shapeless=True)
+def _extrapolate_hidden_bf(h_final: mx.array, h_ref: mx.array, w: mx.array) -> mx.array:
+    h_f32 = h_final.astype(mx.float32)
+    return (h_f32 + w * (h_f32 - h_ref.astype(mx.float32))).astype(h_final.dtype)
+
+
 def apply_hidden(
     h_final: mx.array,
     bs_final: Any,
@@ -125,8 +133,7 @@ def apply_hidden(
     if cfg.omega == 0.0:
         return h_final, bs_final
     w = float(cfg.omega)
-    h_f32 = h_final.astype(mx.float32)
-    h_out = (h_f32 + w * (h_f32 - h_ref.astype(mx.float32))).astype(h_final.dtype)
+    h_out = _extrapolate_hidden_bf(h_final, h_ref, mx.array(w, dtype=mx.float32))
 
     if cfg.blend_bs and bs_final is not None and bs_ref is not None:
         if isinstance(bs_final, list):

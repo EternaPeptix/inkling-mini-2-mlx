@@ -1222,7 +1222,8 @@ class BatchDecoder:
                 h, bs = prelude
             h, bs = run_b1(layers[core.start : core.stop], h, bs, bank)
             if p == ref_pass:
-                ref_state = (h, list(bs))
+                keep_bs = cfg.blend_bs or cfg.mode == "logits"
+                ref_state = (h, list(bs) if keep_bs else None)
         if use_cd and cfg.mode == "hidden":
             h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
         coda_layers = layers[core.stop :]
@@ -1292,10 +1293,11 @@ class BatchDecoder:
                     msg = msgs[i]
                 else:
                     msg = tm.message_input(bank4, i).reshape(C, 4, 2304)
+                next_gpar1 = i < last_i and (isinstance(ls[i + 1], L.SlidingDecoderLayer) or bank is not None)
                 h, bs, prev_moe = self._layer_batch(
                     layer, self._v, h, bs, msg,
                     self._stage_main, step_metas, step_Ss, full_offs, st_len, kv_news,
-                    tau_cache, self.conv, prev_moe=prev_moe, skip_combine=(fuse_ck1 and i < last_i),
+                    tau_cache, self.conv, prev_moe=prev_moe, skip_combine=(fuse_ck1 and next_gpar1),
                 )
                 self._v += 1
             return h, bs
@@ -1313,7 +1315,8 @@ class BatchDecoder:
                 h, bs = prelude
             h, bs = run_batch(layers[core.start : core.stop], h, bs, bank)
             if p == ref_pass:
-                ref_state = (h, list(bs))
+                keep_bs = cfg.blend_bs or do_logits_cd
+                ref_state = (h, list(bs) if keep_bs else None)
         if use_cd and cfg.mode == "hidden":
             h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
         coda_layers = layers[core.stop :]
@@ -1605,7 +1608,7 @@ class BatchDecoder:
         """Non-mutating causal W-token verify using GPU `meta_arr` and `tau_table`, without mid-async_eval."""
         assert self._b1_fast and self._kv_stacked
         tm = self.tm
-        assert not tm.loopcd.enabled_for(tm.args.loop_config["num_passes"])
+        assert not (tm.loopcd.enabled_for(num_passes) and tm.loopcd.mode != "hidden")
         assert tm.args.loop_config["num_passes"] == 1 and self.nv == 24
         W = int(tokens.shape[0])
         assert 2 <= W <= 8
@@ -1640,6 +1643,175 @@ class BatchDecoder:
             use_walk=use_walk, use_stage=use_stage,
         )
 
+    def _get_cw_compiled_loop(
+        self, W, max_depth, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, tap_tuple,
+        use_tau_table=False, tau_size=0, use_walk=False, fuse_k1=None, use_stage=False, use_dyn=False,
+    ):
+        if fuse_k1 is None:
+            fuse_k1 = (not use_dyn) and (os.environ.get("LOOPLING_FUSE_COMB_K1", "0") not in ("0", ""))
+        tm = self.tm
+        m = self.model
+        layers_seq = tm.layer_visits
+        core = tm.args.loop_core
+        num_passes = tm.args.loop_config["num_passes"]
+        cfg = tm.loopcd
+        use_cd = cfg.enabled_for(num_passes) and cfg.mode == "hidden"
+        ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if use_cd else None
+        md_key = None if use_tau_table else max_depth
+        key = (
+            "loop", W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple,
+            use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, num_passes, cd_key,
+        )
+        ent = self._cw_compiled.get(key)
+        if ent is not None:
+            return ent
+
+        tap_set = set(tap_tuple) if tap_tuple is not None else set()
+        nv = self.nv
+        has_o = "o" in tap_set
+        has_F = tap_tuple is not None
+        pre_n = sum(1 for v in range(0, core.start) if layers_seq[v].is_block_boundary)
+        n_core = core.stop - core.start
+        n_bs_core = pre_n + sum(1 for v in range(core.start, core.stop) if layers_seq[v].is_block_boundary)
+        use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
+
+        def make_chunk(v0, v1, *, is_first=False, is_last=False, use_msg=False, apply_cd=False):
+            n_v = v1 - v0
+            t_in_chunk = frozenset(v for v in range(v0, v1) if v in tap_set)
+            f_vs = [v for v in range(v0, v1) if not self._cw_meta[v][1]]
+            f_pos = {v: i for i, v in enumerate(f_vs)}
+
+            @mx.compile
+            def fn(
+                h_in, bs_in, h_aux, bs_aux,
+                kv_r, kv_f, kv_st_r, kv_st_f,
+                ca_in, tm_in, dep_in, m_r, m_f, tau_luts, w_act_in, walk_in, *convs
+            ):
+                old = (self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st, self.conv)
+                try:
+                    self._kv_ring = kv_r
+                    self._kv_full = kv_f
+                    if use_stage:
+                        self._kv_ring_st = kv_st_r
+                        self._kv_full_st = kv_st_f
+                    self.conv = [None] * nv
+                    for j, v in enumerate(range(v0, v1)):
+                        self.conv[v] = [convs[4 * j], convs[4 * j + 1], convs[4 * j + 2], convs[4 * j + 3]]
+                    wa = w_act_in[0] if use_dyn else None
+                    if is_first:
+                        h = tm.embed(h_in.reshape(W, 1)).reshape(W, 2304)
+                        bs = None
+                        msgs = None
+                    elif use_msg:
+                        bank = (
+                            mx.stack(list(bs_in[pre_n + 1 :]), axis=0),
+                            L.unweighted_rms_norm(h_in.astype(mx.float32)),
+                        )
+                        if use_batch_msg:
+                            msgs = IK.depth_attention_batch(bank[0], bank[1], tm.message_input.query, scale=2304 ** -0.5)
+                        else:
+                            bank4 = (bank[0][:, :, None, :], bank[1][:, None, :])
+                            msgs = [tm.message_input(bank4, i).reshape(W, 4, 2304) for i in range(n_v)]
+                        h = h_aux
+                        bs = list(bs_aux)
+                    else:
+                        h = h_in
+                        bs = list(bs_in) if bs_in else None
+                        msgs = None
+                        if apply_cd:
+                            h, bs = loopcd.apply_hidden(
+                                h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg
+                            )
+
+                    prev_moe = None
+                    kvns, cws, taps_out = [], [], []
+                    for j, v in enumerate(range(v0, v1)):
+                        tlut = tau_luts[f_pos[v]] if v in f_pos else None
+                        is_ring = self._kv_vmap[v][0]
+                        skip_v = fuse_k1 and (
+                            (v + 1 < v1 and self._cw_meta[v + 1][1])
+                            or (is_last and v == v1 - 1)
+                        )
+                        use_prev = prev_moe is not None
+                        msg_v = None if msgs is None else msgs[j]
+                        out_v, bs, kvn, cw, prev_w3, h_before_v = self._layer_causal_w(
+                            layers_seq[v], v, h, bs, msg_v, W,
+                            depths_arr=dep_in,
+                            tau_lut=(None if use_tau_table else tlut),
+                            tau_table=(tlut if use_tau_table else None),
+                            meta_arr=(m_r if is_ring else m_f),
+                            s_bounds=(s_bounds_r if is_ring else s_bounds_f),
+                            conv_anc=ca_in, tree_meta=tm_in,
+                            prev_moe=prev_moe, skip_combine=skip_v, emit_h=use_prev,
+                            use_stage=use_stage, w_act=wa,
+                        )
+                        if v in t_in_chunk:
+                            taps_out.append(h_before_v)
+                        kvns.append(kvn)
+                        if prev_w3 is not None:
+                            cws.append(prev_w3)
+                        cws.extend(cw)
+                        if skip_v:
+                            prev_moe = out_v
+                        else:
+                            prev_moe = None
+                            h = out_v
+                    if is_last:
+                        if prev_moe is not None:
+                            r_fn = RL.k1_from_down_causal(
+                                prev_moe["down"], prev_moe["expert_w"], prev_moe["residual"], prev_moe["cs3"],
+                                prev_moe["conv_w"], ca_in, bs, None, tm.final_input.query, [tm.norm.weight],
+                                sliding=True, eps_ln=tm.norm.eps, emit_h=has_o,
+                            )
+                            cws.append(r_fn["w3"])
+                            if has_o:
+                                taps_out.append(r_fn["h"])
+                            h_out = r_fn["q_in"]
+                        else:
+                            if has_o:
+                                taps_out.append(h)
+                            h_out = RL.k1_pre(
+                                h, bs, None, tm.final_input.query, [tm.norm.weight],
+                                sliding=True, eps_ln=tm.norm.eps, w_act=wa,
+                            )["q_in"]
+                        if has_F:
+                            taps_out.append(h_out)
+                        lm = m.lm_head
+                        text = m.args.text
+                        if "head" in _FUSED and "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
+                            nt = RQ.qmv_softcap_argmax_rows(
+                                h_out, lm["weight"], lm["scales"], lm["biases"],
+                                text.final_logit_softcapping, text.unpadded_vocab_size,
+                            )
+                        else:
+                            lg = RQ.qmv_rows(h_out, lm["weight"], lm["scales"], lm["biases"])
+                            nt = RH.softcap_argmax_rows(lg, text.final_logit_softcapping, text.unpadded_vocab_size)
+                        return [nt] + kvns + cws + taps_out
+                    return [h] + (list(bs) if bs is not None else []) + kvns + cws + taps_out
+                finally:
+                    self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st, self.conv = old
+
+            t_keys = [v for v in range(v0, v1) if v in tap_set]
+            if is_last:
+                if has_o:
+                    t_keys.append("o")
+                if has_F:
+                    t_keys.append("F")
+            n_bs_out = 0 if is_last else (pre_n if is_first else n_bs_core)
+            return fn, v0, v1, n_bs_out, f_vs, t_keys
+
+        chunks = [make_chunk(0, core.start, is_first=True)]
+        for p in range(num_passes):
+            v0 = core.start + p * n_core
+            chunks.append(make_chunk(v0, v0 + n_core, use_msg=(p > 0)))
+        coda_v0 = core.start + num_passes * n_core
+        chunks.append(make_chunk(coda_v0, nv, is_last=True, apply_cd=use_cd))
+        if len(self._cw_compiled) >= 64:
+            self._cw_compiled.clear()
+        ent = self._cw_compiled[key] = (chunks, pre_n, n_bs_core, use_cd, ref_pass, bool(cfg.blend_bs))
+        return ent
+
     def verify_w(
         self, tokens, *, tap_visits=None, parents=None, depths=None, depths_arr=None, max_depth=None,
         conv_anc=None, tree_meta=None,
@@ -1647,7 +1819,10 @@ class BatchDecoder:
         """Bit-exact causal W-token/tree verify (W in 2..8) without mutating caches or conv state."""
         assert self._b1_fast
         tm = self.tm
-        assert not tm.loopcd.enabled_for(tm.args.loop_config["num_passes"])
+        num_passes = tm.args.loop_config["num_passes"]
+        cfg = tm.loopcd
+        use_cd = cfg.enabled_for(num_passes)
+        assert not (use_cd and cfg.mode != "hidden")
         self._ensure_stacked_kv()
         if self._kv_st_len > 0:
             self.flush_kv_stage()
@@ -1659,11 +1834,10 @@ class BatchDecoder:
                 depths = tuple(range(W))
             depths, conv_anc, tree_meta = build_tree_tables(parents, depths)
 
-        num_passes = tm.args.loop_config["num_passes"]
         use_compile = (
             os.environ.get("LOOPLING_COMPILE_VERIFY", "1") not in ("0", "")
-            and num_passes == 1
-            and self.nv == 24
+            and self.nv == len(tm.layer_visits)
+            and ((num_passes == 1 and self.nv == 24) or num_passes > 1)
         )
         if use_compile:
             if depths_arr is None:
@@ -1681,22 +1855,82 @@ class BatchDecoder:
                 r_key, f_key, m_r, m_f, s_b_r, s_b_f, end0_f, cap_r, cap_f = binfo
                 tap_set = set(tap_visits) if tap_visits is not None else set()
                 tap_tuple = tuple(sorted(tap_set, key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))) if tap_visits is not None else None
-                (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
-                    W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-                )
                 layers_seq = tm.layer_visits
                 conv_flat = [x for cs in self.conv for x in cs]
-                tluts0 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
-                tluts1 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs1]
-                tluts2 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs2]
+                if num_passes == 1 and self.nv == 24:
+                    (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
+                        W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
+                    )
+                    tluts0 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
+                    tluts1 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs1]
+                    tluts2 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs2]
 
-                o0 = fn0(tokens, [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts0, [], [], *conv_flat[:24])
-                mx.async_eval(o0[0])
-                o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts1, [], [], *conv_flat[24:56])
-                mx.async_eval(o1[0])
-                o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts2, [], [], *conv_flat[56:])
+                    o0 = fn0(tokens, [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts0, [], [], *conv_flat[:24])
+                    mx.async_eval(o0[0])
+                    o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts1, [], [], *conv_flat[24:56])
+                    mx.async_eval(o1[0])
+                    o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts2, [], [], *conv_flat[56:])
+                    return self._unpack_cw_outputs(o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None)
 
-                return self._unpack_cw_outputs(o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None)
+                chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
+                    W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
+                )
+                outs_all = []
+                # Prelude
+                fn0, v0, v1, nbs_pre, fvs0, tks0 = chunks[0]
+                tluts = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
+                o_pre = fn0(
+                    tokens, [], [], [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
+                    depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * v0 : 4 * v1],
+                )
+                mx.async_eval(o_pre[0])
+                outs_all.append((o_pre, v1 - v0, nbs_pre, tks0))
+                h_pre = o_pre[0]
+                bs_pre = o_pre[1 : 1 + nbs_pre]
+                o_prev = o_pre
+                ref_o = None
+                for p in range(num_passes):
+                    fn_p, pv0, pv1, nbs_p, pfvs, ptks = chunks[1 + p]
+                    tluts = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in pfvs]
+                    if p == 0:
+                        o_p = fn_p(
+                            h_pre, bs_pre, [], [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
+                            depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * pv0 : 4 * pv1],
+                        )
+                    else:
+                        o_p = fn_p(
+                            o_prev[0], o_prev[1 : 1 + n_bs_core], h_pre, bs_pre,
+                            self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
+                            depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * pv0 : 4 * pv1],
+                        )
+                    mx.async_eval(o_p[0])
+                    outs_all.append((o_p, pv1 - pv0, nbs_p, ptks))
+                    o_prev = o_p
+                    if cd_on and p == ref_pass:
+                        ref_o = o_p
+                # Coda
+                fn_c, cv0, cv1, _, cfvs, ctks = chunks[-1]
+                tluts = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in cfvs]
+                h_aux = ref_o[0] if cd_on else []
+                bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
+                o_c = fn_c(
+                    o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
+                    self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
+                    depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * cv0 : 4 * cv1],
+                )
+                outs_all.append((o_c, cv1 - cv0, 0, ctks))
+                kv_news, conv_ws = [], []
+                tap_buf = {} if tap_visits is not None else None
+                for out_i, nvi, nbsi, tksi in outs_all:
+                    head = 1 + nbsi
+                    ncw = 4 * nvi
+                    kv_news.extend(out_i[head : head + nvi])
+                    conv_ws.extend(out_i[head + nvi : head + nvi + ncw])
+                    if tap_buf is not None:
+                        for k, arr in zip(tksi, out_i[head + nvi + ncw :]):
+                            tap_buf[k] = arr
+                conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
+                return o_c[0], kv_news, conv_ws, tap_buf
 
         if depths is None:
             depths = tuple(depths_arr.tolist())
@@ -1706,11 +1940,14 @@ class BatchDecoder:
         tau_cache = {}
         tap_set = set(tap_visits) if tap_visits is not None else set()
         tap_buf = {} if tap_visits is not None else None
+        ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        ref_state = None
         h = tm.embed(tokens.reshape(W, 1)).reshape(W, 2304)
         use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
         kv_news = [None] * self.nv
         conv_ws = [None] * self.nv
         split = os.environ.get("LOOPLING_VERIFY_SPLIT", "1") not in ("0", "")
+        split_pts = (6, 14) if num_passes == 1 else (6, 18, 30, 42)
 
         def run_cw(ls, h, bs, bank=None):
             nonlocal v_idx
@@ -1727,7 +1964,7 @@ class BatchDecoder:
                 kv_news[v_idx] = kvn
                 conv_ws[v_idx] = cw
                 v_idx += 1
-                if split and (v_idx == 6 or v_idx == 14):
+                if split and v_idx in split_pts:
                     mx.async_eval(h)
             return h, bs
 
@@ -1743,6 +1980,10 @@ class BatchDecoder:
                 )
                 h, bs = prelude
             h, bs = run_cw(layers[core.start : core.stop], h, bs, bank)
+            if use_cd and p == ref_pass:
+                ref_state = (h, list(bs) if cfg.blend_bs else None)
+        if use_cd and cfg.mode == "hidden":
+            h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
         h, bs = run_cw(layers[core.stop :], h, bs)
         assert v_idx == self.nv
         if tap_buf is not None and "o" in tap_set:

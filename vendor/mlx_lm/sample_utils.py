@@ -70,6 +70,16 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
+    sampler._sampler_key = (
+        float(temp),
+        float(top_p),
+        float(min_p),
+        int(min_tokens_to_keep),
+        int(top_k),
+        float(xtc_probability),
+        float(xtc_threshold),
+        tuple(xtc_special_tokens),
+    )
     return sampler
 
 
@@ -132,6 +142,9 @@ def make_logits_processors(
 
 def greedy_sampler(logprobs: mx.array) -> mx.array:
     return mx.argmax(logprobs, axis=-1)
+
+
+greedy_sampler._sampler_key = ("greedy",)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)

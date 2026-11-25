@@ -496,11 +496,7 @@ METAL_FUNC void mg_tile_run(
     const uint r = q / quads, e = 4 * (q % quads);
     const bfloat4 wbf = *reinterpret_cast<const device bfloat4*>(ln_w + e);
     const float4 sc = rows[q] * shared.inverses[r];
-    dst[q] = bfloat4(
-        bfloat16_t(wbf.x) * bfloat16_t(sc.x),
-        bfloat16_t(wbf.y) * bfloat16_t(sc.y),
-        bfloat16_t(wbf.z) * bfloat16_t(sc.z),
-        bfloat16_t(wbf.w) * bfloat16_t(sc.w));
+    dst[q] = bfloat4(float4(wbf) * sc);
   }
 }
 """
@@ -562,7 +558,7 @@ def _k_splash(name, ins, outs, src):
 def _splash_ok(gates, N: int) -> bool:
     return (
         _SPLASH_MSGGATE
-        and len(gates) == 3
+        and len(gates) in (1, 3)
         and N >= 32
         and all(g.down_proj.weight.shape == (64, 4608) for g in gates)
     )

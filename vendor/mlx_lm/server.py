@@ -789,6 +789,7 @@ class ResponseGenerator:
         current_model = None
         current_tokenizer = None
         current_model_key = None
+        current_text_sm = None
         batch_generator = None
         drain_batch = False
         batch_results = {}
@@ -838,8 +839,12 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-                    text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
+                    stop_sm = (
+                        TextStateMachine.from_stop_words(args.stop_words)
+                        if args.stop_words
+                        else None
+                    )
+                    text_sm = current_text_sm
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -866,6 +871,10 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    need_lp = bool(
+                        args.logprobs
+                        or (args.top_logprobs is not None and args.top_logprobs > 0)
+                    )
                     (uid,) = batch_generator.insert_segments(
                         segments=[segments],
                         max_tokens=[args.max_tokens],
@@ -873,12 +882,13 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
+                        need_logprobs=[need_lp],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
                         "detokenizer": current_tokenizer.detokenizer,
-                        "stop_reader": stop_sm.reader(),
+                        "stop_reader": stop_sm.reader() if stop_sm is not None else None,
                         "segment_types": segment_types[::-1],
                         "logprobs": args.logprobs,
                         "top_logprobs": args.top_logprobs,
@@ -914,6 +924,7 @@ class ResponseGenerator:
                     current_model = args.model
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
+                    current_text_sm = TextStateMachine.from_tokenizer(tokenizer)
                     batch_results = {}
                     batch_generator = BatchGenerator(
                         model,
@@ -940,6 +951,7 @@ class ResponseGenerator:
                         current_model = None
                         current_tokenizer = None
                         current_model_key = None
+                        current_text_sm = None
                         batch_generator.close()
                         batch_generator = None
                         drain_batch = False
@@ -1017,9 +1029,12 @@ class ResponseGenerator:
                         else:
                             result["detokenizer"].add_token(r.token)
                             text = result["detokenizer"].last_segment
-                        text, finish_reason = _apply_stop_words(
-                            result["stop_reader"], text, finish_reason=r.finish_reason
-                        )
+                        if result["stop_reader"] is not None:
+                            text, finish_reason = _apply_stop_words(
+                                result["stop_reader"], text, finish_reason=r.finish_reason
+                            )
+                        else:
+                            finish_reason = r.finish_reason
 
                         result["rqueue"].put(
                             Response(
@@ -1087,6 +1102,9 @@ class ResponseGenerator:
                                 cache,
                                 cache_type="assistant",
                             )
+
+                    if not self._is_distributed and not drain_batch and not self.requests.empty():
+                        break
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
@@ -1280,6 +1298,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.response_generator = response_generator
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
         super().__init__(*args, **kwargs)
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def _set_cors_headers(self):
         allowed_origins = self.response_generator.cli_args.allowed_origins
@@ -1931,11 +1956,12 @@ def _run_http_server(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
     server_class.address_family, _, _, _, server_address = next(iter(infos))
+    fingerprint = get_system_fingerprint()
     httpd = server_class(
         server_address,
         lambda *args, **kwargs: handler_class(
             response_generator,
-            system_fingerprint=get_system_fingerprint(),
+            system_fingerprint=fingerprint,
             *args,
             **kwargs,
         ),

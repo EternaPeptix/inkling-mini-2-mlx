@@ -155,9 +155,10 @@ class TextModel(PipelineMixin, nn.Module):
                 self.layers[core.start : core.stop], hidden_states, block_states, bank
             )
             if loop_pass == ref_pass:
+                keep_bs = cfg.blend_bs or cfg.mode == "logits"
                 ref_state = (
                     hidden_states,
-                    list(block_states) if isinstance(block_states, list) else block_states,
+                    (list(block_states) if isinstance(block_states, list) else block_states) if keep_bs else None,
                 )
 
         if use_cd and cfg.mode == "hidden":

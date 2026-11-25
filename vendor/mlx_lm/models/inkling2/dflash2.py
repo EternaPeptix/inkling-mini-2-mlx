@@ -15,6 +15,7 @@ from collections import deque
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2.rows import qmv as RQ
 
 DFLASH2_DIR = os.environ.get(
@@ -74,6 +75,52 @@ def _qkv_norm_split(
     k = mx.fast.rms_norm(qkv[:, q_w : q_w + k_w].reshape(1, B, nkv, hd), k_norm_w, _EPS).transpose(0, 2, 1, 3)
     v = qkv[:, q_w + k_w :].reshape(1, B, nkv, hd).transpose(0, 2, 1, 3)
     return q, k, v
+
+
+_DF_COMPILED: dict = {}
+
+
+def _get_df_compiled(nh: int, nkv: int, hd: int, inter: int, qbits: int):
+    key = (nh, nkv, hd, inter, qbits)
+    ent = _DF_COMPILED.get(key)
+    if ent is not None:
+        return ent
+
+    def _dlin(x: mx.array, w) -> mx.array:
+        if qbits:
+            return mx.quantized_matmul(
+                x, w[0], scales=w[1], biases=w[2], transpose=True, group_size=64, bits=qbits, mode="affine"
+            )
+        return x @ w
+
+    @mx.compile
+    def pre_rope(x, in_ln, a_dyn, a_base, qkv_w, q_norm, k_norm):
+        B = x.shape[0]
+        h_norm = mx.fast.rms_norm(x, in_ln, _EPS)
+        dyn_a = _dlin(h_norm, a_dyn).reshape(B, 2, 2, 144)
+        c_in = _dyn_conv(h_norm, dyn_a, a_base, None)
+        qkv = _dlin(c_in, qkv_w)
+        q_w = nh * hd
+        k_w = nkv * hd
+        q = mx.fast.rms_norm(qkv[:, :q_w].reshape(1, B, nh, hd), q_norm, _EPS).transpose(0, 2, 1, 3)
+        k = mx.fast.rms_norm(qkv[:, q_w : q_w + k_w].reshape(1, B, nkv, hd), k_norm, _EPS).transpose(0, 2, 1, 3)
+        v = qkv[:, q_w + k_w :].reshape(1, B, nkv, hd).transpose(0, 2, 1, 3)
+        return q, k, v, dyn_a
+
+    @mx.compile
+    def post_attn(x, attn, o_w, dyn_a, a_base, post_ln, m_dyn, m_base, gu_w, dn_w):
+        B = x.shape[0]
+        proj = _dlin(attn, o_w)
+        res = _dyn_conv(proj, dyn_a, a_base, x)
+        m_norm = mx.fast.rms_norm(res, post_ln, _EPS)
+        dyn_m = _dlin(m_norm, m_dyn).reshape(B, 2, 2, 144)
+        m_in = _dyn_conv(m_norm, dyn_m, m_base, None)
+        gu = _dlin(m_in, gu_w)
+        m_out = _dlin(_swiglu(gu[:, :inter], gu[:, inter:]), dn_w)
+        return _dyn_conv(m_out, dyn_m, m_base, res)
+
+    ent = _DF_COMPILED[key] = (pre_rope, post_attn)
+    return ent
 
 
 @mx.compile
@@ -491,6 +538,18 @@ class DFlash2Drafter:
         )
         self._lm_t = (lm["weight"], lm["scales"], lm["biases"]) if self._lm_aff8 else None
         self._unpadded_vocab = int(target.args.text.unpadded_vocab_size)
+        lm_qbits = int(os.environ.get("LOOPLING_DFLASH2_LM_QUANT", "4"))
+        self._lm_q4 = None
+        if lm_qbits == 4 and self._lm_aff8:
+            w8_f = mx.dequantize(
+                lm["weight"], scales=lm["scales"], biases=lm["biases"], group_size=64, bits=8, mode="affine"
+            )[: self._unpadded_vocab]
+            wq4, sc4, bi4 = mx.quantize(w8_f, group_size=64, bits=4, mode="affine")
+            self._lm_q4 = (wq4, sc4, bi4)
+            to_eval.extend([wq4, sc4, bi4])
+        self._df_pre_rope, self._df_post_attn = _get_df_compiled(
+            self.nh, self.nkv, self.hd, self.inter, self.qbits
+        )
         to_eval.extend([self._mask_emb, self._mask_7])
         mx.eval(*to_eval)
 
@@ -542,8 +601,13 @@ class DFlash2Drafter:
             k = _rms(k, lw["k_norm"]).transpose(0, 2, 1, 3)
             k = mx.fast.rope(k, self.hd, traditional=False, base=self.theta, scale=1.0, offset=pos)
             v = v.transpose(0, 2, 1, 3)
-            self.ck[i][:, :, pos : pos + n_tok, :] = k
-            self.cv[i][:, :, pos : pos + n_tok, :] = v
+            wpos = FD._wpos(pos)
+            ck_i = self.ck[i]
+            self.ck[i] = None
+            self.ck[i] = mx.slice_update(ck_i, k, wpos, axes=(2,))
+            cv_i = self.cv[i]
+            self.cv[i] = None
+            self.cv[i] = mx.slice_update(cv_i, v, wpos, axes=(2,))
         self.n += n_tok
 
     def _ctx_slice(self, i: int):
@@ -558,13 +622,13 @@ class DFlash2Drafter:
         B = self.block
         scale = self.hd ** -0.5
         offset = self.n
+        pre_rope = self._df_pre_rope
+        post_attn = self._df_post_attn
 
         for i, lw in enumerate(self.layers):
-            h_norm = _rms(x, lw["in_ln"])
-            dyn_a = self._lin(h_norm, lw["a_dyn"]).reshape(B, 2, 2, 144)
-            c_in = _dyn_conv(h_norm, dyn_a, lw["a_base"], None)
-            qkv = self._lin(c_in, lw["qkv"])
-            q, k, v = _qkv_norm_split(qkv, lw["q_norm"], lw["k_norm"], self.nh, self.nkv, self.hd)
+            q, k, v, dyn_a = pre_rope(
+                x, lw["in_ln"], lw["a_dyn"], lw["a_base"], lw["qkv"], lw["q_norm"], lw["k_norm"]
+            )
             q = mx.fast.rope(q, self.hd, traditional=False, base=self.theta, scale=1.0, offset=offset)
             k = mx.fast.rope(k, self.hd, traditional=False, base=self.theta, scale=1.0, offset=offset)
             ck, cv = self._ctx_slice(i)
@@ -572,19 +636,18 @@ class DFlash2Drafter:
             v_all = v if cv is None else mx.concatenate([cv, v], axis=2)
             attn = mx.fast.scaled_dot_product_attention(q, k_all, v_all, scale=scale)
             attn = attn.transpose(0, 2, 1, 3).reshape(B, self.nh * self.hd)
-            proj = self._lin(attn, lw["o_proj"])
-            res = _dyn_conv(proj, dyn_a, lw["a_base"], x)
-
-            m_norm = _rms(res, lw["post_ln"])
-            dyn_m = self._lin(m_norm, lw["m_dyn"]).reshape(B, 2, 2, 144)
-            m_in = _dyn_conv(m_norm, dyn_m, lw["m_base"], None)
-            gu = self._lin(m_in, lw["gu"])
-            m_out = self._lin(_swiglu(gu[:, : self.inter], gu[:, self.inter :]), lw["down"])
-            x = _dyn_conv(m_out, dyn_m, lw["m_base"], res)
+            x = post_attn(
+                x, attn, lw["o_proj"], dyn_a, lw["a_base"], lw["post_ln"], lw["m_dyn"], lw["m_base"], lw["gu"], lw["down"]
+            )
 
         n_pos = max(2, min(self.block - 1, int(n_pos)))
         hid = _rms(x, self.final_norm)[1 : 1 + n_pos]  # (n_pos, H)
-        if self._lm_aff8:
+        if self._lm_q4 is not None:
+            wq4, sc4, bi4 = self._lm_q4
+            raw_logits = mx.quantized_matmul(
+                hid, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
+            )
+        elif self._lm_aff8:
             raw_logits = RQ.qmv_rows(hid, *self._lm_t)[:, : self._unpadded_vocab]
         else:
             raw_logits = self.target.lm_head(hid)[:, : self._unpadded_vocab]

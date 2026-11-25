@@ -385,6 +385,9 @@ class KVCache(_BaseCache):
     def update_packed_b1(self, kv_new, wpos_fn):
         prev = self.offset
         buf = self._packed
+        if buf is None:
+            self.pack_b1()
+            buf = self._packed
         self._packed = None
         cap = buf.shape[2]
         if prev + 1 > cap:
@@ -586,6 +589,9 @@ class RotatingKVCache(_BaseCache):
     def update_packed_b1(self, kv_new, wpos_fn):
         prev = self.offset
         buf = self._packed
+        if buf is None:
+            self.pack_b1()
+            buf = self._packed
         self._packed = None
         cap = buf.shape[2]
         if prev >= cap and cap < self.max_size:
@@ -2194,7 +2200,7 @@ class PromptTrie:
             current = current[tok]
         return values
 
-    def search(self, model: Any, tokens: List[int]) -> PromptTrieResult:
+    def search(self, model: Any, tokens: List[int], find_longer: bool = True) -> PromptTrieResult:
         if model not in self._trie:
             return PromptTrieResult(model, None, None, None, 0)
 
@@ -2221,21 +2227,31 @@ class PromptTrie:
         if last_index > 0:
             shorter = tokens[: last_index + 1]
 
-        # Check for sequences that are longer
+        # Check for sequences that are longer via O(V) BFS with parent backpointers
         longer = None
         common_prefix = index
-        if index > 0:
-            best = None
-            stack = [(current, [])]
-            while stack:
-                current, extra = stack.pop()
-                if "__value__" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                elif best is None or len(extra) < len(best):
-                    for tok in current:
-                        stack.append((current[tok], extra + [tok]))
-            longer = tokens[:index] + best
+        if index > 0 and find_longer:
+            nodes = [(current, -1, None)]
+            q = deque([0])
+            found_idx = -1
+            while q:
+                ni = q.popleft()
+                node, _, _ = nodes[ni]
+                if "__value__" in node:
+                    found_idx = ni
+                    break
+                for tok, child in node.items():
+                    nodes.append((child, ni, tok))
+                    q.append(len(nodes) - 1)
+            if found_idx >= 0:
+                extra = []
+                cur_idx = found_idx
+                while cur_idx > 0:
+                    _, parent_idx, tok = nodes[cur_idx]
+                    extra.append(tok)
+                    cur_idx = parent_idx
+                extra.reverse()
+                longer = tokens[:index] + extra
         return PromptTrieResult(model, None, shorter, longer, common_prefix)
 
 
@@ -2301,6 +2317,7 @@ class LRUPromptCache:
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self._has_trimmable = False
 
     def __len__(self):
         return len(self._lru)
@@ -2310,7 +2327,7 @@ class LRUPromptCache:
         return self._n_bytes
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
-        result = self._trie.search(model, tokens)
+        result = self._trie.search(model, tokens, find_longer=self._has_trimmable)
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
@@ -2365,6 +2382,7 @@ class LRUPromptCache:
         # If it is a trimmable cache remove all prefixes cause they just take
         # space
         if can_trim_prompt_cache(prompt_cache):
+            self._has_trimmable = True
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes

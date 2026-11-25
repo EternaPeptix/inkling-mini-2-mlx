@@ -73,12 +73,17 @@ def _is_inkling2_model(model: nn.Module) -> bool:
 
 
 def _inkling2_bd_caches_ok(model: nn.Module, caches: List[List[Any]]) -> bool:
-    if not _SERVER_BATCHDECODE or not (2 <= len(caches) <= 8) or not _is_inkling2_model(model):
+    if not _SERVER_BATCHDECODE or not (1 <= len(caches) <= 8) or not _is_inkling2_model(model):
         return False
-    from .models.inkling2.batchdecode import BatchDecoder, _batch_cache_ok
+    from .models.inkling2 import layers as _L
+    from .models.inkling2.batchdecode import BatchDecoder, _batch_cache_ok, _b1_cache_ok
 
     nv = len(model.model.language_model.layer_visits)
-    return bool(caches[0]) and len(caches[0]) == nv and _batch_cache_ok(caches, nv)
+    if not caches[0] or len(caches[0]) != nv:
+        return False
+    if len(caches) == 1:
+        return _L._FAST_ON and _L._use_kernels() and all(_b1_cache_ok(caches[0][v]) for v in range(nv))
+    return _L._FAST_ON and _batch_cache_ok(caches, nv)
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
@@ -1233,6 +1238,7 @@ class PromptProcessingBatch:
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
         max_tokens: Optional[List[int]] = None,
+        need_logprobs: Optional[List[bool]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1255,11 +1261,17 @@ class PromptProcessingBatch:
             if max_tokens is not None
             else [DEFAULT_MAX_TOKENS] * len(self.uids)
         )
+        self.need_logprobs = (
+            list(need_logprobs) if need_logprobs is not None else [True] * len(self.uids)
+        )
 
     def __len__(self):
         return len(self.uids)
 
     def extract_cache(self, idx: int) -> List[Any]:
+        lps = [c.left_padding for c in self.prompt_cache if getattr(c, "left_padding", None) is not None]
+        if lps:
+            mx.eval(lps)
         return [c.extract(idx) for c in self.prompt_cache]
 
     def extend(self, batch):
@@ -1270,6 +1282,7 @@ class PromptProcessingBatch:
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.stop_sequences.extend(batch.stop_sequences)
+        self.need_logprobs.extend(batch.need_logprobs)
 
     def _copy(self):
         new_batch = self.__class__.__new__(self.__class__)
@@ -1283,11 +1296,30 @@ class PromptProcessingBatch:
         new_batch.logits_processors = list(self.logits_processors)
         new_batch.stop_sequences = list(self.stop_sequences)
         new_batch.max_tokens = list(self.max_tokens)
+        new_batch.need_logprobs = list(self.need_logprobs)
         return new_batch
 
     def split(self, indices: List[int]):
         indices = sorted(indices)
         indices_left = sorted(set(range(len(self.uids))) - set(indices))
+        if not indices_left:
+            new_batch = self.__class__.__new__(self.__class__)
+            new_batch.model = self.model
+            new_batch.uids = list(self.uids)
+            new_batch.prompt_cache = self.prompt_cache
+            self.prompt_cache = []
+            new_batch.tokens = list(self.tokens)
+            new_batch.prefill_step_size = self.prefill_step_size
+            new_batch.samplers = list(self.samplers)
+            new_batch.fallback_sampler = self.fallback_sampler
+            new_batch.logits_processors = list(self.logits_processors)
+            new_batch.stop_sequences = list(self.stop_sequences)
+            new_batch.max_tokens = list(self.max_tokens)
+            new_batch.need_logprobs = list(self.need_logprobs)
+            self.filter([])
+            if indices != list(range(len(new_batch.uids))):
+                new_batch.filter(indices)
+            return new_batch
         new_batch = self._copy()
         self.filter(indices_left)
         new_batch.filter(indices)
@@ -1306,6 +1338,7 @@ class PromptProcessingBatch:
         self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
+        self.need_logprobs = [self.need_logprobs[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
         """
@@ -1380,6 +1413,7 @@ class PromptProcessingBatch:
             self.logits_processors,
             self.stop_sequences,
             self.max_tokens,
+            self.need_logprobs,
         )
 
         self.uids = []
@@ -1388,6 +1422,7 @@ class PromptProcessingBatch:
         self.samplers = []
         self.logits_processors = []
         self.max_tokens = []
+        self.need_logprobs = []
 
         return generation
 
@@ -1409,6 +1444,7 @@ class PromptProcessingBatch:
             logits_processors=[],
             max_tokens=[],
             stop_sequences=[],
+            need_logprobs=[],
         )
 
 
@@ -1441,6 +1477,7 @@ class GenerationBatch:
         logits_processors: Optional[List[List[LogitsProcessor]]],
         stop_sequences: List[StopSequences],
         max_tokens: List[int],
+        need_logprobs: Optional[List[bool]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1452,6 +1489,9 @@ class GenerationBatch:
         self.logits_processors = logits_processors
         self.stop_sequences = stop_sequences
         self.max_tokens = max_tokens
+        self.need_logprobs = (
+            list(need_logprobs) if need_logprobs is not None else [True] * len(self.uids)
+        )
 
         if self.samplers and len(self.samplers) != len(self.uids):
             raise ValueError("Insufficient number of samplers provided")
@@ -1469,11 +1509,14 @@ class GenerationBatch:
 
         if (
             _SERVER_BATCHDECODE
-            and 2 <= len(self.uids) <= 8
+            and 1 <= len(self.uids) <= 8
             and _is_inkling2_model(self.model)
             and self.prompt_cache
             and not any(c.empty() for c in self.prompt_cache)
         ):
+            lps = [c.left_padding for c in self.prompt_cache if getattr(c, "left_padding", None) is not None]
+            if lps:
+                mx.eval(lps)
             per_caches = [
                 [c.extract(i) for c in self.prompt_cache] for i in range(len(self.uids))
             ]
@@ -1493,7 +1536,8 @@ class GenerationBatch:
         if self._bd is None:
             return
         if self._next_tokens is not None:
-            mx.eval(self._next_tokens, self._next_logprobs)
+            nlp = [lp for lp in self._next_logprobs if lp is not None]
+            mx.eval(self._next_tokens, nlp) if nlp else mx.eval(self._next_tokens)
         self._bd.flush()
 
     def _extract_all_caches(self) -> List[List[Any]]:
@@ -1516,21 +1560,26 @@ class GenerationBatch:
     def extend(self, batch):
         """Extend this batch with another generation batch."""
         was_empty = len(self.uids) == 0
-        self.uids.extend(batch.uids)
-        if was_empty and batch._bd is not None:
-            self._bd = batch._bd
-            batch._bd = None
-            self.prompt_cache = []
+        if was_empty:
+            self.uids.extend(batch.uids)
+            if batch._bd is not None:
+                self._bd = batch._bd
+                batch._bd = None
+                self.prompt_cache = []
+            else:
+                self.prompt_cache = batch.prompt_cache
+                batch.prompt_cache = []
         elif (
             self._bd is not None
             or batch._bd is not None
             or (
                 _SERVER_BATCHDECODE
-                and 2 <= len(self.uids) <= 8
+                and 1 <= len(self.uids) + len(batch.uids) <= 8
                 and _is_inkling2_model(self.model)
             )
         ):
             all_caches = self._extract_all_caches() + batch._extract_all_caches()
+            self.uids.extend(batch.uids)
             self._bd = None
             batch._bd = None
             if _inkling2_bd_caches_ok(self.model, all_caches):
@@ -1540,12 +1589,14 @@ class GenerationBatch:
             else:
                 self.prompt_cache = []
         else:
+            self.uids.extend(batch.uids)
             self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
         self.samplers.extend(batch.samplers)
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.stop_sequences.extend(batch.stop_sequences)
+        self.need_logprobs.extend(batch.need_logprobs)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1575,6 +1626,35 @@ class GenerationBatch:
         self._current_logprobs = self._next_logprobs
         inputs = self._current_tokens
 
+        samplers = [
+            self.fallback_sampler if s is None else s
+            for s in (self.samplers or [None] * len(self.uids))
+        ]
+        k0 = getattr(samplers[0], "_sampler_key", None) if samplers else None
+        same_sampler = (not samplers) or all(
+            s is samplers[0] or (k0 is not None and getattr(s, "_sampler_key", None) == k0)
+            for s in samplers
+        )
+        base_sampler = samplers[0] if samplers else self.fallback_sampler
+        need_lp = any(self.need_logprobs)
+
+        if (
+            self._bd is not None
+            and not need_lp
+            and not any(self.logits_processors)
+            and same_sampler
+            and base_sampler is greedy_sampler
+        ):
+            self._next_tokens = self._bd.step(inputs)
+            self._next_logprobs = [None] * len(self.uids)
+            mx.async_eval(self._next_tokens)
+            cur_lp = [lp for lp in self._current_logprobs if lp is not None]
+            mx.eval(inputs, cur_lp) if cur_lp else mx.eval(inputs)
+            inputs = inputs.tolist()
+            for sti, ti in zip(self.tokens, inputs):
+                sti.append(ti)
+            return inputs, self._current_logprobs
+
         # Forward pass
         if self._bd is not None:
             logits = self._bd.logits(self._bd._hidden_pair(inputs))
@@ -1602,12 +1682,8 @@ class GenerationBatch:
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
         # One batched call when the batch shares a sampler.
-        samplers = [
-            self.fallback_sampler if s is None else s
-            for s in (self.samplers or [None] * len(self.uids))
-        ]
-        if not samplers or all(s is samplers[0] for s in samplers):
-            sampled = (samplers[0] if samplers else self.fallback_sampler)(logprobs)
+        if same_sampler:
+            sampled = base_sampler(logprobs)
         else:
             sampled = mx.concatenate(
                 [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0
@@ -1616,13 +1692,18 @@ class GenerationBatch:
         # Assign the next step to member variables and start computing it
         # asynchronously
         self._next_tokens = sampled
-        self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        self._next_logprobs = list(logprobs) if need_lp else [None] * len(self.uids)
+        nlp = [lp for lp in self._next_logprobs if lp is not None]
+        if nlp:
+            mx.async_eval(self._next_tokens, nlp, token_context)
+        else:
+            mx.async_eval(self._next_tokens, token_context)
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
-        mx.eval(inputs, self._current_logprobs)
+        cur_lp = [lp for lp in self._current_logprobs if lp is not None]
+        mx.eval(inputs, cur_lp) if cur_lp else mx.eval(inputs)
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
@@ -1643,7 +1724,7 @@ class GenerationBatch:
             self._bd = None
             if not kept:
                 self.prompt_cache = []
-            elif len(kept) == 1 or not _inkling2_bd_caches_ok(self.model, kept):
+            elif not _inkling2_bd_caches_ok(self.model, kept):
                 self.prompt_cache = _merge_caches(kept)
             else:
                 self._activate_bd(kept)
@@ -1657,6 +1738,7 @@ class GenerationBatch:
         self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
+        self.need_logprobs = [self.need_logprobs[idx] for idx in keep]
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
@@ -1734,6 +1816,7 @@ class GenerationBatch:
             logits_processors=[],
             max_tokens=[],
             stop_sequences=[],
+            need_logprobs=[],
         )
 
 
@@ -1786,6 +1869,7 @@ class BatchGenerator:
         self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
         self._currently_processing = []
+        self._prefill_turn = False
 
         self._counters = BatchCounters()
 
@@ -1828,6 +1912,7 @@ class BatchGenerator:
         samplers: Optional[List[Sampler]] = None,
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
+        need_logprobs: Optional[List[bool]] = None,
     ):
         return self.insert_segments(
             [[p] for p in prompts],
@@ -1837,6 +1922,7 @@ class BatchGenerator:
             samplers,
             logits_processors,
             stop_sequences,
+            need_logprobs=need_logprobs,
         )
 
     def insert_segments(
@@ -1848,6 +1934,7 @@ class BatchGenerator:
         samplers: Optional[List[Sampler]] = None,
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
+        need_logprobs: Optional[List[bool]] = None,
     ):
         num_segments = len(segments)
 
@@ -1861,6 +1948,9 @@ class BatchGenerator:
         stop_sequences = stop_sequences or (
             [self._default_stop_sequences] * num_segments
         )
+        need_logprobs = (
+            list(need_logprobs) if need_logprobs is not None else [True] * num_segments
+        )
 
         caches = caches or [None] * num_segments
 
@@ -1872,6 +1962,7 @@ class BatchGenerator:
             "samplers": samplers,
             "logits_processors": logits_processors,
             "stop_sequences": stop_sequences,
+            "need_logprobs": need_logprobs,
         }
         for k, v in opts.items():
             if len(v) != num_segments:
@@ -1882,7 +1973,7 @@ class BatchGenerator:
 
         uids = list(range(self._uid_count, self._uid_count + num_segments))
         pending = []
-        for uid, seq, m, c, at, s, lp, sm in zip(
+        for uid, seq, m, c, at, s, lp, sm, nl in zip(
             uids,
             segments,
             max_tokens,
@@ -1891,6 +1982,7 @@ class BatchGenerator:
             samplers,
             logits_processors,
             stop_sequences,
+            need_logprobs,
         ):
             seq = [segment for segment in seq if segment]
             if not seq:
@@ -1902,7 +1994,7 @@ class BatchGenerator:
                 seq[-2] = seq[-2][:-1]
             if c is None:
                 c = make_prompt_cache(self.model, self.max_kv_size)
-            pending.append((uid, seq, m, c, at, s, lp, sm))
+            pending.append((uid, seq, m, c, at, s, lp, sm, nl))
 
         self._unprocessed_sequences.extend(pending)
         self._uid_count += num_segments
@@ -1982,6 +2074,7 @@ class BatchGenerator:
         logits_processors = []
         max_tokens = []
         stop_sequences = []
+        need_logprobs = []
         for _ in range(n):
             sequence = self._unprocessed_sequences.popleft()
             uids.append(sequence[0])
@@ -1991,6 +2084,7 @@ class BatchGenerator:
             logits_processors.append(sequence[6])
             max_tokens.append(sequence[2])
             stop_sequences.append(sequence[7])
+            need_logprobs.append(sequence[8])
             self._currently_processing.append(
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
@@ -2006,14 +2100,17 @@ class BatchGenerator:
             logits_processors=logits_processors,
             stop_sequences=stop_sequences,
             max_tokens=max_tokens,
+            need_logprobs=need_logprobs,
         )
 
     def _next(self):
         generation_responses = []
         prompt_responses = []
 
-        # Generate tokens first
-        if len(self._generation_batch) > 0:
+        # Generate tokens first unless this tick is explicitly flushing a deferred prefill
+        prefill_turn = self._prefill_turn
+        self._prefill_turn = False
+        if len(self._generation_batch) > 0 and not prefill_turn:
             tic = time.perf_counter()
             generation_responses = self._generation_batch.next()
             self._counters.decode_time += time.perf_counter() - tic
@@ -2026,27 +2123,18 @@ class BatchGenerator:
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses
 
-        # Check if we have sequences and add them to the prompt batch
-        n = min(
-            self.prefill_batch_size - len(self._prompt_batch),
-            self.completion_batch_size - len(self._generation_batch),
-            len(self._unprocessed_sequences),
-        )
-        if n > 0:
-            self._prompt_batch.extend(self._make_batch(n))
-
-        # Split the prompt sequences to the ones moving to generation and the rest
-        keep = []
-        split = []
-        for i, seq in enumerate(self._currently_processing):
-            segments = seq[0]
-            if len(segments) == 1 and len(segments[0]) == 1:
-                split.append(i)
-            else:
-                keep.append(i)
-
-        # Actually split off part of the prompt batch and start generation
-        if split:
+        # Split finished prompt sequences to generation first so prompt slots open immediately
+        def _split_ready():
+            keep = []
+            split = []
+            for i, seq in enumerate(self._currently_processing):
+                segments = seq[0]
+                if len(segments) == 1 and len(segments[0]) == 1:
+                    split.append(i)
+                else:
+                    keep.append(i)
+            if not split:
+                return
             last_inputs = [self._currently_processing[i][0][0] for i in split]
             progress = [(self._currently_processing[i][2],) * 2 for i in split]
             self._currently_processing = [self._currently_processing[i] for i in keep]
@@ -2061,6 +2149,24 @@ class BatchGenerator:
                     )
                 )
             self._generation_batch.extend(gen_batch)
+
+        _split_ready()
+
+        # Admit pending sequences into newly freed prompt slots
+        n = min(
+            self.prefill_batch_size - len(self._prompt_batch),
+            self.completion_batch_size - len(self._generation_batch),
+            len(self._unprocessed_sequences),
+        )
+        if n > 0:
+            self._prompt_batch.extend(self._make_batch(n))
+            _split_ready()
+
+        # If we already have ready decode tokens to deliver and prompts remain to prefill,
+        # stream the decode tokens immediately and run prefill on the next tick.
+        if generation_responses and self._currently_processing and not prefill_turn:
+            self._prefill_turn = True
+            return prompt_responses, generation_responses
 
         # Extract the next prompts input
         prompts = []
@@ -2080,10 +2186,11 @@ class BatchGenerator:
             prompt_responses.append(response)
 
         # Process the prompts
-        self._counters.prompt_tokens += sum(len(p) for p in prompts)
-        tic = time.perf_counter()
-        self._prompt_batch.prompt(prompts)
-        self._counters.prompt_time += time.perf_counter() - tic
+        if prompts:
+            self._counters.prompt_tokens += sum(len(p) for p in prompts)
+            tic = time.perf_counter()
+            self._prompt_batch.prompt(prompts)
+            self._counters.prompt_time += time.perf_counter() - tic
 
         return prompt_responses, generation_responses
 

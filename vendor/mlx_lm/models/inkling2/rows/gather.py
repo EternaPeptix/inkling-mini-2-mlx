@@ -59,16 +59,49 @@ _HELPERS = r"""
 template <int bits, int values_per_thread>
 inline void dequant_vals(const device uint8_t* w, thread float* d) {
   if constexpr (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      d[4 * i] = Dequantize<4>{}(ws[i]);
-      d[4 * i + 1] = Dequantize<4>{}(ws[i] >> 4);
-      d[4 * i + 2] = Dequantize<4>{}(ws[i] >> 8);
-      d[4 * i + 3] = Dequantize<4>{}(ws[i] >> 12);
+    if constexpr (values_per_thread == 8) {
+      uint32_t v = ((const device uint32_t*)w)[0];
+      d[0] = Dequantize<4>{}(uint16_t(v));
+      d[1] = Dequantize<4>{}(uint16_t(v >> 4));
+      d[2] = Dequantize<4>{}(uint16_t(v >> 8));
+      d[3] = Dequantize<4>{}(uint16_t(v >> 12));
+      d[4] = Dequantize<4>{}(uint16_t(v >> 16));
+      d[5] = Dequantize<4>{}(uint16_t(v >> 20));
+      d[6] = Dequantize<4>{}(uint16_t(v >> 24));
+      d[7] = Dequantize<4>{}(uint16_t(v >> 28));
+    } else {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      for (int i = 0; i < (values_per_thread / 4); i++) {
+        uint16_t v = ws[i];
+        d[4 * i] = Dequantize<4>{}(v);
+        d[4 * i + 1] = Dequantize<4>{}(v >> 4);
+        d[4 * i + 2] = Dequantize<4>{}(v >> 8);
+        d[4 * i + 3] = Dequantize<4>{}(v >> 12);
+      }
     }
   } else {
-    for (int i = 0; i < values_per_thread; i++) {
-      d[i] = Dequantize<8>{}(w[i]);
+    if constexpr (values_per_thread == 8) {
+      uint2 v = ((const device uint2*)w)[0];
+      uchar4 c0 = as_type<uchar4>(v.x);
+      uchar4 c1 = as_type<uchar4>(v.y);
+      d[0] = Dequantize<8>{}(c0.x);
+      d[1] = Dequantize<8>{}(c0.y);
+      d[2] = Dequantize<8>{}(c0.z);
+      d[3] = Dequantize<8>{}(c0.w);
+      d[4] = Dequantize<8>{}(c1.x);
+      d[5] = Dequantize<8>{}(c1.y);
+      d[6] = Dequantize<8>{}(c1.z);
+      d[7] = Dequantize<8>{}(c1.w);
+    } else if constexpr (values_per_thread == 4) {
+      uchar4 c0 = as_type<uchar4>(((const device uint32_t*)w)[0]);
+      d[0] = Dequantize<8>{}(c0.x);
+      d[1] = Dequantize<8>{}(c0.y);
+      d[2] = Dequantize<8>{}(c0.z);
+      d[3] = Dequantize<8>{}(c0.w);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        d[i] = Dequantize<8>{}(w[i]);
+      }
     }
   }
 }

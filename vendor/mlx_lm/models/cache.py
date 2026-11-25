@@ -1375,7 +1375,7 @@ class BatchRotatingKVCache(_BaseCache):
             v = v[..., trim_size:, :]
         if append is not None:
             return mx.concatenate([v, append], axis=2)
-        return v
+        return mx.contiguous(v) if trim_size > 0 else v
 
     def _temporal_order(self):
         """

@@ -32,7 +32,7 @@ _RM_MODS = None
 def _mods():
     global _RM_MODS
     if _RM_MODS is None:
-        from mlx_lm.models.cache import KVCache, RotatingKVCache
+        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, KVCache, RotatingKVCache
         from mlx_lm.models.inkling2 import layers as L
         from mlx_lm.models.inkling2.rows import mid as RM
         from mlx_lm.models.inkling2.rows import moe as RMo
@@ -41,7 +41,7 @@ def _mods():
         from mlx_lm.models.inkling2.rows import rowlocal as RL
         from mlx_lm.models.inkling2.rows import sdpa as RS
         from mlx_lm.models.inkling2.rows import visit as RV
-        _RM_MODS = (KVCache, RotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV)
+        _RM_MODS = (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV)
     return _RM_MODS
 
 
@@ -335,7 +335,7 @@ def _core(layer, q, k, v, pb, sinks, kv):
 
 
 def _fused_b1_ok_layer(layer) -> bool:
-    _, _, L, _, _, _, _, _, _, _ = _mods()
+    L = _mods()[4]
     if not L._use_kernels():
         return False
     a = layer["self_attn"]
@@ -409,7 +409,7 @@ def _fused_b1_ok(layer, h, conv) -> bool:
 
 
 def _decode_layer_fused_b1(layer, h, bs, cache, messages):
-    KVCache, RotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV = _mods()
+    KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV = _mods()
     conv = cache[1]
     kv = cache[0]
     cs = conv.cache
@@ -466,8 +466,37 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
         )
         gate = qkv_flat[gate_off : gate_off + 3072].reshape(1, 3072)
         sinks = qkv_flat[sink_off : sink_off + 24].reshape(1, 1, 24)
-        attn_out = _core(layer, q[:, :, None, :], kk[:, :, None, :], vv[:, :, None, :], pb[:, None], sinks, kv)
-        op = RP.oproj_rows(attn_out, gate, op_m["weight"], op_m["scales"], op_m["biases"])
+        use_sdpa_rows = (
+            type(kv) in (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
+            and getattr(kv, "keep", 0) == 0
+            and q.dtype == mx.bfloat16
+            and kk.dtype == mx.bfloat16
+            and (kv.keys is None or kv.keys.dtype == mx.bfloat16)
+            and q.shape[0] == 1
+            and q.shape[1] == 24
+            and q.shape[2] == 128
+            and kk.shape[1] == 8
+        )
+        if use_sdpa_rows:
+            k_all, v_all = kv.update_and_fetch(kk[:, :, None, :], vv[:, :, None, :])
+            is_rot = isinstance(kv, (RotatingKVCache, BatchRotatingKVCache))
+            meta = [
+                (
+                    int(_end(kv)),
+                    int(kv._idx) if is_rot else 0,
+                    1 if is_rot else 0,
+                    int(kv.keys.shape[2]),
+                    int(kv.values.shape[2]),
+                )
+            ]
+            attn_out = RS.sdpa_rows(
+                q[:, :, None, :], [k_all], [v_all], pb[:, None], sinks,
+                meta, scale=a.scaling, window=a.sliding_window or 0, gate=gate,
+            ).reshape(1, 3072)
+            op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
+        else:
+            attn_out = _core(layer, q[:, :, None, :], kk[:, :, None, :], vv[:, :, None, :], pb[:, None], sinks, kv)
+            op = RP.oproj_rows(attn_out, gate, op_m["weight"], op_m["scales"], op_m["biases"])
 
     r10 = RL.k10_post_layer(layer, op, h2, nr, bs_in, cs[2], m2, debug=False)
     if layer.is_block_boundary:

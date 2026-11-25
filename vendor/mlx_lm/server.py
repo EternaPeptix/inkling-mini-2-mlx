@@ -523,6 +523,13 @@ def _make_logits_processors(args):
     )
 
 
+def _token_logprob(logprobs, token: int, enabled: bool) -> float:
+    if not enabled:
+        return 0.0
+    with mx.stream(mx.cpu):
+        return logprobs[token].item()
+
+
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     """Returns info dicts for the top `top_n` tokens from `logprobs`"""
     if top_n <= 0:
@@ -872,6 +879,7 @@ class ResponseGenerator:
                         "detokenizer": current_tokenizer.detokenizer,
                         "stop_reader": stop_sm.reader(),
                         "segment_types": segment_types[::-1],
+                        "logprobs": args.logprobs,
                         "top_logprobs": args.top_logprobs,
                     }
                     # just making sure we don't leave a reference around
@@ -987,7 +995,7 @@ class ResponseGenerator:
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                _token_logprob(r.logprobs, r.token, result["logprobs"]),
                                 finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
@@ -1131,7 +1139,7 @@ class ResponseGenerator:
                     Response(
                         text,
                         gen.token,
-                        gen.logprobs[gen.token].item(),
+                        _token_logprob(gen.logprobs, gen.token, args.logprobs),
                         finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer

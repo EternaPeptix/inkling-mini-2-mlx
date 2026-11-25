@@ -1832,7 +1832,14 @@ def _legacy_mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, pr
 
 
 def mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, prefill_step_size=2048, prompt_cache=None, **kw):
-    """Greedy self-speculative decoding with the official drafter. Yields (token, logprobs, from_draft)."""
+    """Greedy self-speculative decoding with the official drafter (or Splash DFlash2 when LOOPLING_MTP=dflash2). Yields (token, logprobs, from_draft)."""
+    if os.environ.get("LOOPLING_MTP") == "dflash2":
+        from mlx_lm.models.inkling2.dflash2 import dflash2_exact_generate_step
+
+        return dflash2_exact_generate_step(
+            prompt, model, max_tokens=max_tokens, sampler=sampler,
+            prefill_step_size=prefill_step_size, prompt_cache=prompt_cache, **kw,
+        )
     from mlx_lm.models.inkling2.batchdecode import BatchDecoder, _FUSED, _PLAIN
     from mlx_lm.models.inkling2 import fastdecode as FD, layers as L
     from mlx_lm.models.inkling2.rows import visit as RV

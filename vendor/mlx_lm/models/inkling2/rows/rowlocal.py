@@ -978,23 +978,42 @@ def k3b_norm(mixed, ln_w, *, eps_ln=1e-6):
         raise ValueError("need %d weights" % G)
     for w in ln_w:
         _check(w, (D,), _BF, "ln_w")
-    NT = 576
-    ckey = (G, eps_ln)
+    NT = TG
+    ckey = ("vec", G, eps_ln)
     k = _K3B_CACHE.get(ckey)
     if k is None:
         ins = ["x"] + ["w%d" % g for g in range(G)]
         outs = ["o%d" % g for g in range(G)]
         s = [
-            "uint t = threadgroup_position_in_grid.x; uint lid = thread_position_in_threadgroup.x;",
+            "uint t = threadgroup_position_in_grid.x;",
+            "uint lane = thread_index_in_simdgroup; uint sg = simdgroup_index_in_threadgroup;",
             "uint row = t / %d, g = t %% %d;" % (G, G),
-            "threadgroup float part[32];",
+            "threadgroup float part[64];",
             "const device float* xr = x + (size_t(row) * %d + g) * RL_D;" % G,
-            "float inv = glue_rms_inv_tg<RL_D, %d, true>(xr, %s, part, lid);" % (NT, flit(eps_ln)),
+            "int b0 = (int(sg) * 32 + int(lane)) * 4;",
+            "int b1 = ((int(sg) + 9) * 32 + int(lane)) * 4;",
+            "float4 v0 = ((const device float4*)(xr + b0))[0];",
+            "float4 v1 = ((const device float4*)(xr + b1))[0];",
+            "float inv = rl_rms_inv_reg(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, %s, part, sg, lane);" % flit(eps_ln),
         ]
         for g in range(G):
-            s += ["if (g == %d) { for (int i = int(lid); i < RL_D; i += %d) o%d[size_t(row) * RL_D + i] = bfloat16_t(glue_rms_apply<float>("
-                  "xr[i], inv, w%d[i])); }" % (g, NT, g, g)]
-        k = _K3B_CACHE[ckey] = _kernel(("rl_k3b_%d_%s" % (G, flit(eps_ln))).replace(".", "p").replace("-", "m"), "\n".join(s), tuple(ins), tuple(outs))
+            cond = ("if (g == %d)" % g) if G > 1 else ""
+            s += [
+                "%s {" % cond if cond else "{",
+                "  bfloat4 ww0 = rl_load_raw_bf4(w%d + b0); bfloat4 ww1 = rl_load_raw_bf4(w%d + b1);" % (g, g),
+                "  bfloat4 xo0 = bfloat4(bfloat16_t(glue_rms_apply<float>(v0.x, inv, ww0.x)), bfloat16_t(glue_rms_apply<float>(v0.y, inv, ww0.y)), bfloat16_t(glue_rms_apply<float>(v0.z, inv, ww0.z)), bfloat16_t(glue_rms_apply<float>(v0.w, inv, ww0.w)));",
+                "  bfloat4 xo1 = bfloat4(bfloat16_t(glue_rms_apply<float>(v1.x, inv, ww1.x)), bfloat16_t(glue_rms_apply<float>(v1.y, inv, ww1.y)), bfloat16_t(glue_rms_apply<float>(v1.z, inv, ww1.z)), bfloat16_t(glue_rms_apply<float>(v1.w, inv, ww1.w)));",
+                "  ((device uint2*)(o%d + size_t(row) * RL_D + b0))[0] = as_type<uint2>(xo0);" % g,
+                "  ((device uint2*)(o%d + size_t(row) * RL_D + b1))[0] = as_type<uint2>(xo1);" % g,
+                "}",
+            ]
+        k = _K3B_CACHE[ckey] = _kernel(
+            ("rl_k3b_v_%d_%s" % (G, flit(eps_ln))).replace(".", "p").replace("-", "m"),
+            "\n".join(s),
+            tuple(ins),
+            tuple(outs),
+            ensure_row_contiguous=True,
+        )
     r = k(inputs=[mixed] + list(ln_w), grid=(B * G * NT, 1, 1), threadgroup=(NT, 1, 1),
           output_shapes=[(B, D)] * G, output_dtypes=[_BF] * G)
     return tuple(r)

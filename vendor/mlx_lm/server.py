@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import pickle
 import platform
 import socket
@@ -881,6 +882,9 @@ class ResponseGenerator:
                         "segment_types": segment_types[::-1],
                         "logprobs": args.logprobs,
                         "top_logprobs": args.top_logprobs,
+                        "prompt_cache_count": prompt_cache_count,
+                        "last_ckpt": prompt_cache_count,
+                        "gen_tokens": 0,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -942,6 +946,7 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
+                ckpt_stride = int(os.environ.get("LOOPLING_PREFIX_CHECKPOINT", "2048"))
                 for _ in self._time_budget:
                     prompt_responses, gen_responses = batch_generator.next()
                     if not prompt_responses and not gen_responses:
@@ -962,17 +967,42 @@ class ResponseGenerator:
                         and not r.end_of_prompt
                         and batch_results[r.uid]["segment_types"]
                     ]
-                    caches = batch_generator.extract_cache(eos_ids)
-                    for uid, (cache, cache_key) in caches.items():
-                        self.prompt_cache.insert_cache(
-                            self.model_provider.model_key,
-                            cache_key[:],
-                            cache,
-                            cache_type=batch_results[uid]["segment_types"].pop(),
-                        )
-                    del caches
+                    if eos_ids:
+                        caches = batch_generator.extract_cache(eos_ids)
+                        for uid, (cache, cache_key) in caches.items():
+                            self.prompt_cache.insert_cache(
+                                self.model_provider.model_key,
+                                cache_key[:],
+                                cache,
+                                cache_type=batch_results[uid]["segment_types"].pop(),
+                            )
+                            batch_results[uid]["last_ckpt"] = len(cache_key)
+                        del caches
+
+                    # Periodic mid-prefill checkpoints (KVCache + ArraysCache snapshots)
+                    ckpt_ids = []
+                    if ckpt_stride > 0:
+                        for r in prompt_responses:
+                            if not r.end_of_prompt and not r.end_of_segment and r.uid in batch_results:
+                                br = batch_results[r.uid]
+                                processed, total = r.progress
+                                cur_len = br["prompt_cache_count"] + processed
+                                if cur_len - br["last_ckpt"] >= ckpt_stride and (total - processed) >= 256:
+                                    ckpt_ids.append(r.uid)
+                        if ckpt_ids:
+                            ckpts = batch_generator.extract_cache(ckpt_ids)
+                            for uid, (cache, cache_key) in ckpts.items():
+                                self.prompt_cache.insert_cache(
+                                    self.model_provider.model_key,
+                                    cache_key[:],
+                                    cache,
+                                    cache_type="checkpoint",
+                                )
+                                batch_results[uid]["last_ckpt"] = len(cache_key)
+                            del ckpts
 
                     uids_to_finish = []
+                    gen_ckpt_ids = []
                     for r in gen_responses:
                         result = batch_results[r.uid]
 
@@ -1017,9 +1047,33 @@ class ResponseGenerator:
                             else:
                                 uids_to_finish.append(r.uid)
                             del batch_results[r.uid]
+                        else:
+                            result["gen_tokens"] += 1
+                            if (
+                                ckpt_stride > 0
+                                and result["gen_tokens"] % ckpt_stride == 0
+                                and not result["ctx"]._should_stop
+                            ):
+                                gen_ckpt_ids.append(r.uid)
 
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
+
+                    if gen_ckpt_ids:
+                        ckpts = batch_generator.extract_cache(gen_ckpt_ids)
+                        for uid, (cache, cache_key) in ckpts.items():
+                            self.prompt_cache.insert_cache(
+                                current_model_key,
+                                cache_key[:],
+                                cache,
+                                cache_type="checkpoint",
+                            )
+                        del ckpts
+
+                    if (ckpt_ids or gen_ckpt_ids) and self.model_provider.cli_args.prompt_cache_bytes is not None:
+                        total = self.model_provider.cli_args.prompt_cache_bytes
+                        active = batch_generator.prompt_cache_nbytes
+                        self.prompt_cache.trim_to(n_bytes=total - active)
 
                     # End text-stopped requests like finished ones (same on all ranks).
                     if uids_to_finish:

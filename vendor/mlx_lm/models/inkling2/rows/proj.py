@@ -393,33 +393,27 @@ def _gd_tm1_src(G, B):
     for (int it = 0; it < 4; it++) {{
       const int off = it * 1024;
       const device bfloat16_t* wp = wr + off;
-      bfloat16_t w0v = wp[0], w1v = wp[1], w2v = wp[2], w3v = wp[3];
+      bfloat4 wv = as_type<bfloat4>(((const device uint2*)wp)[0]);
       for (int b = 0; b < {B}; b++) {{
         const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
-        float v0 = static_cast<float>(xp[0]);
-        float v1 = static_cast<float>(xp[1]);
-        float v2 = static_cast<float>(xp[2]);
-        float v3 = static_cast<float>(xp[3]);
-        result[b] += w0v * v0;
-        result[b] += w1v * v1;
-        result[b] += w2v * v2;
-        result[b] += w3v * v3;
+        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+        result[b] += wv.x * static_cast<float>(xv.x);
+        result[b] += wv.y * static_cast<float>(xv.y);
+        result[b] += wv.z * static_cast<float>(xv.z);
+        result[b] += wv.w * static_cast<float>(xv.w);
       }}
     }}
     if (bn0 + 4096 < 4608) {{
       const int off = 4096;
       const device bfloat16_t* wp = wr + off;
-      bfloat16_t w0v = wp[0], w1v = wp[1], w2v = wp[2], w3v = wp[3];
+      bfloat4 wv = as_type<bfloat4>(((const device uint2*)wp)[0]);
       for (int b = 0; b < {B}; b++) {{
         const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
-        float v0 = static_cast<float>(xp[0]);
-        float v1 = static_cast<float>(xp[1]);
-        float v2 = static_cast<float>(xp[2]);
-        float v3 = static_cast<float>(xp[3]);
-        result[b] += w0v * v0;
-        result[b] += w1v * v1;
-        result[b] += w2v * v2;
-        result[b] += w3v * v3;
+        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+        result[b] += wv.x * static_cast<float>(xv.x);
+        result[b] += wv.y * static_cast<float>(xv.y);
+        result[b] += wv.z * static_cast<float>(xv.z);
+        result[b] += wv.w * static_cast<float>(xv.w);
       }}
     }}
     for (int b = 0; b < {B}; b++) {{
@@ -530,7 +524,8 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
     for (int b = 0; b < RB; b++) {
       if (b < nb) {
         const device bfloat16_t* xp = dn0 + b * G * 64 + off;
-        float v0 = float(xp[0]), v1 = float(xp[1]), v2 = float(xp[2]), v3 = float(xp[3]);
+        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+        float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
         fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
         mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
       }

@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 from typing import Any, Callable
+import os
 
 import mlx.core as mx
 from mlx import nn
@@ -8,7 +9,7 @@ from mlx.nn.layers.distributed import shard_linear
 
 from mlx_lm.layers.common import splice
 from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, CacheList, Int8KVCache, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2 import checkpoint, fastdecode, kernels, loopcd
 from mlx_lm.models.inkling2.config import ModelArgs, TextArgs
 from mlx_lm.models.inkling2.layers import (
@@ -576,12 +577,14 @@ class Model(nn.Module):
 
     def make_cache(self) -> list[CacheList]:
         window = self.args.text.sliding_window_size
+        kv_int8 = os.environ.get("LOOPLING_KV_INT8", "0") not in ("0", "", "false", "False")
+        full_cls = Int8KVCache if kv_int8 else KVCache
         return [
             CacheList(
                 (
                     RotatingKVCache(max_size=window)
                     if isinstance(layer, SlidingDecoderLayer)
-                    else KVCache()
+                    else full_cls()
                 ),
                 ArraysCache(4),
             )

@@ -58,6 +58,27 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+_SERVER_BATCHDECODE = os.environ.get("LOOPLING_SERVER_BATCHDECODE", "1") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+
+
+def _is_inkling2_model(model: nn.Module) -> bool:
+    inner = getattr(model, "model", None)
+    lm = getattr(inner, "language_model", None) if inner is not None else None
+    return lm is not None and hasattr(lm, "layer_visits") and hasattr(model, "args")
+
+
+def _inkling2_bd_caches_ok(model: nn.Module, caches: List[List[Any]]) -> bool:
+    if not _SERVER_BATCHDECODE or not (2 <= len(caches) <= 8) or not _is_inkling2_model(model):
+        return False
+    from .models.inkling2.batchdecode import BatchDecoder, _batch_cache_ok
+
+    nv = len(model.model.language_model.layer_visits)
+    return bool(caches[0]) and len(caches[0]) == nv and _batch_cache_ok(caches, nv)
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
@@ -750,8 +771,8 @@ def stream_generate(
         _ss = selfspec.parse_env()
         if _ss is not None and not selfspec.applicable(model, *_ss):
             _ss = None
-    if draft_model is None and os.environ.get("LOOPLING_MTP") == "1":
-        # official multi-token-prediction drafter (docs/MTP.md); default OFF
+    if draft_model is None and os.environ.get("LOOPLING_MTP") in ("1", "dflash2"):
+        # official MTP or Splash DFlash2 drafter; default OFF
         if _ss is not None:
             raise ValueError("LOOPLING_MTP and LOOPLING_SELFSPEC cannot be combined")
         from mlx_lm.models.inkling2.mtp import mtp_generate_step
@@ -1444,17 +1465,82 @@ class GenerationBatch:
         self._token_context = [TokenBuffer(t) for t in tokens]
         self._num_tokens = [0] * len(self.uids)
         self._matchers = [ss.matcher() for ss in stop_sequences]
+        self._bd = None
+
+        if (
+            _SERVER_BATCHDECODE
+            and 2 <= len(self.uids) <= 8
+            and _is_inkling2_model(self.model)
+            and self.prompt_cache
+            and not any(c.empty() for c in self.prompt_cache)
+        ):
+            per_caches = [
+                [c.extract(i) for c in self.prompt_cache] for i in range(len(self.uids))
+            ]
+            if _inkling2_bd_caches_ok(self.model, per_caches):
+                self._activate_bd(per_caches)
 
         if self.uids:
             self._step()
+
+    def _activate_bd(self, per_caches: List[List[Any]]) -> None:
+        from .models.inkling2.batchdecode import BatchDecoder
+
+        self._bd = BatchDecoder(self.model, per_caches)
+        self.prompt_cache = []
+
+    def _flush_bd(self) -> None:
+        if self._bd is None:
+            return
+        if self._next_tokens is not None:
+            mx.eval(self._next_tokens, self._next_logprobs)
+        self._bd.flush()
+
+    def _extract_all_caches(self) -> List[List[Any]]:
+        if not self.uids:
+            return []
+        if self._bd is not None:
+            self._flush_bd()
+            return list(self._bd.caches)
+        return [self.extract_cache(i) for i in range(len(self.uids))]
+
+    @property
+    def cache_nbytes(self) -> int:
+        if self._bd is not None:
+            return sum(c.nbytes for seq in self._bd.caches for c in seq)
+        return sum(c.nbytes for c in self.prompt_cache)
 
     def __len__(self):
         return len(self.uids)
 
     def extend(self, batch):
         """Extend this batch with another generation batch."""
+        was_empty = len(self.uids) == 0
         self.uids.extend(batch.uids)
-        self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
+        if was_empty and batch._bd is not None:
+            self._bd = batch._bd
+            batch._bd = None
+            self.prompt_cache = []
+        elif (
+            self._bd is not None
+            or batch._bd is not None
+            or (
+                _SERVER_BATCHDECODE
+                and 2 <= len(self.uids) <= 8
+                and _is_inkling2_model(self.model)
+            )
+        ):
+            all_caches = self._extract_all_caches() + batch._extract_all_caches()
+            self._bd = None
+            batch._bd = None
+            if _inkling2_bd_caches_ok(self.model, all_caches):
+                self._activate_bd(all_caches)
+            elif all_caches:
+                self.prompt_cache = _merge_caches(all_caches)
+            else:
+                self.prompt_cache = []
+        else:
+            self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
         self.samplers.extend(batch.samplers)
         self.logits_processors.extend(batch.logits_processors)
@@ -1490,8 +1576,11 @@ class GenerationBatch:
         inputs = self._current_tokens
 
         # Forward pass
-        logits = self.model(inputs[:, None], cache=self.prompt_cache)
-        logits = logits[:, -1, :]
+        if self._bd is not None:
+            logits = self._bd.logits(self._bd._hidden_pair(inputs))
+        else:
+            logits = self.model(inputs[:, None], cache=self.prompt_cache)
+            logits = logits[:, -1, :]
 
         # Logits processors
         token_context = []
@@ -1540,12 +1629,25 @@ class GenerationBatch:
         return inputs, self._current_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
+        if self._bd is not None:
+            self._flush_bd()
+            return copy.deepcopy(self._bd.caches[idx])
         return [c.extract(idx) for c in self.prompt_cache]
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
         self.uids = [self.uids[idx] for idx in keep]
-        if not keep:
+        if self._bd is not None:
+            self._flush_bd()
+            kept = [self._bd.caches[idx] for idx in keep]
+            self._bd = None
+            if not kept:
+                self.prompt_cache = []
+            elif len(kept) == 1 or not _inkling2_bd_caches_ok(self.model, kept):
+                self.prompt_cache = _merge_caches(kept)
+            else:
+                self._activate_bd(kept)
+        elif not keep:
             self.prompt_cache.clear()
         else:
             for c in self.prompt_cache:
@@ -1869,7 +1971,7 @@ class BatchGenerator:
     def prompt_cache_nbytes(self):
         total = sum(c.nbytes for p in self._unprocessed_sequences for c in p[3])
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
-        total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        total += self._generation_batch.cache_nbytes
         return total
 
     def _make_batch(self, n: int):

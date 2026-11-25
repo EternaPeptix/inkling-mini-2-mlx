@@ -32,7 +32,14 @@ _RM_MODS = None
 def _mods():
     global _RM_MODS
     if _RM_MODS is None:
-        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, KVCache, RotatingKVCache
+        from mlx_lm.models.cache import (
+            BatchInt8KVCache,
+            BatchKVCache,
+            BatchRotatingKVCache,
+            Int8KVCache,
+            KVCache,
+            RotatingKVCache,
+        )
         from mlx_lm.models.inkling2 import layers as L
         from mlx_lm.models.inkling2.rows import mid as RM
         from mlx_lm.models.inkling2.rows import moe as RMo
@@ -41,7 +48,11 @@ def _mods():
         from mlx_lm.models.inkling2.rows import rowlocal as RL
         from mlx_lm.models.inkling2.rows import sdpa as RS
         from mlx_lm.models.inkling2.rows import visit as RV
-        _RM_MODS = (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV)
+        _RM_MODS = (
+            KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache,
+            Int8KVCache, BatchInt8KVCache,
+            L, RM, RMo, RP, RQ, RL, RS, RV,
+        )
     return _RM_MODS
 
 
@@ -87,6 +98,8 @@ def eligible(h, cache, conv_mask) -> bool:
     kv = cache[0]
     if isinstance(kv.offset, mx.array) and getattr(kv, "_fd_delta", None) is None:
         return False
+    if hasattr(kv, "k_q"):
+        return kv.k_q is not None
     return getattr(kv, "_packed", None) is not None or isinstance(kv.keys, mx.array)
 
 
@@ -335,7 +348,7 @@ def _core(layer, q, k, v, pb, sinks, kv):
 
 
 def _fused_b1_ok_layer(layer) -> bool:
-    L = _mods()[4]
+    L = _mods()[6]
     if not L._use_kernels():
         return False
     a = layer["self_attn"]
@@ -409,7 +422,11 @@ def _fused_b1_ok(layer, h, conv) -> bool:
 
 
 def _decode_layer_fused_b1(layer, h, bs, cache, messages):
-    KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache, L, RM, RMo, RP, RQ, RL, RS, RV = _mods()
+    (
+        KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache,
+        Int8KVCache, BatchInt8KVCache,
+        L, RM, RMo, RP, RQ, RL, RS, RV,
+    ) = _mods()
     conv = cache[1]
     kv = cache[0]
     cs = conv.cache
@@ -438,8 +455,16 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
     tau_1d = None if sliding else _full_tau(layer, _end(kv)).reshape(-1)
     rel_w_bf = _rel_w_bf(a["rel_logits_proj"])
 
+    use_int8_kv = (
+        type(kv) in (Int8KVCache, BatchInt8KVCache)
+        and getattr(kv, "k_q", None) is not None
+        and kv.k_q.shape[0] == 1
+        and kv.k_q.shape[1] == 8
+        and kv.k_q.shape[3] == 128
+    )
     use_packed_kv = (
-        type(kv) in (KVCache, RotatingKVCache)
+        not use_int8_kv
+        and type(kv) in (KVCache, RotatingKVCache)
         and getattr(kv, "keep", 0) == 0
         and getattr(kv, "_fd_delta", None) is None
         and (
@@ -448,7 +473,17 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
         )
     )
     op_m = a["o_proj"]
-    if use_packed_kv:
+    if use_int8_kv:
+        q, kk, vv, pb, w0, w1 = RM.mid_rows_flat(
+            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=False
+        )
+        kq_n, vq_n, ks_n, vs_n = RS.quantize_kv_b1_int8(kk, vv)
+        k_q, v_q, k_s, v_s, end_int, cap = kv.update_b1_int8(kq_n, vq_n, ks_n, vs_n, _wpos)
+        attn_out = RS.sdpa_b1_int8(
+            q, k_q, v_q, k_s, v_s, pb, qkv_flat, gate_off, sink_off, end_int, end_int, cap, scale=a.scaling
+        )
+        op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
+    elif use_packed_kv:
         if kv._packed is None:
             kv.pack_b1()
         q, kv_new, pb, w0, w1 = RM.mid_rows_flat(

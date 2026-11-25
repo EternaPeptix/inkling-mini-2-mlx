@@ -916,7 +916,7 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        cache.cache = [mx.contiguous(c[idx : idx + 1]) if c is not None else None for c in self.cache]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -1656,6 +1656,9 @@ class BatchRotatingKVCache(_BaseCache):
             cache._idx = self.max_size
         cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
         cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+        if cache.keys.shape[2] > cache.max_size:
+            cache.keys = mx.contiguous(cache.keys[:, :, -cache.max_size :])
+            cache.values = mx.contiguous(cache.values[:, :, -cache.max_size :])
         cache.offset = offset
         cache._idx = cache.keys.shape[2]
         return cache
@@ -1736,7 +1739,365 @@ def _drop_fd_flag(cls, attr, value, names):
             setattr(cls, n, wrap(m))
 
 
-for _c in (BatchKVCache, BatchRotatingKVCache):
+def _quantize_kv_int8(x: mx.array):
+    amax = mx.max(mx.abs(x.astype(mx.float32)), axis=-1)
+    scale = mx.maximum(amax / 127.0, 1e-12)
+    inv = 1.0 / scale[..., None]
+    q = mx.round(x.astype(mx.float32) * inv).astype(mx.int8)
+    return q, scale
+
+
+def _dequantize_kv_int8(q: mx.array, scale: mx.array, dtype=mx.bfloat16) -> mx.array:
+    return (q.astype(mx.float32) * scale[..., None]).astype(dtype)
+
+
+class Int8KVCache(_BaseCache):
+    """Per-token, per-head symmetric INT8 KV cache for FullDecoderLayer (opt-in via LOOPLING_KV_INT8=1)."""
+
+    step = 256
+
+    def __init__(self):
+        self.k_q = None
+        self.v_q = None
+        self.k_s = None
+        self.v_s = None
+        self.offset = 0
+        self._dtype = mx.bfloat16
+
+    def _ensure_cap(self, B, Hkv, D, need):
+        if self.k_q is None:
+            n_steps = (self.step + need - 1) // self.step
+            cap = n_steps * self.step
+            self.k_q = mx.zeros((B, Hkv, cap, D), mx.int8)
+            self.v_q = mx.zeros((B, Hkv, cap, D), mx.int8)
+            self.k_s = mx.zeros((B, Hkv, cap), mx.float32)
+            self.v_s = mx.zeros((B, Hkv, cap), mx.float32)
+        elif need > self.k_q.shape[2]:
+            prev = self.offset
+            add_need = need - prev
+            n_steps = (self.step + add_need - 1) // self.step
+            ext = n_steps * self.step
+            if prev % self.step != 0:
+                self.k_q = self.k_q[..., :prev, :]
+                self.v_q = self.v_q[..., :prev, :]
+                self.k_s = self.k_s[..., :prev]
+                self.v_s = self.v_s[..., :prev]
+            self.k_q = mx.concatenate([self.k_q, mx.zeros((B, Hkv, ext, D), mx.int8)], axis=2)
+            self.v_q = mx.concatenate([self.v_q, mx.zeros((B, Hkv, ext, D), mx.int8)], axis=2)
+            self.k_s = mx.concatenate([self.k_s, mx.zeros((B, Hkv, ext), mx.float32)], axis=2)
+            self.v_s = mx.concatenate([self.v_s, mx.zeros((B, Hkv, ext), mx.float32)], axis=2)
+
+    @property
+    def keys(self):
+        return None if self.k_q is None else _dequantize_kv_int8(self.k_q, self.k_s, self._dtype)
+
+    @property
+    def values(self):
+        return None if self.v_q is None else _dequantize_kv_int8(self.v_q, self.v_s, self._dtype)
+
+    def update_b1_int8(self, kq_new, vq_new, ks_new, vs_new, wpos_fn):
+        prev = self.offset
+        B, Hkv, _, D = kq_new.shape
+        self._ensure_cap(B, Hkv, D, prev + 1)
+        wp = wpos_fn(prev)
+        self.offset = prev + 1
+        self.k_q = mx.slice_update(self.k_q, kq_new, wp, axes=(2,))
+        self.v_q = mx.slice_update(self.v_q, vq_new, wp, axes=(2,))
+        self.k_s = mx.slice_update(self.k_s, ks_new, wp, axes=(2,))
+        self.v_s = mx.slice_update(self.v_s, vs_new, wp, axes=(2,))
+        return self.k_q, self.v_q, self.k_s, self.v_s, self.offset, self.k_q.shape[2]
+
+    def update_and_fetch(self, keys, values):
+        prev = self.offset
+        B, Hkv, S, D = keys.shape
+        self._dtype = keys.dtype
+        self._ensure_cap(B, Hkv, D, prev + S)
+        kq, ks = _quantize_kv_int8(keys)
+        vq, vs = _quantize_kv_int8(values)
+        self.offset = prev + S
+        self.k_q[..., prev : self.offset, :] = kq
+        self.v_q[..., prev : self.offset, :] = vq
+        self.k_s[..., prev : self.offset] = ks
+        self.v_s[..., prev : self.offset] = vs
+        if prev == 0:
+            return keys, values
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        if self.k_q is None:
+            return None, None
+        return (
+            _dequantize_kv_int8(self.k_q[..., : self.offset, :], self.k_s[..., : self.offset], self._dtype),
+            _dequantize_kv_int8(self.v_q[..., : self.offset, :], self.v_s[..., : self.offset], self._dtype),
+        )
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        return self.k_q, self.v_q, self.k_s, self.v_s, self.offset
+
+    @state.setter
+    def state(self, v):
+        self.k_q, self.v_q, self.k_s, self.v_s, self.offset = v
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    @classmethod
+    def merge(_, caches):
+        return BatchInt8KVCache.merge(caches)
+
+    def empty(self):
+        return self.k_q is None
+
+    @property
+    def nbytes(self):
+        if self.k_q is None:
+            return 0
+        return self.k_q.nbytes + self.v_q.nbytes + self.k_s.nbytes + self.v_s.nbytes
+
+
+class BatchInt8KVCache(_BaseCache):
+    """Batched INT8 KV cache mirroring BatchKVCache semantics with B=1 fastdecode support."""
+
+    step = 256
+
+    def __init__(self, left_padding: List[int]):
+        self.k_q = None
+        self.v_q = None
+        self.k_s = None
+        self.v_s = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-l for l in left_padding])
+        self._idx = 0
+        self._dtype = mx.bfloat16
+        self._fd_delta = 0 if (len(left_padding) == 1 and left_padding[0] == 0) else None
+        self._right_padding = None
+
+    @property
+    def keys(self):
+        return None if self.k_q is None else _dequantize_kv_int8(self.k_q, self.k_s, self._dtype)
+
+    @property
+    def values(self):
+        return None if self.v_q is None else _dequantize_kv_int8(self.v_q, self.v_s, self._dtype)
+
+    def _ensure_cap(self, B, Hkv, D, need):
+        if self.k_q is None:
+            n_steps = (self.step + need - 1) // self.step
+            cap = n_steps * self.step
+            self.k_q = mx.zeros((B, Hkv, cap, D), mx.int8)
+            self.v_q = mx.zeros((B, Hkv, cap, D), mx.int8)
+            self.k_s = mx.zeros((B, Hkv, cap), mx.float32)
+            self.v_s = mx.zeros((B, Hkv, cap), mx.float32)
+        elif need > self.k_q.shape[2]:
+            prev = self._idx
+            n_steps = (self.step + need - prev - 1) // self.step
+            ext = n_steps * self.step
+            if prev % self.step != 0:
+                self.k_q = self.k_q[..., :prev, :]
+                self.v_q = self.v_q[..., :prev, :]
+                self.k_s = self.k_s[..., :prev]
+                self.v_s = self.v_s[..., :prev]
+            self.k_q = mx.concatenate([self.k_q, mx.zeros((B, Hkv, ext, D), mx.int8)], axis=2)
+            self.v_q = mx.concatenate([self.v_q, mx.zeros((B, Hkv, ext, D), mx.int8)], axis=2)
+            self.k_s = mx.concatenate([self.k_s, mx.zeros((B, Hkv, ext), mx.float32)], axis=2)
+            self.v_s = mx.concatenate([self.v_s, mx.zeros((B, Hkv, ext), mx.float32)], axis=2)
+
+    def update_b1_int8(self, kq_new, vq_new, ks_new, vs_new, wpos_fn):
+        prev = self._idx
+        B, Hkv, _, D = kq_new.shape
+        self._ensure_cap(B, Hkv, D, prev + 1)
+        wp = wpos_fn(prev)
+        self._idx = prev + 1
+        self.offset = self.offset + 1
+        self.k_q = mx.slice_update(self.k_q, kq_new, wp, axes=(2,))
+        self.v_q = mx.slice_update(self.v_q, vq_new, wp, axes=(2,))
+        self.k_s = mx.slice_update(self.k_s, ks_new, wp, axes=(2,))
+        self.v_s = mx.slice_update(self.v_s, vs_new, wp, axes=(2,))
+        return self.k_q, self.v_q, self.k_s, self.v_s, self._idx, self.k_q.shape[2]
+
+    def update_and_fetch(self, keys, values):
+        prev = self._idx
+        B, Hkv, S, D = keys.shape
+        self._dtype = keys.dtype
+        self._ensure_cap(B, Hkv, D, prev + S)
+        kq, ks = _quantize_kv_int8(keys)
+        vq, vs = _quantize_kv_int8(values)
+        self.offset = self.offset + S
+        self._idx = prev + S
+        self.k_q[..., prev : self._idx, :] = kq
+        self.v_q[..., prev : self._idx, :] = vq
+        self.k_s[..., prev : self._idx] = ks
+        self.v_s[..., prev : self._idx] = vs
+        if prev == 0:
+            return keys, values
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        return (
+            _dequantize_kv_int8(self.k_q[..., : self._idx, :], self.k_s[..., : self._idx], self._dtype),
+            _dequantize_kv_int8(self.v_q[..., : self._idx, :], self.v_s[..., : self._idx], self._dtype),
+        )
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.k_q is not None:
+                raise ValueError("Left padding can only be added to an empty BatchInt8KVCache")
+            lp = mx.array(left_padding)
+            self.left_padding += lp
+            self.offset = self.offset - lp
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            p = self._right_padding
+            self.k_q = dynamic_roll(self.k_q, p[:, None], axis=2)
+            self.v_q = dynamic_roll(self.v_q, p[:, None], axis=2)
+            self.k_s = dynamic_roll(self.k_s, p[:, None], axis=2)
+            self.v_s = dynamic_roll(self.v_s, p[:, None], axis=2)
+            self.offset = self.offset - p
+            self.left_padding += p
+            self._right_padding = None
+
+    @property
+    def state(self):
+        return self.k_q, self.v_q, self.k_s, self.v_s, self.offset, self.left_padding, self._idx
+
+    @state.setter
+    def state(self, v):
+        self.k_q, self.v_q, self.k_s, self.v_s, self.offset, self.left_padding, self._idx = v
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset = self.offset - n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(N, offset=self._idx, left_padding=self.left_padding, **kwargs)
+
+    def filter(self, batch_indices):
+        if self.k_q is not None:
+            self.k_q = self.k_q[batch_indices]
+            self.v_q = self.v_q[batch_indices]
+            self.k_s = self.k_s[batch_indices]
+            self.v_s = self.v_s[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        min_lp = min(self.left_padding.tolist())
+        if min_lp > 0:
+            if self.k_q is not None:
+                self.k_q = self.k_q[..., min_lp:, :]
+                self.v_q = self.v_q[..., min_lp:, :]
+                self.k_s = self.k_s[..., min_lp:]
+                self.v_s = self.v_s[..., min_lp:]
+            self._idx -= min_lp
+            self.left_padding -= min_lp
+
+    def extend(self, other):
+        if self.k_q is None and other.k_q is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+        max_idx = max(self._idx, other._idx)
+        L1 = self.k_q.shape[2] if self.k_q is not None else 0
+        L2 = other.k_q.shape[2] if other.k_q is not None else 0
+        H = self.k_q.shape[1] if self.k_q is not None else other.k_q.shape[1]
+        D = self.k_q.shape[3] if self.k_q is not None else other.k_q.shape[3]
+        max_size = max(L1, L2)
+
+        def pad(c):
+            kq, vq, ks, vs = c.k_q, c.v_q, c.k_s, c.v_s
+            if kq is None:
+                Bc = c.offset.shape[0]
+                kq = mx.zeros((Bc, H, 0, D), mx.int8)
+                vq = mx.zeros((Bc, H, 0, D), mx.int8)
+                ks = mx.zeros((Bc, H, 0), mx.float32)
+                vs = mx.zeros((Bc, H, 0), mx.float32)
+            left = max_idx - c._idx
+            right = max_size - kq.shape[2] - left
+            if right < 0:
+                kq, vq, ks, vs = kq[..., :right, :], vq[..., :right, :], ks[..., :right], vs[..., :right]
+                right = 0
+            if left != 0 or right != 0:
+                p4 = [(0, 0), (0, 0), (left, right), (0, 0)]
+                p3 = [(0, 0), (0, 0), (left, right)]
+                kq, vq = mx.pad(kq, p4), mx.pad(vq, p4)
+                ks, vs = mx.pad(ks, p3), mx.pad(vs, p3)
+            return kq, vq, ks, vs, c.offset, c.left_padding + left
+
+        self.k_q, self.v_q, self.k_s, self.v_s, self.offset, self.left_padding = map(
+            mx.concatenate, zip(*(pad(self), pad(other)))
+        )
+        self._idx = max_idx
+
+    def extract(self, idx):
+        cache = Int8KVCache()
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
+        cache.k_q = mx.contiguous(self.k_q[idx : idx + 1, :, padding : self._idx])
+        cache.v_q = mx.contiguous(self.v_q[idx : idx + 1, :, padding : self._idx])
+        cache.k_s = mx.contiguous(self.k_s[idx : idx + 1, :, padding : self._idx])
+        cache.v_s = mx.contiguous(self.v_s[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.k_q.shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths)
+        if max_length == 0:
+            return cls([0] * len(caches))
+        padding = [max_length - l for l in lengths]
+        B = len(caches)
+        H = max(c.k_q.shape[1] for c in caches if c.k_q is not None)
+        D = max(c.k_q.shape[3] for c in caches if c.k_q is not None)
+        k_q = mx.zeros((B, H, max_length, D), mx.int8)
+        v_q = mx.zeros((B, H, max_length, D), mx.int8)
+        k_s = mx.zeros((B, H, max_length), mx.float32)
+        v_s = mx.zeros((B, H, max_length), mx.float32)
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.k_q is None:
+                continue
+            k_q[i : i + 1, :, p : p + c.offset] = c.k_q[..., : c.offset, :]
+            v_q[i : i + 1, :, p : p + c.offset] = c.v_q[..., : c.offset, :]
+            k_s[i : i + 1, :, p : p + c.offset] = c.k_s[..., : c.offset]
+            v_s[i : i + 1, :, p : p + c.offset] = c.v_s[..., : c.offset]
+        cache = cls(padding)
+        cache.k_q, cache.v_q, cache.k_s, cache.v_s = k_q, v_q, k_s, v_s
+        cache.offset += max_length
+        cache._idx = max_length
+        return cache
+
+    def size(self):
+        return self._idx
+
+    def empty(self):
+        return self.k_q is None
+
+    @property
+    def nbytes(self):
+        if self.k_q is None:
+            return 0
+        return self.k_q.nbytes + self.v_q.nbytes + self.k_s.nbytes + self.v_s.nbytes
+
+
+for _c in (BatchKVCache, BatchRotatingKVCache, BatchInt8KVCache):
     _drop_fd_flag(_c, "_fd_delta", None, ("prepare", "filter", "extend", "state"))
 _drop_fd_flag(ArraysCache, "_zero_pad", False, ("prepare", "filter", "extend", "state"))
 
@@ -1888,12 +2249,20 @@ class LRUPromptCache:
     class CacheOrder:
         def __init__(self, ordering: Optional[List[str]] = None):
             self._ordering = (
-                ["assistant", "user", "system"] if ordering is None else ordering
+                ["checkpoint", "assistant", "user", "system"]
+                if ordering is None
+                else ordering
             )
             self._lrus = {k: deque() for k in self._ordering}
 
         def __len__(self):
             return sum(len(lru) for lru in self._lrus.values())
+
+        def count_type(self, cache_type: str) -> int:
+            return len(self._lrus.get(cache_type, ()))
+
+        def count_non_checkpoint(self) -> int:
+            return sum(len(q) for k, q in self._lrus.items() if k != "checkpoint")
 
         def push(self, model: Any, tokens: List[Any], cache_type: str = "assistant"):
             self._lrus[cache_type].append((model, tokens))
@@ -1906,19 +2275,28 @@ class LRUPromptCache:
                 except ValueError:
                     pass
 
-        def pop(self):
-            i = 0
+        def pop(self, *, skip_checkpoint: bool = False):
+            # Evict periodic checkpoints before conversation entries.
+            if not skip_checkpoint and self._lrus.get("checkpoint"):
+                return self._lrus["checkpoint"].popleft()
+            i = 1 if self._ordering and self._ordering[0] == "checkpoint" else 0
             while i + 1 < len(self._ordering):
                 lru_a = self._lrus[self._ordering[i]]
                 lru_b = self._lrus[self._ordering[i + 1]]
                 if lru_a and len(lru_a) >= len(lru_b):
                     return lru_a.popleft()
                 i += 1
-            return lru_b.popleft()
+            return self._lrus[self._ordering[-1]].popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        max_checkpoints: int = 32,
+    ):
         self.max_size = max_size
         self.max_bytes = max_bytes
+        self.max_checkpoints = max_checkpoints
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
@@ -1953,6 +2331,12 @@ class LRUPromptCache:
 
         return None, tokens
 
+    def _evict_entry(self, *, skip_checkpoint: bool = False):
+        model, tokens = self._lru.pop(skip_checkpoint=skip_checkpoint)
+        entry = self._trie.pop(model, tokens)
+        self._n_bytes -= entry.nbytes
+        self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+
     def insert_cache(
         self,
         model: Any,
@@ -1961,6 +2345,8 @@ class LRUPromptCache:
         *,
         cache_type: str = "assistant",
     ):
+        if cache_type not in self._n_bytes_by_type:
+            cache_type = "assistant"
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
             prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
@@ -1984,17 +2370,13 @@ class LRUPromptCache:
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
 
-        # Ensure we match the constraints
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-        while self._n_bytes > self.max_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        # Enforce slot caps separately for checkpoints and conversation entries
+        while self._lru.count_type("checkpoint") > self.max_checkpoints:
+            self._evict_entry(skip_checkpoint=False)
+        while self._lru.count_non_checkpoint() > self.max_size:
+            self._evict_entry(skip_checkpoint=True)
+        while self._n_bytes > self.max_bytes and len(self._lru) > 0:
+            self._evict_entry(skip_checkpoint=False)
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -2003,15 +2385,9 @@ class LRUPromptCache:
         n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
 
         while len(self._lru) > n_sequences:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            self._evict_entry(skip_checkpoint=False)
+        while self._n_bytes > n_bytes and len(self._lru) > 0:
+            self._evict_entry(skip_checkpoint=False)
 
     def stats_by_type(self):
         result = {}

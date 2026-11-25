@@ -10,13 +10,16 @@ once per launch.  Not wired into the decode path.  Notes and results: docs/FUSED
 * gate_down_rows(x, ws)                    K2: x (B,G,4608) bf16, G weights (64,4608) bf16 -> (B,G,64) bf16
 * gate_mix_rows(down, ss, msg, slots, wf, wm)  K3 -> (B,G,D) f32
 """
+import math
 import os
 import weakref
 import mlx.core as mx
+import numpy as np
 
 from . import gemv as _gemv
+from . import mid as _mid
 from . import qmv as _qmv
-from .glue import GLUE_HEADER
+from .glue import GLUE_HEADER, flit
 
 MAX_B = _qmv.MAX_B
 
@@ -73,10 +76,11 @@ def _qheader(pro):
 _kernels = {}
 
 
-def _qkernel(nw, xmap, pro, rout=False, ro=False):
+def _qkernel(nw, xmap, pro, rout=False, ro=False, stg_x=False):
     use_rout = rout and not pro
     use_ro = ro and not pro and not use_rout
-    key = (nw, xmap, pro, use_rout, use_ro)
+    use_stg_x = bool(stg_x and use_rout and not use_ro)
+    key = (nw, xmap, pro, use_rout, use_ro, use_stg_x)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -91,12 +95,11 @@ def _qkernel(nw, xmap, pro, rout=False, ro=False):
         "uint sl = thread_index_in_simdgroup;",
     ]
     fn = "rows_qmv_ro" if use_ro else ("rows_qmv_rout" if use_rout else "rows_qmv_tile")
-    tail_t = "" if (use_rout or use_ro) else ", STG"
+    tail_t = (", true" if use_stg_x else "") if use_rout else ("" if use_ro else ", STG")
     if not pro:
-        lines += [
-            "const device uint32_t* wp; const device bfloat16_t* sp; const device bfloat16_t* bp;",
-            "const device bfloat16_t* xp; device bfloat16_t* yp; int Ni; uint tyl;",
-        ]
+        if use_stg_x:
+            lines.insert(0, "threadgroup uint32_t sx_raw[RB * 160]; threadgroup bfloat16_t* sx = (threadgroup bfloat16_t*)sx_raw;")
+        sx_arg = "sx" if use_stg_x else "(threadgroup bfloat16_t*)0"
         prev = "0"
         for i in range(nw):
             end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
@@ -106,12 +109,10 @@ def _qkernel(nw, xmap, pro, rout=False, ro=False):
                 head = ("if" if i == 0 else "else if") + f" (ty < {end})"
             yoff = "+".join(f"N{j}" for j in range(i)) or "0"
             lines.append(
-                f"{head} {{ wp = w{i}; sp = s{i}; bp = b{i}; xp = x{xmap[i]}; yp = y + B * ({yoff}); Ni = N{i}; tyl = ty - ({prev}); }}"
+                f"{head} {{ {fn}<B, K, (N{i} % (RPS * NSG)) != 0, RPS, NSG, RB{tail_t}>"
+                f"(w{i}, s{i}, b{i}, x{xmap[i]}, x{xmap[i]}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl, {sx_arg}); }}"
             )
             prev = end
-        lines.append(
-            f"{fn}<B, K, true, RPS, NSG, RB{tail_t}>(wp, sp, bp, xp, xp, yp, Ni, tyl, rb0, sg, sl, (threadgroup bfloat16_t*)0);"
-        )
     else:
         if pro:
             lines.insert(0, "threadgroup bfloat16_t sx[2 * RB * 256];")
@@ -129,7 +130,7 @@ def _qkernel(nw, xmap, pro, rout=False, ro=False):
                 f"(w{i}, s{i}, b{i}, x{xmap[i]}, {gt}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl, sx); }}"
             )
             prev = end
-    suf = "_pro" if pro else ("_ro" if use_ro else ("_rout" if use_rout else ""))
+    suf = "_pro" if pro else ("_ro" if use_ro else ("_rout_sx" if use_stg_x else ("_rout" if use_rout else "")))
     k = mx.fast.metal_kernel(
         name="f3_qmv_x%s_n%d%s" % ("".join(map(str, xmap)), nw, suf),
         input_names=ins,
@@ -168,6 +169,7 @@ def _launch_q(xs, weights, gate=None):
     pro = gate is not None
     rout = _qmv._use_rout(B, tot_n, len(weights), pro=pro)
     ro = _qmv._use_ro(B, tot_n, pro=pro, rout=rout)
+    stg_x = _qmv._use_stg_x(B, tot_n, rout, pro=pro)
     rps, nsg, rb, stg = _qmv._cfg(B, pro, N=tot_n, rout=rout, ro=ro)
     tmpl = [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb)]
     if not ((rout or ro) and not pro):
@@ -182,7 +184,7 @@ def _launch_q(xs, weights, gate=None):
         args += [w, s, b]
         tmpl.append((f"N{i}", N))
         tiles += (N + tile_w - 1) // tile_w
-    return _qkernel(len(weights), tuple(xmap), pro, rout=rout, ro=ro)(
+    return _qkernel(len(weights), tuple(xmap), pro, rout=rout, ro=ro, stg_x=stg_x)(
         inputs=args,
         template=tmpl,
         grid=(32, nsg * tiles, (B + rb - 1) // rb),
@@ -342,6 +344,792 @@ def qkv_rows(a, q_in, k_in, v_in, full=None, flat=False):
     return {m[0]: o for m, o in zip(mods, outs)}
 
 
+# =============================================================================================== K3b+K4 fused (qkv from mixed)
+_QNORM_SRC = r"""
+inline float proj_inv_from_part_q(const device float* p, float eps, uint lane) {
+  GL_NOFMA
+  float pv = (lane < 18u) ? (p[lane * 2u] + p[lane * 2u + 1u]) : 0.0f;
+  float tot = simd_sum(pv);
+  return metal::precise::rsqrt(tot / 2304.0f + eps);
+}
+
+inline float proj_norm_load8(const device float* mp, float inv, bfloat4 lw0, bfloat4 lw1, thread float* xt) {
+  float4 m0 = ((const device float4*)mp)[0];
+  float4 m1 = ((const device float4*)(mp + 4))[0];
+  bfloat16_t b0 = bfloat16_t(glue_rms_apply<float>(m0.x, inv, lw0.x));
+  bfloat16_t b1 = bfloat16_t(glue_rms_apply<float>(m0.y, inv, lw0.y));
+  bfloat16_t b2 = bfloat16_t(glue_rms_apply<float>(m0.z, inv, lw0.z));
+  bfloat16_t b3 = bfloat16_t(glue_rms_apply<float>(m0.w, inv, lw0.w));
+  bfloat16_t b4 = bfloat16_t(glue_rms_apply<float>(m1.x, inv, lw1.x));
+  bfloat16_t b5 = bfloat16_t(glue_rms_apply<float>(m1.y, inv, lw1.y));
+  bfloat16_t b6 = bfloat16_t(glue_rms_apply<float>(m1.z, inv, lw1.z));
+  bfloat16_t b7 = bfloat16_t(glue_rms_apply<float>(m1.w, inv, lw1.w));
+  xt[0] = float(b0); xt[1] = float(b1); xt[2] = float(b2); xt[3] = float(b3);
+  xt[4] = float(b4); xt[5] = float(b5); xt[6] = float(b6); xt[7] = float(b7);
+  float s = 0.0f;
+  s += xt[0]; s += xt[1]; s += xt[2]; s += xt[3];
+  s += xt[4]; s += xt[5]; s += xt[6]; s += xt[7];
+  return s;
+}
+
+template <int B, int K, bool PR, int RPS, int NSG, int RB, bool USE_TILE>
+METAL_FUNC void rows_qmv_norm_run(
+    const device uint32_t* w,
+    const device bfloat16_t* scales,
+    const device bfloat16_t* biases,
+    const device float* mixed,
+    const device float* part,
+    const device bfloat16_t* ln_w,
+    const int gi,
+    const float eps_ln,
+    device bfloat16_t* y,
+    const int N,
+    const uint ty,
+    const uint b0,
+    const uint simd_gid,
+    const uint simd_lid) {
+  constexpr int group_size = 64;
+  constexpr int bits = 8;
+  constexpr int packs_per_thread = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  static_assert(K == 2304 && values_per_thread == 8, "rows_qmv_norm_run expects K=2304, VPT=8");
+  constexpr bool FULL = (B % RB) == 0;
+
+  const int out_row = int(ty) * (NSG * RPS) + int(simd_gid) * RPS;
+  int last_row = RPS - 1;
+  if (PR) {
+    if (out_row >= N) return;
+    last_row = min(last_row, N - 1 - out_row);
+  }
+
+  typedef float U;
+  const int nb = FULL ? RB : min(RB, B - int(b0));
+  thread float inv[RB];
+  const device float* pp0 = part + (size_t(b0) * 3u + uint(gi)) * 36u;
+  _Pragma("clang loop unroll(full)")
+  for (int b = 0; b < RB; b++) {
+    if (FULL || b < nb) {
+      inv[b] = proj_inv_from_part_q(pp0 + size_t(b) * 108u, eps_ln, simd_lid);
+    } else {
+      inv[b] = 0.0f;
+    }
+  }
+
+  thread U result[RB][RPS];
+  for (int b = 0; b < RB; b++)
+    for (int r = 0; r < RPS; r++) result[b][r] = 0;
+
+  const int in_vec_size_w = K * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = K / group_size;
+  const device uint8_t* ws = (const device uint8_t*)w + size_t(out_row) * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += size_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += size_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device float* mp = mixed + (size_t(b0) * 3u + uint(gi)) * size_t(K) + simd_lid * values_per_thread;
+  const device bfloat16_t* lw = ln_w + simd_lid * values_per_thread;
+  y += size_t(b0) * N + out_row;
+
+  for (int k = 0; k < K; k += block_size) {
+    uint4 lwpk = ((const device uint4*)lw)[0];
+    bfloat4 l0 = as_type<bfloat4>(lwpk.xy);
+    bfloat4 l1 = as_type<bfloat4>(lwpk.zw);
+    if constexpr (USE_TILE) {
+      thread uint2 wr[RPS];
+      thread U sc[RPS];
+      thread U bi[RPS];
+      _Pragma("clang loop unroll(full)")
+      for (int row = 0; row < RPS; row++) {
+        int src = PR ? min(row, last_row) : row;
+        wr[row] = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+        sc[row] = scales[size_t(src) * in_vec_size_g];
+        bi[row] = biases[size_t(src) * in_vec_size_g];
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < RB; b++) {
+        if (FULL || b < nb) {
+          thread U xtb[8];
+          U smb = proj_norm_load8(mp + size_t(b) * (3u * size_t(K)), inv[b], l0, l1, xtb);
+          _Pragma("clang loop unroll(full)")
+          for (int row = 0; row < RPS; row++) {
+            float4 w0 = float4(as_type<uchar4>(wr[row].x));
+            float4 w1 = float4(as_type<uchar4>(wr[row].y));
+            U accum = 0;
+            accum += xtb[0] * w0.x; accum += xtb[1] * w0.y; accum += xtb[2] * w0.z; accum += xtb[3] * w0.w;
+            accum += xtb[4] * w1.x; accum += xtb[5] * w1.y; accum += xtb[6] * w1.z; accum += xtb[7] * w1.w;
+            result[b][row] += sc[row] * accum + smb * bi[row];
+          }
+        }
+      }
+    } else {
+      thread U xtb[RB][8];
+      thread U smb[RB];
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < RB; b++) {
+        if (FULL || b < nb) {
+          smb[b] = proj_norm_load8(mp + size_t(b) * (3u * size_t(K)), inv[b], l0, l1, xtb[b]);
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int row = 0; row < RPS; row++) {
+        int src = PR ? min(row, last_row) : row;
+        uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+        U sc = scales[size_t(src) * in_vec_size_g];
+        U bi = biases[size_t(src) * in_vec_size_g];
+        float4 w0 = float4(as_type<uchar4>(wr.x));
+        float4 w1 = float4(as_type<uchar4>(wr.y));
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < RB; b++) {
+          if (FULL || b < nb) {
+            U accum = 0;
+            accum += xtb[b][0] * w0.x; accum += xtb[b][1] * w0.y; accum += xtb[b][2] * w0.z; accum += xtb[b][3] * w0.w;
+            accum += xtb[b][4] * w1.x; accum += xtb[b][5] * w1.y; accum += xtb[b][6] * w1.z; accum += xtb[b][7] * w1.w;
+            result[b][row] += sc * accum + smb[b] * bi;
+          }
+        }
+      }
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    mp += block_size;
+    lw += block_size;
+  }
+
+  _Pragma("clang loop unroll(full)")
+  for (int b = 0; b < RB; b++) {
+    _Pragma("clang loop unroll(full)")
+    for (int row = 0; row < RPS; row++) {
+      U r = simd_sum(result[b][row]);
+      if (simd_lid == 0 && row <= last_row && (FULL || b < nb)) {
+        y[size_t(b) * N + row] = static_cast<bfloat16_t>(r);
+      }
+    }
+  }
+}
+"""
+
+_qnorm_header = None
+_qnorm_kernels = {}
+
+
+def _get_qnorm_kernel(shared_ln, eps_ln, use_tile):
+    global _qnorm_header
+    eps_lit = flit(eps_ln)
+    key = (bool(shared_ln), eps_lit, bool(use_tile))
+    k = _qnorm_kernels.get(key)
+    if k is not None:
+        return k
+    if _qnorm_header is None:
+        _qnorm_header = _qmv.base_header() + GLUE_HEADER + _QNORM_SRC
+    ins = ["mixed", "part"] + (["lw0"] if shared_ln else ["lw0", "lw1", "lw2"])
+    for i in range(3):
+        ins += [f"w{i}", f"s{i}", f"b{i}"]
+    lines = [
+        "uint ty = threadgroup_position_in_grid.y;",
+        "uint rb0 = threadgroup_position_in_grid.z * RB;",
+        "uint sg = simdgroup_index_in_threadgroup;",
+        "uint sl = thread_index_in_simdgroup;",
+    ]
+    prev = "0"
+    ut = "true" if use_tile else "false"
+    for i in range(3):
+        end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
+        head = "if (ty < " + end + ")" if i == 0 else ("else if (ty < " + end + ")" if i == 1 else "else")
+        yoff = "+".join(f"N{j}" for j in range(i)) or "0"
+        lw_name = "lw0" if shared_ln else f"lw{i}"
+        lines.append(
+            f"{head} {{ rows_qmv_norm_run<B, 2304, (N{i} % (RPS * NSG)) != 0, RPS, NSG, RB, {ut}>"
+            f"(w{i}, s{i}, b{i}, mixed, part, {lw_name}, {i}, {eps_lit}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl); }}"
+        )
+        prev = end
+    k = _qnorm_kernels[key] = mx.fast.metal_kernel(
+        name="f3_qmv_norm_%s_%s_%s" % ("s" if shared_ln else "f", "t" if use_tile else "r", eps_lit.replace(".", "p").replace("-", "m")),
+        input_names=ins,
+        output_names=["y"],
+        source="\n".join(lines),
+        header=_qnorm_header,
+        ensure_row_contiguous=True,
+    )
+    return k
+
+
+def qkv_rows_from_mixed(a, mixed, part, ln_ws, *, eps_ln=1e-6, full=None, flat=False):
+    """Fused K3b+K4: reads K3's `(mixed (B,3,2304) f32, part (B,3,18) f32)` and normalizes on load inside K4 QKV."""
+    is_dict = isinstance(a, dict)
+    if full is None:
+        ks = a["k_sconv"] if is_dict else a.k_sconv
+        full = ("weight_proj" in ks) if isinstance(ks, dict) else hasattr(ks, "weight_proj")
+    cat = _get_qkv_cat(a, False, full)
+    if cat is None or mixed.ndim != 3 or mixed.shape[1:] != (3, 2304) or mixed.dtype != mx.float32:
+        raise ValueError("qkv_rows_from_mixed requires cat aff8 QKV and mixed (B,3,2304) f32")
+    B = mixed.shape[0]
+    if not 1 <= B <= MAX_B or part.shape != (B, 3, 36) or part.dtype != mx.float32:
+        raise ValueError("part must be (B,3,36) f32")
+    cat_groups, grp_widths, fields = cat
+    shared_ln = len(ln_ws) == 1 or (ln_ws[0] is ln_ws[1] and ln_ws[1] is ln_ws[2])
+    lw_args = [ln_ws[0]] if shared_ln else list(ln_ws[:3])
+    use_tile = B >= 4
+    if B == 1:
+        rps, nsg, rb = 4, 2, 1
+    elif B <= 3:
+        rps, nsg, rb = 2, 4, B
+    elif B == 4:
+        rps, nsg, rb = 4, 2, 4
+    else:
+        rps, nsg, rb = 2, 4, min(B, 8)
+    tile_w = rps * nsg
+    args = [mixed, part] + lw_args
+    tmpl = [("B", B), ("RPS", rps), ("NSG", nsg), ("RB", rb)]
+    tiles = 0
+    tot_n = 0
+    for i, (w, s, b) in enumerate(cat_groups):
+        N = w.shape[0]
+        args += [w, s, b]
+        tmpl.append((f"N{i}", N))
+        tiles += (N + tile_w - 1) // tile_w
+        tot_n += N
+    buf = _get_qnorm_kernel(shared_ln, eps_ln, use_tile)(
+        inputs=args,
+        template=tmpl,
+        grid=(32, nsg * tiles, (B + rb - 1) // rb),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(B * tot_n,)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    grp_bases = (0, B * grp_widths[0], B * (grp_widths[0] + grp_widths[1]))
+    if flat:
+        lay = [(nm, grp_bases[gi] + loc, gw, nc) for nm, gi, loc, gw, nc in fields]
+        return buf, lay
+    out = {}
+    for nm, gi, loc, gw, nc in fields:
+        gb = grp_bases[gi]
+        view = buf[gb : gb + B * gw].reshape(B, gw)[:, loc : loc + nc]
+        out[nm] = view if (loc == 0 and gw == nc) else mx.contiguous(view)
+    return out
+
+
+def qkv_msg_rows(layer, r1, msg, *, flat=True):
+    """Fused K2 -> K3(with partials) -> K3b+K4 QKV for a message visit (eliminates QKV K3b launch)."""
+    is_dict = isinstance(layer, dict)
+    a = layer["self_attn"] if is_dict else layer.self_attn
+    sliding = ("input_layernorm" in layer) if is_dict else hasattr(layer, "input_layernorm")
+    gs = (
+        (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
+        if is_dict
+        else (layer.q_message_gate, layer.k_message_gate, layer.v_message_gate)
+    )
+    down = gate_down_rows(r1["qkv_gate_in"], [g["down_proj"]["weight"] for g in gs])
+    mixed, part = gate_mix_part_rows(
+        down,
+        [r1["s_q"], r1["s_k"], r1["s_v"]],
+        msg,
+        (0, 1, 2),
+        [g["forget_gate_proj"]["weight"] for g in gs],
+        [g["message_gate_proj"]["weight"] for g in gs],
+    )
+    if sliding:
+        ln_m = layer["input_layernorm"] if is_dict else layer.input_layernorm
+        ln_ws, eps_ln = [ln_m["weight"]], ln_m.eps
+    else:
+        m0 = layer["q_input_layernorm"] if is_dict else layer.q_input_layernorm
+        m1 = layer["k_input_layernorm"] if is_dict else layer.k_input_layernorm
+        m2 = layer["v_input_layernorm"] if is_dict else layer.v_input_layernorm
+        ln_ws, eps_ln = [m0["weight"], m1["weight"], m2["weight"]], m0.eps
+    return qkv_rows_from_mixed(a, mixed, part, ln_ws, eps_ln=eps_ln, full=not sliding, flat=flat)
+
+
+# =============================================================================================== K4+K5 fused (B=1 QKV+MID+REL)
+_qkv_all_cat_cache: dict = {}
+
+
+def _get_qkv_all_cat(a, full):
+    """Single concatenated (W_all, S_all, B_all) for B=1 fused QKV+MID+REL.
+    Row order: q_proj(3072), r_proj(384), gate(3072), sinks(24), k_proj(1024), v_proj(1024) [, k_wproj(32), v_wproj(32)]."""
+    if not full:
+        cat = _get_qkv_cat(a, True, False)
+        if cat is not None:
+            return cat[0][0]
+    is_dict = isinstance(a, dict)
+    if is_dict and not hasattr(a, "q_proj"):
+        mods = [a["q_proj"], a["r_proj"], a["gate_proj"], a["sink_proj"], a["k_proj"], a["v_proj"]]
+        if full:
+            mods += [a["k_sconv"]["weight_proj"], a["v_sconv"]["weight_proj"]]
+    else:
+        mods = [a.q_proj, a.r_proj, a.gate_proj, a.sink_proj, a.k_proj, a.v_proj]
+        if full:
+            mods += [a.k_sconv.weight_proj, a.v_sconv.weight_proj]
+    if not all(_aff8_ok(m) for m in mods):
+        return None
+    cur_refs = tuple(t for m in mods for t in (m["weight"], m["scales"], m["biases"]))
+    key = (id(a), bool(full))
+    ent = _qkv_all_cat_cache.get(key)
+    if ent is not None and len(ent[0]) == len(cur_refs) and all(x is y for x, y in zip(ent[0], cur_refs)):
+        return ent[1]
+    if len(_qkv_all_cat_cache) >= 256:
+        _qkv_all_cat_cache.clear()
+    cw = mx.contiguous(mx.concatenate([m["weight"] for m in mods], axis=0))
+    cs = mx.contiguous(mx.concatenate([m["scales"] for m in mods], axis=0))
+    cb = mx.contiguous(mx.concatenate([m["biases"] for m in mods], axis=0))
+    val = (cw, cs, cb)
+    mx.eval(val)
+    _qkv_all_cat_cache[key] = (cur_refs, val)
+    if not is_dict or hasattr(a, "__weakref__"):
+        try:
+            weakref.finalize(a, _qkv_all_cat_cache.pop, key, None)
+        except TypeError:
+            pass
+    return val
+
+
+_QKV_MID_HEADER_EXTRA = r"""
+template <bool FROM_TG>
+inline void qmv_b1_4rows_impl(
+    const device uint32_t* w,
+    const device bfloat16_t* scales,
+    const device bfloat16_t* biases,
+    const threadgroup bfloat16_t* sx,
+    const device bfloat16_t* dx,
+    const int row0,
+    const uint sl,
+    thread float* out4) {
+  const device uint8_t* ws = (const device uint8_t*)w + size_t(row0) * 2304u + sl * 8u;
+  const device bfloat16_t* sp = scales + size_t(row0) * 36u + (sl >> 3);
+  const device bfloat16_t* bp = biases + size_t(row0) * 36u + (sl >> 3);
+  float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+  for (int k = 0; k < 2304; k += 256) {
+    uint4 xpk = FROM_TG
+        ? ((const threadgroup uint4*)(sx + k + sl * 8u))[0]
+        : ((const device uint4*)(dx + k + sl * 8u))[0];
+    uint2 wr0 = ((const device uint2*)ws)[0];
+    uint2 wr1 = ((const device uint2*)(ws + 2304u))[0];
+    uint2 wr2 = ((const device uint2*)(ws + 4608u))[0];
+    uint2 wr3 = ((const device uint2*)(ws + 6912u))[0];
+    bfloat16_t s0 = sp[0], s1 = sp[36], s2 = sp[72], s3 = sp[108];
+    bfloat16_t b0 = bp[0], b1 = bp[36], b2 = bp[72], b3 = bp[108];
+    bfloat4 x0b = as_type<bfloat4>(xpk.xy);
+    bfloat4 x1b = as_type<bfloat4>(xpk.zw);
+    float x0 = float(x0b.x), x1 = float(x0b.y), x2 = float(x0b.z), x3 = float(x0b.w);
+    float x4 = float(x1b.x), x5 = float(x1b.y), x6 = float(x1b.z), x7 = float(x1b.w);
+    float smb = 0.0f;
+    smb += x0; smb += x1; smb += x2; smb += x3;
+    smb += x4; smb += x5; smb += x6; smb += x7;
+    {
+      float4 w0 = float4(as_type<uchar4>(wr0.x)), w1 = float4(as_type<uchar4>(wr0.y));
+      float a = 0.0f;
+      a += x0 * w0.x; a += x1 * w0.y; a += x2 * w0.z; a += x3 * w0.w;
+      a += x4 * w1.x; a += x5 * w1.y; a += x6 * w1.z; a += x7 * w1.w;
+      r0 += float(s0) * a + smb * float(b0);
+    }
+    {
+      float4 w0 = float4(as_type<uchar4>(wr1.x)), w1 = float4(as_type<uchar4>(wr1.y));
+      float a = 0.0f;
+      a += x0 * w0.x; a += x1 * w0.y; a += x2 * w0.z; a += x3 * w0.w;
+      a += x4 * w1.x; a += x5 * w1.y; a += x6 * w1.z; a += x7 * w1.w;
+      r1 += float(s1) * a + smb * float(b1);
+    }
+    {
+      float4 w0 = float4(as_type<uchar4>(wr2.x)), w1 = float4(as_type<uchar4>(wr2.y));
+      float a = 0.0f;
+      a += x0 * w0.x; a += x1 * w0.y; a += x2 * w0.z; a += x3 * w0.w;
+      a += x4 * w1.x; a += x5 * w1.y; a += x6 * w1.z; a += x7 * w1.w;
+      r2 += float(s2) * a + smb * float(b2);
+    }
+    {
+      float4 w0 = float4(as_type<uchar4>(wr3.x)), w1 = float4(as_type<uchar4>(wr3.y));
+      float a = 0.0f;
+      a += x0 * w0.x; a += x1 * w0.y; a += x2 * w0.z; a += x3 * w0.w;
+      a += x4 * w1.x; a += x5 * w1.y; a += x6 * w1.z; a += x7 * w1.w;
+      r3 += float(s3) * a + smb * float(b3);
+    }
+    ws += 256u;
+    sp += 4u;
+    bp += 4u;
+  }
+  out4[0] = simd_sum(r0);
+  out4[1] = simd_sum(r1);
+  out4[2] = simd_sum(r2);
+  out4[3] = simd_sum(r3);
+}
+"""
+
+_qkv_mid_header = None
+_qkv_mid_kernels = {}
+_qkv_mid_layer_cache: dict = {}
+_QKVMID_NSG_DEF = int(os.environ.get("LOOPLING_QKVMID_NSG", "16"))
+if _QKVMID_NSG_DEF not in (8, 16, 32):
+    _QKVMID_NSG_DEF = 16
+
+
+def _qkv_mid_source(full, from_mixed, single_x, shared_ln, thr_q, thr_k, thr_r, eps_v, eps_ln):
+    scale_conv = flit(np.float32(math.sqrt(5)))
+    if from_mixed:
+        lw_expr = "lw0" if shared_ln else "((gi == 0) ? lw0 : ((gi == 1) ? lw1 : lw2))"
+        tg_decls = """
+    threadgroup uint4 sx_raw[288];
+    threadgroup bfloat16_t* sx = (threadgroup bfloat16_t*)sx_raw;
+    threadgroup float* st_buf = (threadgroup float*)sx_raw;"""
+        load_x = f"""
+    const float inv = proj_inv_from_part_q(part + uint(gi) * 36u, {flit(eps_ln)}, sl);
+    const device float* mp = mixed + size_t(gi) * 2304u;
+    const device bfloat16_t* lw = {lw_expr};
+    for (uint idx = tid; idx < 576u; idx += uint(NSG) * 32u) {{
+      float4 mv = ((const device float4*)mp)[idx];
+      bfloat4 lv = as_type<bfloat4>(((const device uint2*)lw)[idx]);
+      bfloat4 ov = bfloat4(
+          bfloat16_t(glue_rms_apply<float>(mv.x, inv, lv.x)),
+          bfloat16_t(glue_rms_apply<float>(mv.y, inv, lv.y)),
+          bfloat16_t(glue_rms_apply<float>(mv.z, inv, lv.z)),
+          bfloat16_t(glue_rms_apply<float>(mv.w, inv, lv.w)));
+      ((threadgroup uint2*)sx)[idx] = as_type<uint2>(ov);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const device bfloat16_t* dx = (const device bfloat16_t*)0;"""
+        qmv_call = "qmv_b1_4rows_impl<true>(w_all, s_all, b_all, sx, dx, "
+    else:
+        tg_decls = """
+    threadgroup float st_buf[8 * 64];
+    const threadgroup bfloat16_t* sx = (const threadgroup bfloat16_t*)0;"""
+        load_x = (
+            "    const device bfloat16_t* dx = x0;"
+            if single_x
+            else "    const device bfloat16_t* dx = (gi == 0) ? x0 : ((gi == 1) ? x1 : x2);"
+        )
+        qmv_call = "qmv_b1_4rows_impl<false>(w_all, s_all, b_all, sx, dx, "
+
+    k_wproj_block = f"""
+      if (sg == 0u) {{
+        float wpr[4];
+        {qmv_call}8600 + int(hk) * 4, sl, wpr);
+        if (sl == 0u) {{
+          for (int r = 0; r < 4; r++) wp_s[r] = float(bfloat16_t(wpr[r]));
+        }}
+      }}""" if full else ""
+    v_wproj_block = f"""
+      if (sg == 0u) {{
+        float wpr[4];
+        {qmv_call}8632 + int(hk) * 4, sl, wpr);
+        if (sl == 0u) {{
+          for (int r = 0; r < 4; r++) wp_s[r] = float(bfloat16_t(wpr[r]));
+        }}
+      }}""" if full else ""
+    k_conv_expr = """
+          float sw[4];
+          for (int k = 0; k < 4; k++) sw[k] = float(k_static[k * 1024u + c]);
+          y[i] = mid_conv_d(x0v, s0v, s1v, s2v, sw, dy);""" if full else f"""
+          const device bfloat16_t* cw = k_conv + c * 4u;
+          y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cw[0]), float(cw[1]), float(cw[2]), float(cw[3]), {scale_conv});"""
+    v_conv_expr = """
+          float sw[4];
+          for (int k = 0; k < 4; k++) sw[k] = float(v_static[k * 1024u + c]);
+          y[i] = mid_conv_d(x0v, s0v, s1v, s2v, sw, dy);""" if full else f"""
+          const device bfloat16_t* cw = v_conv + c * 4u;
+          y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cw[0]), float(cw[1]), float(cw[2]), float(cw[3]), {scale_conv});"""
+
+    return f"""
+    constexpr int PASSES = 128 / (NSG * 4);
+    constexpr uint GATE_ROWS = uint(NSG * 4);
+    constexpr uint N_GATE_TG = 3072u / GATE_ROWS;{tg_decls}
+    threadgroup float head_f[128];
+    threadgroup bfloat16_t rel_s[128];
+    {"threadgroup float wp_s[4];" if full else ""}
+    const uint tg = threadgroup_position_in_grid.x;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint sl = thread_index_in_simdgroup;
+    const uint tid = sg * 32u + sl;
+    const int gi = (tg < 24u) ? 0 : ((tg < 32u) ? 1 : ((tg < 40u) ? 2 : 0));
+{load_x}
+    {"const float tau_v = tau[0];" if full else ""}
+
+    if (tg < 24u) {{
+      const uint h = tg;
+      const int base_row = int(h) * 128;
+      for (int p = 0; p < PASSES; p++) {{
+        int lrow = p * (NSG * 4) + int(sg) * 4;
+        float out4[4];
+        {qmv_call}base_row + lrow, sl, out4);
+        if (sl == 0u) {{
+          for (int r = 0; r < 4; r++) head_f[lrow + r] = float(bfloat16_t(out4[r]));
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg == 0u) {{
+        float s[4];
+        const uint qoff = h * 128u + sl * 4u;
+        for (int i = 0; i < 4; i++) s[i] = head_f[sl * 4u + i] * float(q_scale[qoff + i]);
+        glue_l2_clip_lane128(s, {flit(thr_q)});
+        bfloat16_t qo[4];
+        for (int i = 0; i < 4; i++) {{
+          bfloat16_t o = bfloat16_t(s[i]);
+          {"o = bfloat16_t(glue_tau(float(o), tau_v));" if full else ""}
+          qo[i] = o;
+        }}
+        bfloat4 ob = bfloat4(qo[0], qo[1], qo[2], qo[3]);
+        ((device uint2*)(q_out + qoff))[0] = as_type<uint2>(ob);
+      }}
+    }} else if (tg < 32u) {{
+      const uint hk = tg - 24u;
+      const int base_row = 6552 + int(hk) * 128;
+      for (int p = 0; p < PASSES; p++) {{
+        int lrow = p * (NSG * 4) + int(sg) * 4;
+        float out4[4];
+        {qmv_call}base_row + lrow, sl, out4);
+        if (sl == 0u) {{
+          for (int r = 0; r < 4; r++) head_f[lrow + r] = float(bfloat16_t(out4[r]));
+        }}
+      }}{k_wproj_block}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg == 0u) {{
+        {"float dy[4] = {wp_s[0], wp_s[1], wp_s[2], wp_s[3]};" if full else ""}
+        const uint c0 = hk * 128u + sl * 4u;
+        float y[4];
+        for (int i = 0; i < 4; i++) {{
+          uint c = c0 + i;
+          float x0v = head_f[sl * 4u + i];
+          float s0v = cs0[c], s1v = cs0[1024u + c], s2v = cs0[2048u + c];
+          {k_conv_expr}
+          w0[c] = s1v; w0[1024u + c] = s2v; w0[2048u + c] = x0v;
+        }}
+        glue_l2_clip_lane128(y, {flit(thr_k)});
+        bfloat4 ob = bfloat4(bfloat16_t(y[0]), bfloat16_t(y[1]), bfloat16_t(y[2]), bfloat16_t(y[3]));
+        ((device uint2*)(kv_out + c0))[0] = as_type<uint2>(ob);
+      }}
+    }} else if (tg < 40u) {{
+      const uint hk = tg - 32u;
+      const int base_row = 7576 + int(hk) * 128;
+      for (int p = 0; p < PASSES; p++) {{
+        int lrow = p * (NSG * 4) + int(sg) * 4;
+        float out4[4];
+        {qmv_call}base_row + lrow, sl, out4);
+        if (sl == 0u) {{
+          for (int r = 0; r < 4; r++) head_f[lrow + r] = float(bfloat16_t(out4[r]));
+        }}
+      }}{v_wproj_block}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg == 0u) {{
+        {"float dy[4] = {wp_s[0], wp_s[1], wp_s[2], wp_s[3]};" if full else ""}
+        const uint c0 = hk * 128u + sl * 4u;
+        float y[4];
+        for (int i = 0; i < 4; i++) {{
+          uint c = c0 + i;
+          float x0v = head_f[sl * 4u + i];
+          float s0v = cs1[c], s1v = cs1[1024u + c], s2v = cs1[2048u + c];
+          {v_conv_expr}
+          w1[c] = s1v; w1[1024u + c] = s2v; w1[2048u + c] = x0v;
+        }}
+        for (int i = 0; i < 4; i++) head_f[sl * 4u + i] = y[i];
+        float inv_v = glue_rms_inv_sg<128, true>(head_f, {flit(eps_v)}, sl);
+        bfloat4 ob = bfloat4(
+            glue_rms_apply_nw<bfloat16_t>(y[0], inv_v),
+            glue_rms_apply_nw<bfloat16_t>(y[1], inv_v),
+            glue_rms_apply_nw<bfloat16_t>(y[2], inv_v),
+            glue_rms_apply_nw<bfloat16_t>(y[3], inv_v));
+        ((device uint2*)(kv_out + 1024u + c0))[0] = as_type<uint2>(ob);
+      }}
+    }} else if (tg < 43u) {{
+      const uint rg = tg - 40u;
+      const int base_row = 3072 + int(rg) * 128;
+      for (int p = 0; p < PASSES; p++) {{
+        int lrow = p * (NSG * 4) + int(sg) * 4;
+        float out4[4];
+        {qmv_call}base_row + lrow, sl, out4);
+        if (sl == 0u) {{
+          for (int r = 0; r < 4; r++) head_f[lrow + r] = float(bfloat16_t(out4[r]));
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg == 0u && sl < 8u) {{
+        const uint h = rg * 8u + sl;
+        float s[16];
+        for (int i = 0; i < 16; i++) s[i] = head_f[sl * 16u + i] * float(rel_scale[h * 16u + i]);
+        glue_l2_clip_row16(s, {flit(thr_r)});
+        for (int i = 0; i < 16; i++) {{
+          bfloat16_t o = bfloat16_t(s[i]);
+          {"o = bfloat16_t(glue_tau(float(o), tau_v));" if full else ""}
+          rel_s[sl * 16u + i] = o;
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg < 8u) {{
+        simdgroup_bfloat8x8 ma0, ma1;
+        simdgroup_load(ma0, rel_s + 0, 16);
+        simdgroup_load(ma1, rel_s + 8, 16);
+        threadgroup float* st = st_buf + sg * 64u;
+        for (uint n0 = sg * 16u; n0 < uint(REL_R); n0 += 128u) {{
+          const device bfloat16_t* Bm = rw + n0;
+          device bfloat16_t* Cm = pb_out + size_t(rg * 8u) * uint(REL_R) + n0;
+          for (int ni = 0; ni < 2; ni++) {{
+            simdgroup_bfloat8x8 mb0, mb1;
+            simdgroup_load(mb0, Bm + 0 * REL_R + ni * 8, REL_R);
+            simdgroup_load(mb1, Bm + 8 * REL_R + ni * 8, REL_R);
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_multiply_accumulate(acc, ma0, mb0, acc);
+            simdgroup_multiply_accumulate(acc, ma1, mb1, acc);
+            simdgroup_store(acc, st, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (int idx = int(sl); idx < 64; idx += 32) {{
+              int r = idx >> 3, c = idx & 7;
+              Cm[r * REL_R + ni * 8 + c] = bfloat16_t(st[idx]);
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }}
+        }}
+      }}
+    }} else if (tg < 43u + N_GATE_TG) {{
+      const uint gg = tg - 43u;
+      const int g_off = int(gg * GATE_ROWS) + int(sg) * 4;
+      float out4[4];
+      {qmv_call}3456 + g_off, sl, out4);
+      if (sl == 0u) {{
+        bfloat4 ob = bfloat4(bfloat16_t(out4[0]), bfloat16_t(out4[1]), bfloat16_t(out4[2]), bfloat16_t(out4[3]));
+        ((device uint2*)(gs_out + g_off))[0] = as_type<uint2>(ob);
+      }}
+    }} else {{
+      if (sg < 6u) {{
+        int lrow = int(sg) * 4;
+        float out4[4];
+        {qmv_call}6528 + lrow, sl, out4);
+        if (sl == 0u) {{
+          bfloat4 ob = bfloat4(bfloat16_t(out4[0]), bfloat16_t(out4[1]), bfloat16_t(out4[2]), bfloat16_t(out4[3]));
+          ((device uint2*)(gs_out + 3072 + lrow))[0] = as_type<uint2>(ob);
+        }}
+      }}
+    }}
+"""
+
+
+def _get_qkv_mid_kernel(full, from_mixed, single_x, shared_ln, thr_q, thr_k, thr_r, eps_v, eps_ln, dtypes):
+    global _qkv_mid_header
+    key = (bool(full), bool(from_mixed), bool(single_x), bool(shared_ln), thr_q, thr_k, thr_r, eps_v, eps_ln, dtypes)
+    k = _qkv_mid_kernels.get(key)
+    if k is not None:
+        return k
+    if _qkv_mid_header is None:
+        _qkv_mid_header = _qmv.base_header() + GLUE_HEADER + _mid._MID_HEADER + _QNORM_SRC + _QKV_MID_HEADER_EXTRA
+    if from_mixed:
+        ins = ["mixed", "part"] + (["lw0"] if shared_ln else ["lw0", "lw1", "lw2"])
+    elif single_x:
+        ins = ["x0"]
+    else:
+        ins = ["x0", "x1", "x2"]
+    ins += ["w_all", "s_all", "b_all", "cs0", "cs1", "q_scale", "rel_scale", "rw"]
+    if full:
+        ins += ["tau", "k_static", "v_static"]
+    else:
+        ins += ["k_conv", "v_conv"]
+    src = _qkv_mid_source(full, from_mixed, single_x, shared_ln, thr_q, thr_k, thr_r, eps_v, eps_ln)
+    k = _qkv_mid_kernels[key] = mx.fast.metal_kernel(
+        name="f3_qkvmid_%s%s%s_%d" % ("F" if full else "S", "m" if from_mixed else ("1" if single_x else "3"), "s" if shared_ln else "f", abs(hash(key)) % 10**9),
+        input_names=ins,
+        output_names=["q_out", "kv_out", "pb_out", "gs_out", "w0", "w1"],
+        source=src,
+        header=_qkv_mid_header,
+        ensure_row_contiguous=True,
+    )
+    return k
+
+
+def _get_qkv_mid_layer_meta(layer):
+    is_dict = isinstance(layer, dict)
+    a = layer["self_attn"] if is_dict else layer.self_attn
+    a_dict = isinstance(a, dict)
+    ql2 = a["q_l2_clip"] if a_dict else a.q_l2_clip
+    kl2 = a["k_l2_clip"] if a_dict else a.k_l2_clip
+    rl2 = a["rel_l2_clip"] if a_dict else a.rel_l2_clip
+    q_sc = ql2["scale"] if isinstance(ql2, dict) else ql2.scale
+    r_sc = rl2["scale"] if isinstance(rl2, dict) else rl2.scale
+    ksconv = a["k_sconv"] if a_dict else a.k_sconv
+    vsconv = a["v_sconv"] if a_dict else a.v_sconv
+    full = a.sliding_window == 0
+    assert a.num_heads == 24 and a.num_key_value_heads == 8 and a.head_dim == 128
+    cat = _get_qkv_all_cat(a, full)
+    if cat is None:
+        raise ValueError("qkv_mid_rel_b1 requires aff8 gs64 QKV weights")
+    if full:
+        cw0 = ksconv["static_weight"] if isinstance(ksconv, dict) else ksconv.static_weight
+        cw1 = vsconv["static_weight"] if isinstance(vsconv, dict) else vsconv.static_weight
+        m0 = layer["q_input_layernorm"] if is_dict else layer.q_input_layernorm
+        m1 = layer["k_input_layernorm"] if is_dict else layer.k_input_layernorm
+        m2 = layer["v_input_layernorm"] if is_dict else layer.v_input_layernorm
+        ln_ws, eps_ln = (m0["weight"], m1["weight"], m2["weight"]), m0.eps
+    else:
+        cw0 = ksconv["conv1d"]["weight"] if isinstance(ksconv, dict) else ksconv.conv1d.weight
+        cw1 = vsconv["conv1d"]["weight"] if isinstance(vsconv, dict) else vsconv.conv1d.weight
+        ln_m = layer["input_layernorm"] if is_dict else layer.input_layernorm
+        ln_ws, eps_ln = (ln_m["weight"],), ln_m.eps
+    has_msg = ("q_message_gate" in layer) if is_dict else hasattr(layer, "q_message_gate")
+    if has_msg:
+        gs = (
+            (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
+            if is_dict
+            else (layer.q_message_gate, layer.k_message_gate, layer.v_message_gate)
+        )
+        g_down = [g["down_proj"]["weight"] for g in gs]
+        g_wf = [g["forget_gate_proj"]["weight"] for g in gs]
+        g_wm = [g["message_gate_proj"]["weight"] for g in gs]
+    else:
+        g_down = g_wf = g_wm = None
+    return (
+        full, cat[0], cat[1], cat[2], q_sc, r_sc, cw0, cw1,
+        ql2.threshold, kl2.threshold, rl2.threshold, a.eps,
+        ln_ws, eps_ln, g_down, g_wf, g_wm,
+    )
+
+
+def _run_qkv_mid_rel_b1(layer, cs0, cs1, rel_w, *, q_in=None, k_in=None, v_in=None, mixed=None, part=None, tau=None):
+    (
+        full, w_all, s_all, b_all, q_sc, r_sc, cw0, cw1,
+        thr_q, thr_k, thr_r, eps_v, ln_ws, eps_ln, _, _, _,
+    ) = _get_qkv_mid_layer_meta(layer)
+    rel_r = int(rel_w.shape[1])
+    from_mixed = mixed is not None
+    if from_mixed:
+        single_x = False
+        shared_ln = len(ln_ws) == 1
+        ins = [mixed, part] + list(ln_ws)
+    else:
+        shared_ln = True
+        single_x = (q_in is k_in) and (k_in is v_in)
+        ins = [q_in] if single_x else [q_in, k_in, v_in]
+    ins += [w_all, s_all, b_all, cs0, cs1, q_sc, r_sc, rel_w]
+    if full:
+        ins += [tau.reshape(-1), cw0, cw1]
+    else:
+        ins += [cw0, cw1]
+    nsg = _QKVMID_NSG_DEF
+    n_tg = 44 + 3072 // (nsg * 4)
+    kern = _get_qkv_mid_kernel(
+        full, from_mixed, single_x, shared_ln,
+        thr_q, thr_k, thr_r, eps_v, eps_ln,
+        tuple(x.dtype for x in ins),
+    )
+    return kern(
+        inputs=ins,
+        template=[("NSG", nsg), ("REL_R", rel_r)],
+        grid=(n_tg * nsg * 32, 1, 1),
+        threadgroup=(nsg * 32, 1, 1),
+        output_shapes=[(1, 24, 128), (2, 8, 1, 128), (1, 24, rel_r), (3096,), (1, 3, 1024), (1, 3, 1024)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
+    )
+
+
+def qkv_mid_rel_b1(layer, q_in, k_in, v_in, cs0, cs1, rel_w, *, tau=None):
+    """Fused B=1 K4 QKV + K5 MID + REL MMA -> (q, kv_new, pb, gs_flat, w0, w1).
+    gs_flat has gate at offset 0 (3072) and sinks at offset 3072 (24)."""
+    return _run_qkv_mid_rel_b1(layer, cs0, cs1, rel_w, q_in=q_in, k_in=k_in, v_in=v_in, tau=tau)
+
+
+def qkv_mid_rel_msg_b1(layer, r1, msg, cs0, cs1, rel_w, *, tau=None):
+    """Fused B=1 K2 -> K3(part) -> (K3b + K4 QKV + K5 MID + REL MMA) -> (q, kv_new, pb, gs_flat, w0, w1)."""
+    meta = _get_qkv_mid_layer_meta(layer)
+    g_down, g_wf, g_wm = meta[14], meta[15], meta[16]
+    down = gate_down_rows(r1["qkv_gate_in"], g_down)
+    mixed, part = gate_mix_part_rows(down, [r1["s_q"], r1["s_k"], r1["s_v"]], msg, (0, 1, 2), g_wf, g_wm)
+    return _run_qkv_mid_rel_b1(layer, cs0, cs1, rel_w, mixed=mixed, part=part, tau=tau)
+
+
 def oproj_rows(attn_out, gate, w, scales, biases):
     """K9. attn_out (B,3072) or (B,1,24,128) bf16, gate (B,3072) bf16 -> (B,2304) bf16;
     row b == o_proj(bf16(f32(attn_out[b]) * sigmoid(f32(gate[b])))) at M=1."""
@@ -377,6 +1165,39 @@ def _gd_tm1_src(G, B):
         wsel = "const device bfloat16_t* wr = w0;"
     else:
         wsel = "const device bfloat16_t* wr;\n    " + wsel
+    if B <= 4:
+        k_loop = f"""    bfloat4 wv[4];
+    wv[0] = as_type<bfloat4>(((const device uint2*)(wr + 0))[0]);
+    wv[1] = as_type<bfloat4>(((const device uint2*)(wr + 1024))[0]);
+    wv[2] = as_type<bfloat4>(((const device uint2*)(wr + 2048))[0]);
+    wv[3] = as_type<bfloat4>(((const device uint2*)(wr + 3072))[0]);
+    #pragma unroll
+    for (int it = 0; it < 4; it++) {{
+      const int off = it * 1024;
+      const float4 wvf = float4(wv[it].x, wv[it].y, wv[it].z, wv[it].w);
+      for (int b = 0; b < {B}; b++) {{
+        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+        result[b] += wvf.x * static_cast<float>(xv.x);
+        result[b] += wvf.y * static_cast<float>(xv.y);
+        result[b] += wvf.z * static_cast<float>(xv.z);
+        result[b] += wvf.w * static_cast<float>(xv.w);
+      }}
+    }}"""
+    else:
+        k_loop = f"""    for (int it = 0; it < 4; it++) {{
+      const int off = it * 1024;
+      bfloat4 wvt = as_type<bfloat4>(((const device uint2*)(wr + off))[0]);
+      const float4 wvf = float4(wvt.x, wvt.y, wvt.z, wvt.w);
+      for (int b = 0; b < {B}; b++) {{
+        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+        result[b] += wvf.x * static_cast<float>(xv.x);
+        result[b] += wvf.y * static_cast<float>(xv.y);
+        result[b] += wvf.z * static_cast<float>(xv.z);
+        result[b] += wvf.w * static_cast<float>(xv.w);
+      }}
+    }}"""
     return f"""
     const int t = (int)threadgroup_position_in_grid.x;
     const int g = t / 64;
@@ -390,30 +1211,19 @@ def _gd_tm1_src(G, B):
     const size_t xbs = (size_t){G} * 4608;
     float result[{B}];
     for (int b = 0; b < {B}; b++) result[b] = 0.0f;
-    for (int it = 0; it < 4; it++) {{
-      const int off = it * 1024;
-      const device bfloat16_t* wp = wr + off;
-      bfloat4 wv = as_type<bfloat4>(((const device uint2*)wp)[0]);
-      for (int b = 0; b < {B}; b++) {{
-        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
-        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
-        result[b] += wv.x * static_cast<float>(xv.x);
-        result[b] += wv.y * static_cast<float>(xv.y);
-        result[b] += wv.z * static_cast<float>(xv.z);
-        result[b] += wv.w * static_cast<float>(xv.w);
-      }}
-    }}
+{k_loop}
     if (bn0 + 4096 < 4608) {{
       const int off = 4096;
       const device bfloat16_t* wp = wr + off;
-      bfloat4 wv = as_type<bfloat4>(((const device uint2*)wp)[0]);
+      bfloat4 wvt = as_type<bfloat4>(((const device uint2*)wp)[0]);
+      const float4 wvf = float4(wvt.x, wvt.y, wvt.z, wvt.w);
       for (int b = 0; b < {B}; b++) {{
         const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
         bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
-        result[b] += wv.x * static_cast<float>(xv.x);
-        result[b] += wv.y * static_cast<float>(xv.y);
-        result[b] += wv.z * static_cast<float>(xv.z);
-        result[b] += wv.w * static_cast<float>(xv.w);
+        result[b] += wvf.x * static_cast<float>(xv.x);
+        result[b] += wvf.y * static_cast<float>(xv.y);
+        result[b] += wvf.z * static_cast<float>(xv.z);
+        result[b] += wvf.w * static_cast<float>(xv.w);
       }}
     }}
     for (int b = 0; b < {B}; b++) {{
@@ -501,6 +1311,13 @@ def gate_down_rows(x, ws):
 # (K=64 split 4 lanes x 4 uint4/float4 loads), 8 rows per simdgroup, 4 simdgroups (32 output rows) per threadgroup;
 # forget + message weights share one K-loop and reduce with shuffle_down(2), (1); lane (lane&3)==0 writes the epilogue.
 _H3 = r"""
+inline float proj_inv_from_part(const device float* p, float eps, uint lane) {
+  GL_NOFMA
+  float pv = (lane < 18u) ? p[lane] : 0.0f;
+  float tot = simd_sum(pv);
+  return metal::precise::rsqrt(tot / 2304.0f + eps);
+}
+
 template <int B, int RB, int G, int D, int NSG>
 METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, const device bfloat16_t* down, const int g,
                              const device float* s, const device float* msg, const int slot, device float* out,
@@ -525,17 +1342,44 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
   }
   const device float* wfr = wf + (size_t)row * 64 + qn;
   const device float* wmr = wm + (size_t)row * 64 + qn;
-  for (int i = 0; i < 4; i++) {
-    int off = i * 16;
-    float4 ff = ((const device float4*)(wfr + off))[0];
-    float4 mm = ((const device float4*)(wmr + off))[0];
+  if constexpr (B <= 4) {
+    float4 ffa[4], mma[4];
+    ffa[0] = ((const device float4*)(wfr + 0))[0];
+    ffa[1] = ((const device float4*)(wfr + 16))[0];
+    ffa[2] = ((const device float4*)(wfr + 32))[0];
+    ffa[3] = ((const device float4*)(wfr + 48))[0];
+    mma[0] = ((const device float4*)(wmr + 0))[0];
+    mma[1] = ((const device float4*)(wmr + 16))[0];
+    mma[2] = ((const device float4*)(wmr + 32))[0];
+    mma[3] = ((const device float4*)(wmr + 48))[0];
     #pragma unroll
-    for (int b = 0; b < RB; b++) {
-      if (b < nb) {
-        bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
-        float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
-        fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
-        mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+    for (int i = 0; i < 4; i++) {
+      int off = i * 16;
+      float4 ff = ffa[i];
+      float4 mm = mma[i];
+      #pragma unroll
+      for (int b = 0; b < RB; b++) {
+        if (b < nb) {
+          bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
+          float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
+          fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
+          mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+        }
+      }
+    }
+  } else {
+    for (int i = 0; i < 4; i++) {
+      int off = i * 16;
+      float4 ff = ((const device float4*)(wfr + off))[0];
+      float4 mm = ((const device float4*)(wmr + off))[0];
+      #pragma unroll
+      for (int b = 0; b < RB; b++) {
+        if (b < nb) {
+          bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
+          float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
+          fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
+          mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+        }
       }
     }
   }
@@ -554,10 +1398,180 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
     }
   }
 }
+
+// K3 + exact 36-half-SG rms_single_row partial sum-of-squares (36 TGs/gate = 108 TGs for G=3, 64 rows/TG, NSG=8, 1 pass).
+template <int B, int RB, int G, int D, int NSG>
+METAL_FUNC void gate_mix_part_one(const device float* wf, const device float* wm, const device bfloat16_t* down, const int g,
+                                  const device float* s, const device float* msg, const int slot,
+                                  device float* out, device float* part,
+                                  const uint vs, const uint b0, const uint sg, const uint lane,
+                                  threadgroup bfloat16_t* dn_s, threadgroup float* mix_s) {
+  static_assert(D == 2304 && NSG == 8, "gate_mix_part_one expects D=2304, NSG=8");
+  const int nb = min(RB, B - (int)b0);
+  const int qn = int(lane & 3) * 4;
+  const uint tid = sg * 32 + lane;
+  const uint tg_threads = uint(NSG * 32);
+  for (uint idx = tid; idx < uint(nb * 16); idx += tg_threads) {
+    uint b = idx >> 4;
+    uint ch = (idx & 15u) * 4u;
+    ((threadgroup uint2*)(dn_s + b * 64 + ch))[0] =
+        ((const device uint2*)(down + ((b0 + b) * G + g) * 64 + ch))[0];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint row_base = vs * 64u;
+  const int local_row = int(sg * 8u + (lane >> 2));
+  const int row = int(row_base) + local_row;
+  float fr[RB], mr[RB];
+  for (int b = 0; b < RB; b++) {
+    fr[b] = 0.0f;
+    mr[b] = 0.0f;
+  }
+  const device float* wfr = wf + (size_t)row * 64 + qn;
+  const device float* wmr = wm + (size_t)row * 64 + qn;
+  if constexpr (B <= 4) {
+    float4 ffa[4], mma[4];
+    ffa[0] = ((const device float4*)(wfr + 0))[0];
+    ffa[1] = ((const device float4*)(wfr + 16))[0];
+    ffa[2] = ((const device float4*)(wfr + 32))[0];
+    ffa[3] = ((const device float4*)(wfr + 48))[0];
+    mma[0] = ((const device float4*)(wmr + 0))[0];
+    mma[1] = ((const device float4*)(wmr + 16))[0];
+    mma[2] = ((const device float4*)(wmr + 32))[0];
+    mma[3] = ((const device float4*)(wmr + 48))[0];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int off = i * 16;
+      float4 ff = ffa[i];
+      float4 mm = mma[i];
+      #pragma unroll
+      for (int b = 0; b < RB; b++) {
+        if (b < nb) {
+          bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
+          float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
+          fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
+          mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+        }
+      }
+    }
+  } else {
+    for (int i = 0; i < 4; i++) {
+      int off = i * 16;
+      float4 ff = ((const device float4*)(wfr + off))[0];
+      float4 mm = ((const device float4*)(wmr + off))[0];
+      #pragma unroll
+      for (int b = 0; b < RB; b++) {
+        if (b < nb) {
+          bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
+          float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
+          fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
+          mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+        }
+      }
+    }
+  }
+  for (int b = 0; b < RB; b++) {
+    fr[b] += simd_shuffle_down(fr[b], 2);
+    fr[b] += simd_shuffle_down(fr[b], 1);
+    mr[b] += simd_shuffle_down(mr[b], 2);
+    mr[b] += simd_shuffle_down(mr[b], 1);
+  }
+  if ((lane & 3) == 0) {
+    for (int b = 0; b < RB; b++) {
+      if (b < nb) {
+        const int gb = (int)b0 + b;
+        float mv = glue_msg_combine<0>(fr[b], mr[b], s[gb * D + row], msg[(gb * 4 + slot) * D + row]);
+        out[(gb * G + g) * D + row] = mv;
+        mix_s[b * 64 + local_row] = mv;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int b = (int)sg; b < nb; b += NSG) {
+    GL_NOFMA
+    float acc = 0.0f;
+    if (lane < 16u) {
+      float4 v = ((const threadgroup float4*)(mix_s + b * 64 + lane * 4))[0];
+      acc = fma(v.x, v.x, acc);
+      acc = fma(v.y, v.y, acc);
+      acc = fma(v.z, v.z, acc);
+      acc = fma(v.w, v.w, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+      part[((size_t)(b0 + b) * G + g) * 36u + vs] = acc;
+    }
+  }
+}
 """
 
 _k3 = {}
+_k3p = {}
 _GMIX_RB = int(os.environ.get("LOOPLING_GMIX_RB", "2"))
+
+
+def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
+    """K3 + exact 18-virtual-SG RMS partials -> (mixed (B,G,2304) f32, part (B,G,18) f32).
+    Eliminates K3b launch when consumer (K4 qkv_rows_from_mixed / K11+K12) normalizes on load."""
+    B, G, R = down.shape
+    D = wf[0].shape[0]
+    if D != 2304 or R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G:
+        raise ValueError("gate_mix_part_rows requires D=2304, R=64, down bf16, B in 1..16")
+    for w in list(wf) + list(wm):
+        if w.shape != (D, 64) or w.dtype != mx.float32:
+            raise ValueError("forget/message weights must be (2304,64) f32")
+    if msg.shape != (B, 4, D) or msg.dtype != mx.float32 or any(s.shape != (B, D) or s.dtype != mx.float32 for s in ss):
+        raise ValueError("msg must be (B,4,2304) f32 and each s (B,2304) f32")
+    uniq, smap = [], []
+    for s in ss:
+        for j, u in enumerate(uniq):
+            if u is s:
+                smap.append(j)
+                break
+        else:
+            smap.append(len(uniq))
+            uniq.append(s)
+    nsg = 8
+    nt = 36  # 2304 / 64 = 36 half-SG tiles (108 TGs for G=3 -> all 80 M3 Ultra cores busy, 1 pass!)
+    rb = min(B, max(1, _GMIX_RB))
+    key = (B, rb, G, tuple(smap), tuple(slots))
+    kern = _k3p.get(key)
+    if kern is None:
+        lines = [
+            f"threadgroup bfloat16_t dn_s[{rb} * 64];",
+            f"threadgroup float mix_s[{rb} * 64];",
+            "const uint t = threadgroup_position_in_grid.x;",
+            f"const uint b0 = threadgroup_position_in_grid.y * {rb};",
+            "const uint sg = simdgroup_index_in_threadgroup;",
+            "const uint lane = thread_index_in_simdgroup;",
+            f"const uint vs = t % {nt};",
+        ]
+        for g in range(G):
+            if g < G - 1:
+                head = ("if" if g == 0 else "else if") + f" (t < {(g + 1) * nt})"
+            else:
+                head = "else" if g else ""
+            lines.append(
+                "%s { gate_mix_part_one<%d, %d, %d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, part, vs, b0, sg, lane, dn_s, mix_s); }"
+                % (head, B, rb, G, D, nsg, g, g, g, smap[g], slots[g])
+            )
+        kern = mx.fast.metal_kernel(
+            name="f3_gate_mix_part36_b%d_rb%d_g%d_s%s_m%s" % (B, rb, G, "".join(map(str, smap)), "".join(map(str, slots))),
+            input_names=["down", "msg"] + ["s%d" % j for j in range(len(uniq))]
+            + ["wf%d" % g for g in range(G)] + ["wm%d" % g for g in range(G)],
+            output_names=["out", "part"],
+            header=GLUE_HEADER + _H3,
+            source="\n".join(lines),
+            ensure_row_contiguous=True,
+        )
+        _k3p[key] = kern
+    tg_t = nsg * 32
+    return kern(
+        inputs=[down, msg] + uniq + list(wf) + list(wm),
+        grid=(G * nt * tg_t, (B + rb - 1) // rb, 1),
+        threadgroup=(tg_t, 1, 1),
+        output_shapes=[(B, G, D), (B, G, 36)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
 
 
 def gate_mix_rows(down, ss, msg, slots, wf, wm):

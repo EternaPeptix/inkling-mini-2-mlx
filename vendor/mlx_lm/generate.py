@@ -357,7 +357,7 @@ def generate_step(
     logits_processors: Optional[List[LogitsProcessor]] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
-    prefill_step_size: int = 2048,
+    prefill_step_size: int = 4096,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -1232,7 +1232,7 @@ class PromptProcessingBatch:
         uids: List[int],
         caches: List[List[Any]],
         tokens: Optional[List[List[int]]] = None,
-        prefill_step_size: int = 2048,
+        prefill_step_size: int = 4096,
         samplers: Optional[List[Sampler]] = None,
         fallback_sampler: Optional[Sampler] = None,
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
@@ -1431,7 +1431,7 @@ class PromptProcessingBatch:
         cls,
         model: nn.Module,
         fallback_sampler: Sampler,
-        prefill_step_size: int = 2048,
+        prefill_step_size: int = 4096,
     ):
         return cls(
             model=model,
@@ -1655,39 +1655,53 @@ class GenerationBatch:
                 sti.append(ti)
             return inputs, self._current_logprobs
 
-        # Forward pass
-        if self._bd is not None:
-            logits = self._bd.logits(self._bd._hidden_pair(inputs))
+        # Forward pass + logprobs
+        has_lp_proc = any(self.logits_processors)
+        if self._bd is not None and not has_lp_proc:
+            if same_sampler and base_sampler is greedy_sampler:
+                sampled, logprobs = self._bd.logprobs(self._bd._hidden_pair(inputs), argmax=True)
+            else:
+                logprobs = self._bd.logprobs(self._bd._hidden_pair(inputs))
+                if same_sampler:
+                    sampled = base_sampler(logprobs)
+                else:
+                    sampled = mx.concatenate(
+                        [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0
+                    )
+            token_context = []
         else:
-            logits = self.model(inputs[:, None], cache=self.prompt_cache)
-            logits = logits[:, -1, :]
+            if self._bd is not None:
+                logits = self._bd.logits(self._bd._hidden_pair(inputs))
+            else:
+                logits = self.model(inputs[:, None], cache=self.prompt_cache)
+                logits = logits[:, -1, :]
 
-        # Logits processors
-        token_context = []
-        if any(self.logits_processors):
-            processed_logits = []
-            for e in range(len(self.uids)):
-                sample_logits = logits[e : e + 1]
-                # Only sequences with processors need a context.
-                processors = self.logits_processors[e] or ()
-                if processors:
-                    context = self._token_context[e].update_and_fetch(inputs[e : e + 1])
-                    token_context.append(context)
-                    for processor in processors:
-                        sample_logits = processor(context, sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
+            # Logits processors
+            token_context = []
+            if has_lp_proc:
+                processed_logits = []
+                for e in range(len(self.uids)):
+                    sample_logits = logits[e : e + 1]
+                    # Only sequences with processors need a context.
+                    processors = self.logits_processors[e] or ()
+                    if processors:
+                        context = self._token_context[e].update_and_fetch(inputs[e : e + 1])
+                        token_context.append(context)
+                        for processor in processors:
+                            sample_logits = processor(context, sample_logits)
+                    processed_logits.append(sample_logits)
+                logits = mx.concatenate(processed_logits, axis=0)
 
-        # Normalize the logits
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            # Normalize the logits
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-        # One batched call when the batch shares a sampler.
-        if same_sampler:
-            sampled = base_sampler(logprobs)
-        else:
-            sampled = mx.concatenate(
-                [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0
-            )
+            # One batched call when the batch shares a sampler.
+            if same_sampler:
+                sampled = base_sampler(logprobs)
+            else:
+                sampled = mx.concatenate(
+                    [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0
+                )
 
         # Assign the next step to member variables and start computing it
         # asynchronously
@@ -1758,8 +1772,9 @@ class GenerationBatch:
 
         tokens, logprobs = self._step()
 
+        finish_reasons = [None] * len(self.uids)
         keep = []
-        responses = []
+        any_finished = False
         for i in range(len(self.uids)):
             finish_reason = None
 
@@ -1770,19 +1785,30 @@ class GenerationBatch:
             if self._matchers[i].advance(tokens[i]):
                 finish_reason = "stop"
 
+            finish_reasons[i] = finish_reason
             if finish_reason is not None:
+                any_finished = True
+            else:
+                keep.append(i)
+
+        if any_finished and self._bd is not None:
+            self._flush_bd()
+
+        responses = []
+        for i, finish_reason in enumerate(finish_reasons):
+            if finish_reason is not None:
+                pc = self._bd.caches[i] if self._bd is not None else self.extract_cache(i)
                 responses.append(
                     self.Response(
                         uid=self.uids[i],
                         token=tokens[i],
                         logprobs=logprobs[i],
                         finish_reason=finish_reason,
-                        prompt_cache=self.extract_cache(i),
+                        prompt_cache=pc,
                         all_tokens=self.tokens[i],
                     )
                 )
             else:
-                keep.append(i)
                 responses.append(
                     self.Response(
                         uid=self.uids[i],
@@ -1795,6 +1821,9 @@ class GenerationBatch:
                 )
 
         if len(keep) < len(self.uids):
+            if not keep and self._bd is not None:
+                self._bd = None
+                self.prompt_cache = []
             self.filter(keep)
 
         return responses
@@ -1841,7 +1870,7 @@ class BatchGenerator:
         logits_processors: Optional[List[LogitsProcessor]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
-        prefill_step_size: int = 2048,
+        prefill_step_size: int = 4096,
         max_kv_size: Optional[int] = None,
         stream=None,
     ):

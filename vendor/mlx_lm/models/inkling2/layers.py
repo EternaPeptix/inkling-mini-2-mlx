@@ -320,11 +320,53 @@ class Attention(nn.Module):
         tau: mx.array | None = None,
         gate: mx.array | None = None,
         sinks: mx.array | None = None,
+        max_dist: int | None = None,
     ):
         B, L, _ = hidden_states.shape
         if gate is None:
-            gate = self.gate_proj(hidden_states)
+            gate = P.aff8_linear(self.gate_proj, hidden_states) if P._PF_AFF8_QMM and P.enabled(hidden_states) else self.gate_proj(hidden_states)
             sinks = self.sink_proj(hidden_states)
+
+        if (
+            P._PF_ATTEND_PRE
+            and P.enabled(hidden_states)
+            and self.head_dim == 128
+            and query_states.dtype == mx.bfloat16
+            and key_states.dtype == mx.bfloat16
+            and value_states.dtype == mx.bfloat16
+            and self.q_l2_clip.scale.dtype == mx.bfloat16
+        ):
+            query_states, key_states, value_states = P.qkv_clip_rms(
+                query_states,
+                key_states,
+                value_states,
+                self.q_l2_clip.scale,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_key_value_heads,
+                thr_q=self.q_l2_clip.threshold,
+                thr_k=self.k_l2_clip.threshold,
+                eps=self.eps,
+                tau=tau,
+            )
+            relative_states = self.rel_l2_clip(relative_states.reshape(B, L, self.num_heads, -1))
+            if tau is not None:
+                relative_states = (relative_states.astype(mx.float32) * tau).astype(
+                    relative_states.dtype
+                )
+            md = ((max_dist + 63) // 64) * 64 if max_dist is not None else None
+            if md is not None and 0 < md < self.rel_logits_proj.proj.shape[1]:
+                p = self.rel_logits_proj.proj
+                dt = relative_states.dtype
+                if p.dtype != dt:
+                    c = getattr(self.rel_logits_proj, "_proj_cache", None)
+                    if c is None or c[0] is not p or c[1] != dt:
+                        c = (p, dt, p.astype(dt))
+                        self.rel_logits_proj._proj_cache = c
+                    p = c[2]
+                position_bias = relative_states @ p[:, :md]
+            else:
+                position_bias = self.rel_logits_proj(relative_states)
+            return query_states, key_states, value_states, position_bias, sinks, gate
 
         query_states = query_states.reshape(B, L, self.num_heads, -1)
         key_states = key_states.reshape(B, L, self.num_key_value_heads, -1)
@@ -353,7 +395,8 @@ class Attention(nn.Module):
     def _attend_post(self, attn_output: mx.array, gate: mx.array) -> mx.array:
         B, L = gate.shape[0], gate.shape[1]
         if P.enabled(gate):
-            return self.o_proj(_attend_post_gate(attn_output, gate))
+            x = _attend_post_gate(attn_output, gate)
+            return P.aff8_linear(self.o_proj, x) if P._PF_AFF8_QMM else self.o_proj(x)
         attn_output = attn_output.reshape(B, L, -1).astype(mx.float32)
         attn_output = attn_output * mx.sigmoid(gate.astype(mx.float32))
         return self.o_proj(attn_output.astype(gate.dtype))
@@ -368,6 +411,11 @@ class Attention(nn.Module):
         cache: Any | None,
         tau: mx.array | None = None,
     ) -> mx.array:
+        max_dist = None
+        if cache is None:
+            max_dist = hidden_states.shape[1]
+        elif isinstance(cache.offset, int):
+            max_dist = cache.offset + hidden_states.shape[1]
         query_states, key_states, value_states, position_bias, sinks, gate = (
             self._attend_pre(
                 hidden_states,
@@ -376,6 +424,7 @@ class Attention(nn.Module):
                 value_states,
                 relative_states,
                 tau,
+                max_dist=max_dist,
             )
         )
         if cache is not None:
@@ -457,18 +506,82 @@ class SlidingAttention(Attention):
         fast_conv: bool = False,
     ) -> mx.array:
         kv_cache = cache[0] if cache is not None else None
+        use_a8 = P._PF_AFF8_QMM and P.enabled(hidden_states)
+        if (
+            fast_conv
+            and conv_mask is None
+            and P._PF_ATTEND_PRE
+            and P.enabled(hidden_states)
+            and self.head_dim == 128
+            and self.k_sconv.kernel_size == 4
+            and self.v_sconv.kernel_size == 4
+            and self.k_sconv.conv1d.weight.dtype == mx.bfloat16
+            and self.v_sconv.conv1d.weight.dtype == mx.bfloat16
+            and self.q_l2_clip.scale.dtype == mx.bfloat16
+            and (conv_states[0] is None or conv_states[0].dtype == mx.float32)
+            and (conv_states[1] is None or conv_states[1].dtype == mx.float32)
+        ):
+            B, L, _ = hidden_states.shape
+            q_raw = P.aff8_linear(self.q_proj, hidden_states) if use_a8 else self.q_proj(hidden_states)
+            k_raw = P.aff8_linear(self.k_proj, key_hidden_states) if use_a8 else self.k_proj(key_hidden_states)
+            v_raw = P.aff8_linear(self.v_proj, value_hidden_states) if use_a8 else self.v_proj(value_hidden_states)
+            r_raw = P.aff8_linear(self.r_proj, hidden_states) if use_a8 else self.r_proj(hidden_states)
+            gate = P.aff8_linear(self.gate_proj, hidden_states) if use_a8 else self.gate_proj(hidden_states)
+            sinks = self.sink_proj(hidden_states)
+            query_states, key_states, value_states, conv_states[0], conv_states[1] = P.swa_qkv_conv_clip(
+                q_raw,
+                k_raw,
+                v_raw,
+                self.q_l2_clip.scale,
+                self.k_sconv.conv1d.weight,
+                self.v_sconv.conv1d.weight,
+                conv_states[0],
+                conv_states[1],
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_key_value_heads,
+                thr_q=self.q_l2_clip.threshold,
+                thr_k=self.k_l2_clip.threshold,
+                eps=self.eps,
+            )
+            relative_states = self.rel_l2_clip(r_raw.reshape(B, L, self.num_heads, -1))
+            max_dist = L if kv_cache is None else (kv_cache.offset + L if isinstance(kv_cache.offset, int) else None)
+            md = ((max_dist + 63) // 64) * 64 if max_dist is not None else None
+            if md is not None and 0 < md < self.rel_logits_proj.proj.shape[1]:
+                p = self.rel_logits_proj.proj
+                dt = relative_states.dtype
+                if p.dtype != dt:
+                    c = getattr(self.rel_logits_proj, "_proj_cache", None)
+                    if c is None or c[0] is not p or c[1] != dt:
+                        c = (p, dt, p.astype(dt))
+                        self.rel_logits_proj._proj_cache = c
+                    p = c[2]
+                position_bias = relative_states @ p[:, :md]
+            else:
+                position_bias = self.rel_logits_proj(relative_states)
+            if kv_cache is not None:
+                key_states, value_states = kv_cache.update_and_fetch(key_states, value_states)
+            attn_output = self._attention(
+                query_states, key_states, value_states, position_bias, sinks, kv_cache
+            )
+            return self._attend_post(attn_output, gate)
         key_states, conv_states[0] = self.k_sconv(
-            self.k_proj(key_hidden_states), conv_states[0], conv_mask, fast=fast_conv
+            P.aff8_linear(self.k_proj, key_hidden_states) if use_a8 else self.k_proj(key_hidden_states),
+            conv_states[0],
+            conv_mask,
+            fast=fast_conv,
         )
         value_states, conv_states[1] = self.v_sconv(
-            self.v_proj(value_hidden_states), conv_states[1], conv_mask, fast=fast_conv
+            P.aff8_linear(self.v_proj, value_hidden_states) if use_a8 else self.v_proj(value_hidden_states),
+            conv_states[1],
+            conv_mask,
+            fast=fast_conv,
         )
         return self._attend(
             hidden_states,
-            self.q_proj(hidden_states),
+            P.aff8_linear(self.q_proj, hidden_states) if use_a8 else self.q_proj(hidden_states),
             key_states,
             value_states,
-            self.r_proj(hidden_states),
+            P.aff8_linear(self.r_proj, hidden_states) if use_a8 else self.r_proj(hidden_states),
             kv_cache,
         )
 
@@ -495,15 +608,16 @@ class FullAttention(Attention):
         fast_conv: bool = False,
     ) -> mx.array:
         kv_cache = cache[0] if cache is not None else None
+        use_a8 = P._PF_AFF8_QMM and P.enabled(hidden_states)
         key_states, conv_states[0] = self.k_sconv(
-            self.k_proj(key_hidden_states),
+            P.aff8_linear(self.k_proj, key_hidden_states) if use_a8 else self.k_proj(key_hidden_states),
             key_hidden_states,
             conv_states[0],
             conv_mask,
             fast=fast_conv,
         )
         value_states, conv_states[1] = self.v_sconv(
-            self.v_proj(value_hidden_states),
+            P.aff8_linear(self.v_proj, value_hidden_states) if use_a8 else self.v_proj(value_hidden_states),
             value_hidden_states,
             conv_states[1],
             conv_mask,
@@ -517,10 +631,10 @@ class FullAttention(Attention):
         )
         return self._attend(
             hidden_states,
-            self.q_proj(hidden_states),
+            P.aff8_linear(self.q_proj, hidden_states) if use_a8 else self.q_proj(hidden_states),
             key_states,
             value_states,
-            self.r_proj(hidden_states),
+            P.aff8_linear(self.r_proj, hidden_states) if use_a8 else self.r_proj(hidden_states),
             kv_cache,
             tau=tau[..., None, None],
         )
@@ -609,9 +723,15 @@ class SparseMoeBlock(nn.Module):
             and selected_experts.shape[-1] == 8
         ):
             ex = self.experts
-            x = mx.expand_dims(hidden_states, (-2, -3))
             idx = mx.stop_gradient(selected_experts)
-            x, idx_s, inv_order = _gather_sort(x, idx)
+            if P.moe_gmm_ok(ex, hidden_states, idx):
+                return P.moe_gmm_forward(ex, hidden_states, idx, routing_weights)
+            num_e = ex.gate_up_proj.num_experts
+            if num_e % 32 == 0 and num_e <= 256 and hidden_states.shape[-1] % 8 == 0:
+                x, idx_s, inv_order = P.moe_gather_sort(hidden_states, idx, num_experts=num_e)
+            else:
+                x = mx.expand_dims(hidden_states, (-2, -3))
+                x, idx_s, inv_order = _gather_sort(x, idx)
             gu = ex.gate_up_proj(x, idx_s, sorted_indices=True)
             x = ex.act_fn(gu[..., 0::2], gu[..., 1::2])
             dn_s = ex.down_proj(x, idx_s, sorted_indices=True)
@@ -744,21 +864,41 @@ class DecoderLayer(nn.Module):
         hidden_states = self._self_attention(
             hidden_states, attention_inputs, cache, conv_states, conv_mask, messages, fast_conv=fast_conv
         )
-        hidden_states, conv_states[2] = self.post_attention_convolution(
-            hidden_states, conv_states[2], conv_mask, fast=fast_conv
-        )
-
-        residual = hidden_states = hidden_states.astype(mx.float32)
-        if self.is_block_boundary:
-            block = normed_residual[None]
-            if block_states is None:
-                block_states = block
-            else:
-                block_states = mx.concatenate([block_states, block])
+        if (
+            fast_conv
+            and self.post_attention_convolution.kernel_size == 4
+            and hidden_states.shape[-1] == P._D
+            and self.post_attention_convolution.conv1d.weight.dtype == mx.bfloat16
+            and (conv_states[2] is None or conv_states[2].dtype == mx.float32)
+        ):
+            residual, normed_states, conv_states[2] = P.short_conv_attn_post(
+                hidden_states,
+                conv_states[2],
+                self.post_attention_convolution.conv1d.weight,
+                None if self.is_block_boundary else block_residual,
+            )
+            if self.is_block_boundary:
+                block = normed_residual[None]
+                if block_states is None:
+                    block_states = block
+                else:
+                    block_states = mx.concatenate([block_states, block])
         else:
-            residual = hidden_states = block_residual.astype(mx.float32) + hidden_states
+            hidden_states, conv_states[2] = self.post_attention_convolution(
+                hidden_states, conv_states[2], conv_mask, fast=fast_conv
+            )
 
-        normed_states = unweighted_rms_norm(hidden_states)
+            residual = hidden_states = hidden_states.astype(mx.float32)
+            if self.is_block_boundary:
+                block = normed_residual[None]
+                if block_states is None:
+                    block_states = block
+                else:
+                    block_states = mx.concatenate([block_states, block])
+            else:
+                residual = hidden_states = block_residual.astype(mx.float32) + hidden_states
+
+            normed_states = unweighted_rms_norm(hidden_states)
         hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
         if (
             messages is not None
@@ -768,14 +908,39 @@ class DecoderLayer(nn.Module):
             mlp_in = P.msg_gate_norm_single(
                 self.mlp_message_gate, hidden_states, messages, 3, self.post_attention_layernorm
             )
+        elif (
+            messages is None
+            and P.active(dtype, block_residual)
+            and hidden_states.dtype == mx.float32
+            and hidden_states.shape[-1] == P._D
+            and self.post_attention_layernorm.weight.dtype == mx.bfloat16
+        ):
+            mlp_in = P.rms_norm_f32_bf16(hidden_states, self.post_attention_layernorm)
         else:
             if messages is not None:
                 hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
             mlp_in = self.post_attention_layernorm(hidden_states).astype(dtype)
         hidden_states = self.mlp(mlp_in)
-        hidden_states, conv_states[3] = self.post_mlp_convolution(
-            hidden_states, conv_states[3], conv_mask, fast=fast_conv
+        fused_mlp_post = (
+            fast_conv
+            and self.post_mlp_convolution.kernel_size == 4
+            and hidden_states.shape[1] >= 16
+            and hidden_states.shape[-1] % 4 == 0
+            and residual.dtype == mx.float32
+            and self.post_mlp_convolution.conv1d.weight.dtype == mx.bfloat16
+            and (conv_states[3] is None or conv_states[3].dtype == mx.float32)
         )
+        if fused_mlp_post:
+            hidden_states, conv_states[3] = P.short_conv_residual(
+                hidden_states,
+                conv_states[3],
+                self.post_mlp_convolution.conv1d.weight,
+                residual,
+            )
+        else:
+            hidden_states, conv_states[3] = self.post_mlp_convolution(
+                hidden_states, conv_states[3], conv_mask, fast=fast_conv
+            )
 
         if conv is not None:
             if getattr(conv, "record", False):  # LOOPLING_MTP: keep full windows for rollback
@@ -786,6 +951,8 @@ class DecoderLayer(nn.Module):
             for i, window in enumerate(conv_states):
                 conv[i] = window if (window.shape[1] == n and conv.lengths is None) else _conv_state(window, conv.lengths, n)
             conv.advance(block_residual.shape[1])
+        if fused_mlp_post:
+            return hidden_states, block_states
         hidden_states = residual + hidden_states.astype(mx.float32)
         return hidden_states.astype(dtype), block_states
 
@@ -803,7 +970,15 @@ class SlidingDecoderLayer(DecoderLayer):
         if attention_inputs is not None:
             hidden_states = attention_inputs[..., 0, :]
         if messages is None:
-            states = (self.input_layernorm(hidden_states).astype(dtype),) * 3
+            if (
+                P.active(dtype, hidden_states)
+                and hidden_states.dtype == mx.float32
+                and hidden_states.shape[-1] == P._D
+                and self.input_layernorm.weight.dtype == mx.bfloat16
+            ):
+                states = (P.rms_norm_f32_bf16(hidden_states, self.input_layernorm),) * 3
+            else:
+                states = (self.input_layernorm(hidden_states).astype(dtype),) * 3
         elif (
             P.active(dtype, hidden_states)
             and P.msg_gate_ok(self.q_message_gate, hidden_states, messages, self.input_layernorm)
@@ -861,6 +1036,23 @@ class FullDecoderLayer(DecoderLayer):
                 shared_h=False,
                 shared_ln=False,
             )
+            return self.self_attn(
+                *states,
+                cache=cache,
+                conv_states=conv_states,
+                conv_mask=conv_mask,
+                fast_conv=fast_conv,
+            )
+        if (
+            messages is None
+            and attention_inputs is not None
+            and P.active(dtype, hidden_states)
+            and attention_inputs.dtype == mx.float32
+            and attention_inputs.shape[-1] == P._D
+            and lns[0].eps == lns[1].eps == lns[2].eps
+            and lns[0].weight.dtype == lns[1].weight.dtype == lns[2].weight.dtype == mx.bfloat16
+        ):
+            states = P.rms_norm_f32_bf16_qkv(attention_inputs, lns)
             return self.self_attn(
                 *states,
                 cache=cache,

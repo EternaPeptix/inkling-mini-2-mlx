@@ -19,6 +19,7 @@ Usage:
     toks = dec.step(last_tokens)           # (C,) int -> (C,) next greedy tokens; caches advance in place
     dec.flush()                            # write the batched conv states back into the per-stream caches
 """
+import inspect
 import numpy as np
 import os
 
@@ -223,6 +224,7 @@ _cw_tau_table_cache: dict = {}
 _cw_ar_cache: dict = {}
 _update_kv_stage_k: dict = {}
 KV_STAGE_CAP = 32
+_BATCH_KV_STAGE_CAP = int(os.environ.get("LOOPLING_KV_STAGE_CAP", "64"))
 
 
 def _batch_cache_ok(caches, nv) -> bool:
@@ -248,13 +250,13 @@ def _batch_cache_ok(caches, nv) -> bool:
 
 
 class _BatchKVStage:
-    """32-slot KV staging buffer over unpacked per-stream KVCache/RotatingKVCache objects."""
+    """Ping-pong KV staging buffers over unpacked per-stream KVCache/RotatingKVCache objects."""
 
-    def __init__(self, caches, scap=KV_STAGE_CAP):
+    def __init__(self, caches, scap=None):
         self.caches = caches
         self.C = len(caches)
         self.nv = len(caches[0])
-        self.scap = int(scap)
+        self.scap = int(_BATCH_KV_STAGE_CAP if scap is None else scap)
         self.st_len = 0
         self._meta_cache = {}
         self._off_arr_cache = {}
@@ -270,8 +272,12 @@ class _BatchKVStage:
                     kv._idx = kv.max_size
                     mx.eval(kv._keys, kv._values)
         Hkv = caches[0][0][0]._keys.shape[1]
-        self.buf = mx.zeros((self.nv, self.C, 2, Hkv, self.scap, 128), mx.bfloat16)
-        mx.eval(self.buf)
+        shp = (self.nv, self.C, 2, Hkv, self.scap, 128)
+        self._bufs = [mx.zeros(shp, mx.bfloat16), mx.zeros(shp, mx.bfloat16)]
+        self._active = 0
+        self.buf = self._bufs[0]
+        self._prev_step = None
+        mx.eval(self._bufs[0], self._bufs[1])
         self._refresh_meta()
 
     def _refresh_meta(self):
@@ -392,10 +398,21 @@ class _BatchKVStage:
         return mx.array(offs, mx.int32), max(offs) + 1
 
     def commit_step(self, kv_news):
-        s = self.buf
-        self.buf = None
-        src = mx.stack(kv_news, axis=0)[:, :, :, :, None, :]
-        self.buf = mx.slice_update(s, src, FD._wpos(self.st_len), axes=(4,))
+        cur = mx.stack(kv_news, axis=0)[:, :, :, :, None, :]
+        nxt = 1 - self._active
+        b = self._bufs[nxt]
+        self._bufs[nxt] = None
+        if self.st_len == 0:
+            src = cur
+            pos = 0
+        else:
+            src = mx.concatenate([self._prev_step, cur], axis=4)
+            pos = self.st_len - 1
+        b = mx.slice_update(b, src, FD._wpos(pos), axes=(4,))
+        self._bufs[nxt] = b
+        self._active = nxt
+        self.buf = b
+        self._prev_step = cur
         self.st_len += 1
 
     def flush(self):
@@ -403,7 +420,6 @@ class _BatchKVStage:
             return
         k = int(self.st_len)
         src = self.buf[:, :, :, :, :k, :]
-        mx.eval(src)
         for v in range(self.nv):
             for b in range(self.C):
                 kv = self.caches[b][v][0]
@@ -413,6 +429,7 @@ class _BatchKVStage:
             [self.caches[b][v][0]._values for b in range(self.C) for v in range(self.nv)],
         )
         self.st_len = 0
+        self._prev_step = None
         self._refresh_meta()
 
 
@@ -591,6 +608,17 @@ class BatchDecoder:
         self._full_visits = ()
         self._kv_vmap = None
         self._cw_compiled = {}
+        self._b1_st_cap = _BATCH_KV_STAGE_CAP
+        self._b1_ring_bufs = None
+        self._b1_full_bufs = None
+        self._b1_st_active = 0
+        self._b1_st_prev_r = None
+        self._b1_st_prev_f = None
+        self._b1_compiled = {}
+        self._batch_compiled = {}
+        self._b1_pending_kv = [None] * self.nv
+        self._b1_pending_ref = [None] * self._n_coda if has_ref else None
+        self._sdpa_staged_has_st_info = "st_info_arr" in inspect.signature(RS.sdpa_rows_staged).parameters
         if self._b1_fast:
             self.conv = [[caches[0][v][1].cache[j] for j in range(4)] for v in range(self.nv)]
             for v in range(self.nv):
@@ -638,7 +666,24 @@ class BatchDecoder:
                     for layer in self.tm.layers
                 }
 
+    def _flush_b1_pending(self, caches=None, pending=None):
+        """Commit any deferred B=1 kv_new tensors (from RS.sdpa_mid_b1) into packed KV caches."""
+        if not self._b1_fast:
+            return
+        if caches is None:
+            caches = self.caches
+            pending = self._b1_pending_kv
+        elif pending is None:
+            pending = self._b1_pending_ref if caches is self._ref_caches else self._b1_pending_kv
+        if pending is None:
+            return
+        for v, kv_new in enumerate(pending):
+            if kv_new is not None:
+                caches[0][v][0].update_packed_b1(kv_new, FD._wpos)
+                pending[v] = None
+
     def _ensure_stacked_kv(self):
+        self._flush_b1_pending()
         if self._kv_stacked:
             return True
         if os.environ.get("LOOPLING_KV_STACK", "1") in ("0", ""):
@@ -687,6 +732,7 @@ class BatchDecoder:
 
     def unstack_kv(self):
         """Restore per-visit 4D `_packed` buffers onto caches if currently stacked."""
+        self._flush_b1_pending()
         if not self._kv_stacked:
             return
         self.flush_kv_stage()
@@ -702,6 +748,11 @@ class BatchDecoder:
                 self.caches[0][v][0]._packed = mx.contiguous(buf[i])
         self._kv_ring_st = None
         self._kv_full_st = None
+        self._b1_ring_bufs = None
+        self._b1_full_bufs = None
+        self._b1_st_active = 0
+        self._b1_st_prev_r = None
+        self._b1_st_prev_f = None
         self._kv_vmap = None
         self._kv_stacked = False
 
@@ -710,12 +761,17 @@ class BatchDecoder:
         if not self._ensure_stacked_kv() or not self._ring_visits or not self._full_visits:
             return False
         self.flush_kv_stage()
-        if self._kv_ring_st is None or int(self._kv_ring_st.shape[0]) != len(self._ring_visits):
+        self._b1_ring_bufs = None
+        self._b1_full_bufs = None
+        self._b1_st_active = 0
+        self._b1_st_prev_r = None
+        self._b1_st_prev_f = None
+        if self._kv_ring_st is None or int(self._kv_ring_st.shape[0]) != len(self._ring_visits) or int(self._kv_ring_st.shape[3]) != KV_STAGE_CAP:
             self._kv_ring_st = mx.zeros(
                 (len(self._ring_visits), 2, self._kv_ring.shape[2], KV_STAGE_CAP, self._kv_ring.shape[4]),
                 self._kv_ring.dtype,
             )
-        if self._kv_full_st is None or int(self._kv_full_st.shape[0]) != len(self._full_visits):
+        if self._kv_full_st is None or int(self._kv_full_st.shape[0]) != len(self._full_visits) or int(self._kv_full_st.shape[3]) != KV_STAGE_CAP:
             self._kv_full_st = mx.zeros(
                 (len(self._full_visits), 2, self._kv_full.shape[2], KV_STAGE_CAP, self._kv_full.shape[4]),
                 self._kv_full.dtype,
@@ -730,35 +786,110 @@ class BatchDecoder:
         mx.eval(self._kv_ring_st, self._kv_full_st)
         return True
 
+    def _ensure_b1_kv_stage(self) -> bool:
+        """Ensure stacked 5D ping-pong KV staging buffers are ready for C=1 decode (opt-in via LOOPLING_B1_STAGED_KV=1)."""
+        if os.environ.get("LOOPLING_B1_STAGED_KV", "0") in ("0", ""):
+            return False
+        if not self._ensure_stacked_kv() or not self._ring_visits or not self._full_visits:
+            return False
+        if self._b1_ring_bufs is None:
+            if self._kv_st_len > 0:
+                self.flush_kv_stage()
+            scap = self._b1_st_cap
+            shp_r = (len(self._ring_visits), 2, self._kv_ring.shape[2], scap, self._kv_ring.shape[4])
+            shp_f = (len(self._full_visits), 2, self._kv_full.shape[2], scap, self._kv_full.shape[4])
+            self._b1_ring_bufs = [mx.zeros(shp_r, self._kv_ring.dtype), mx.zeros(shp_r, self._kv_ring.dtype)]
+            self._b1_full_bufs = [mx.zeros(shp_f, self._kv_full.dtype), mx.zeros(shp_f, self._kv_full.dtype)]
+            self._b1_st_active = 0
+            self._kv_ring_st = self._b1_ring_bufs[0]
+            self._kv_full_st = self._b1_full_bufs[0]
+            self._b1_st_prev_r = None
+            self._b1_st_prev_f = None
+            self._kv_st_len = 0
+            mx.eval(self._b1_ring_bufs[0], self._b1_ring_bufs[1], self._b1_full_bufs[0], self._b1_full_bufs[1])
+        elif self._kv_st_len >= self._b1_st_cap:
+            self.flush_kv_stage()
+        if self._kv_st_len == 0:
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            kv_f = self.caches[0][self._full_visits[0]][0]
+            max_size_r = int(kv_r.max_size)
+            self._kv_main_end_r = int(kv_r.offset)
+            self._kv_main_slot_r = 0 if kv_r._idx == max_size_r else int(kv_r._idx)
+            self._kv_main_end_f = int(kv_f.offset)
+        return True
+
+    def _commit_b1_kv_stage(self, kv_news):
+        """Commit 1 token's kv_news into ping-pong 5D staging buffers via 2 donated slice_updates."""
+        cur_r = mx.stack([kv_news[v] for v in self._ring_visits], axis=0)
+        cur_f = mx.stack([kv_news[v] for v in self._full_visits], axis=0)
+        nxt = 1 - self._b1_st_active
+        br = self._b1_ring_bufs[nxt]
+        bf = self._b1_full_bufs[nxt]
+        self._b1_ring_bufs[nxt] = None
+        self._b1_full_bufs[nxt] = None
+        if self._kv_st_len == 0:
+            src_r, src_f, pos = cur_r, cur_f, 0
+        else:
+            src_r = mx.concatenate([self._b1_st_prev_r, cur_r], axis=3)
+            src_f = mx.concatenate([self._b1_st_prev_f, cur_f], axis=3)
+            pos = self._kv_st_len - 1
+        wpos = FD._wpos(pos)
+        br = mx.slice_update(br, src_r, wpos, axes=(3,))
+        bf = mx.slice_update(bf, src_f, wpos, axes=(3,))
+        self._b1_ring_bufs[nxt] = br
+        self._b1_full_bufs[nxt] = bf
+        self._b1_st_active = nxt
+        self._kv_ring_st = br
+        self._kv_full_st = bf
+        self._b1_st_prev_r = cur_r
+        self._b1_st_prev_f = cur_f
+        self.sync_kv_offsets(1, staged=True)
+
     def flush_kv_stage(self):
         """Flush staged KV tokens back into main stacked KV buffers if non-empty."""
         if self._kv_st_len <= 0 or not self._kv_stacked:
             self._kv_st_len = 0
+            self._b1_st_prev_r = None
+            self._b1_st_prev_f = None
             return
         k = int(self._kv_st_len)
         if self._ring_visits and self._kv_ring is not None and self._kv_ring_st is not None:
             br = self._kv_ring
             self._kv_ring = None
-            max_s = int(self.caches[0][self._ring_visits[0]][0].max_size)
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            max_s = int(kv_r.max_size)
             s0 = int(self._kv_main_slot_r)
+            cap_r = int(br.shape[3])
+            if cap_r < max_s and s0 + k > cap_r:
+                target_cap = min(max_s, ((min(s0 + k, max_s) + kv_r.step - 1) // kv_r.step) * kv_r.step)
+                ext = mx.zeros((len(self._ring_visits), 2, br.shape[2], target_cap - cap_r, br.shape[4]), br.dtype)
+                br = mx.concatenate([br, ext], axis=3)
             src_r = self._kv_ring_st[:, :, :, :k, :]
             if s0 + k <= max_s:
-                br[:, :, :, s0 : s0 + k, :] = src_r
+                br = mx.slice_update(br, src_r, FD._wpos(s0), axes=(3,))
             else:
                 n1 = max_s - s0
-                br[:, :, :, s0:max_s, :] = src_r[:, :, :, :n1, :]
-                br[:, :, :, 0 : k - n1, :] = src_r[:, :, :, n1:, :]
+                br = mx.slice_update(br, src_r[:, :, :, :n1, :], FD._wpos(s0), axes=(3,))
+                br = mx.slice_update(br, src_r[:, :, :, n1:, :], FD._wpos(0), axes=(3,))
             self._kv_ring = br
             self._kv_main_end_r += k
             self._kv_main_slot_r = (s0 + k) % max_s
         if self._full_visits and self._kv_full is not None and self._kv_full_st is not None:
             bf = self._kv_full
             self._kv_full = None
+            kv_f = self.caches[0][self._full_visits[0]][0]
             e0 = int(self._kv_main_end_f)
-            bf[:, :, :, e0 : e0 + k, :] = self._kv_full_st[:, :, :, :k, :]
+            cap_f = int(bf.shape[3])
+            if e0 + k > cap_f:
+                target_cap = ((e0 + k + kv_f.step - 1) // kv_f.step) * kv_f.step
+                ext = mx.zeros((len(self._full_visits), 2, bf.shape[2], target_cap - cap_f, bf.shape[4]), bf.dtype)
+                bf = mx.concatenate([bf, ext], axis=3)
+            bf = mx.slice_update(bf, self._kv_full_st[:, :, :, :k, :], FD._wpos(e0), axes=(3,))
             self._kv_full = bf
             self._kv_main_end_f += k
         self._kv_st_len = 0
+        self._b1_st_prev_r = None
+        self._b1_st_prev_f = None
 
     def ensure_gpu_cap(self, extra: int) -> bool:
         """Pre-grow stacked ring/full KV buffers for `extra` upcoming tokens so GPU commits can donate in place."""
@@ -858,7 +989,10 @@ class BatchDecoder:
 
     def kv_packed(self, v):
         """Return 4D packed KV buffer view (2, Hkv, cap, 128) for visit `v` (for tests/inspection)."""
+        self._flush_b1_pending()
         if self._kv_stacked:
+            if self._kv_st_len > 0:
+                self.flush_kv_stage()
             is_ring, lidx = self._kv_vmap[v]
             return (self._kv_ring if is_ring else self._kv_full)[lidx]
         return self.caches[0][v][0]._packed
@@ -866,6 +1000,7 @@ class BatchDecoder:
     def _flush_group(self, caches, conv, kv, stage=None):
         nv = len(conv)
         if self._b1_fast:
+            self._flush_b1_pending(caches)
             if caches is self.caches:
                 self.unstack_kv()
             for v in range(nv):
@@ -962,48 +1097,142 @@ class BatchDecoder:
         conv_list[v] = states
         return o, bs_new
 
-    def _layer_b1(self, layer, v, h, bs, msg, tau_cache=None, caches=None, conv=None):
+    def _layer_b1(self, layer, v, h, bs, msg, tau_cache=None, caches=None, conv=None, b1_stage=None):
         a = layer["self_attn"]
         sliding = "input_layernorm" in layer
         c_list = self.caches if caches is None else caches
         conv_list = self.conv if conv is None else conv
         kv = c_list[0][v][0]
+        pending = self._b1_pending_ref if (caches is not None and caches is self._ref_caches) else self._b1_pending_kv
+        if b1_stage is None and pending is not None and pending[v] is not None:
+            kv.update_packed_b1(pending[v], FD._wpos)
+            pending[v] = None
         cs = conv_list[v]
         r1 = RL.k1_pre_layer(layer, h, bs, msg)
         nr = r1["normed_residual"]
-        if msg is None:
-            q_in, k_in, v_in = r1["q_in"], r1["k_in"], r1["v_in"]
-        else:
-            gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
-            mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), msg, (0, 1, 2), r1["qkv_gate_in"])
-            q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
-        qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
-        if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
-            gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
-            gate_stride, sink_stride = qkv_lay[2][2], qkv_lay[3][2]
-        else:
-            dm = {item[0]: (item[1], item[2]) for item in qkv_lay}
-            gate_off, gate_stride = dm["gate"]
-            sink_off, sink_stride = dm["sinks"]
         tau_1d = None
         if not sliding:
-            end = kv.offset
-            tkey = (end, a.log_scaling_alpha, a.log_scaling_n_floor)
-            tau_1d = tau_cache.get(tkey) if tau_cache is not None else None
-            if tau_1d is None:
-                tau_1d = FD._full_tau(layer, end).reshape(-1)
-                if tau_cache is not None:
-                    tau_cache[tkey] = tau_1d
+            if b1_stage is not None and b1_stage[7] is not None:
+                tau_1d = b1_stage[7]
+            else:
+                end = kv.offset
+                tkey = (end, a.log_scaling_alpha, a.log_scaling_n_floor)
+                tau_1d = tau_cache.get(tkey) if tau_cache is not None else None
+                if tau_1d is None:
+                    tau_1d = FD._full_tau(layer, end).reshape(-1)
+                    if tau_cache is not None:
+                        tau_cache[tkey] = tau_1d
         rel_w_bf = FD._rel_w_bf(a["rel_logits_proj"])
-        q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
-            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=True
-        )
-        kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, FD._wpos)
-        attn_out = RS.sdpa_b1_packed(
-            q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap,
-            scale=a.scaling, window=a.sliding_window or 0,
-            gate_stride=gate_stride, sink_stride=sink_stride,
-        )
+        if os.environ.get("LOOPLING_QKV_MID_B1", "0") not in ("0", ""):
+            if msg is None:
+                q, kv_new, pb, qkv_flat, w0, w1 = RP.qkv_mid_rel_b1(
+                    layer, r1["q_in"], r1["k_in"], r1["v_in"], cs[0], cs[1], rel_w_bf, tau=tau_1d
+                )
+            else:
+                q, kv_new, pb, qkv_flat, w0, w1 = RP.qkv_mid_rel_msg_b1(
+                    layer, r1, msg, cs[0], cs[1], rel_w_bf, tau=tau_1d
+                )
+            gate_off, sink_off = 0, 3072
+            gate_stride, sink_stride = 3072, 24
+            if b1_stage is not None:
+                is_ring, kv_layer_idx = self._kv_vmap[v]
+                kv_buf = self._kv_ring if is_ring else self._kv_full
+                kv_st = self._kv_ring_st if is_ring else self._kv_full_st
+                meta_arr = b1_stage[0] if is_ring else b1_stage[1]
+                s_bounds = b1_stage[2] if is_ring else b1_stage[3]
+                tree_meta = b1_stage[4]
+                rot = 1 if is_ring else 0
+                max_size = b1_stage[5] if is_ring else 0
+                cap = kv_buf.shape[3]
+                attn_out = RS.sdpa_causal_w_packed(
+                    q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off,
+                    0, 0, 0, rot, cap, max_size, 1,
+                    scale=a.scaling, window=a.sliding_window or 0,
+                    kv_layer_idx=kv_layer_idx, tree_meta=tree_meta, depths=(0,),
+                    meta_arr=meta_arr, s_bounds=s_bounds, kv_stage=kv_st,
+                    gate_stride=gate_stride, sink_stride=sink_stride,
+                )
+                b1_stage[6][v] = kv_new
+            else:
+                kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, FD._wpos)
+                attn_out = RS.sdpa_b1_packed(
+                    q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap,
+                    scale=a.scaling, window=a.sliding_window or 0,
+                    gate_stride=gate_stride, sink_stride=sink_stride,
+                )
+        else:
+            if msg is None:
+                qkv_flat, qkv_lay = RP.qkv_rows(a, r1["q_in"], r1["k_in"], r1["v_in"], flat=True)
+            elif (
+                os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
+                and int(r1["s_q"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
+            ):
+                qkv_flat, qkv_lay = RP.qkv_msg_rows(layer, r1, msg, flat=True)
+            else:
+                gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
+                mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), msg, (0, 1, 2), r1["qkv_gate_in"])
+                q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
+                qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
+            if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
+                gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
+                gate_stride, sink_stride = qkv_lay[2][2], qkv_lay[3][2]
+            else:
+                dm = {item[0]: (item[1], item[2]) for item in qkv_lay}
+                gate_off, gate_stride = dm["gate"]
+                sink_off, sink_stride = dm["sinks"]
+            is_rot = hasattr(kv, "_idx")
+            max_sz = int(kv.max_size) if is_rot else 0
+            prev = int(kv.offset)
+            S_now = min(prev + 1, max_sz) if is_rot else (prev + 1)
+            if (
+                b1_stage is None
+                and FD._SDPA_MID_B1
+                and kv._packed is not None
+                and S_now < RS._TWO_PASS_N
+            ):
+                rot_wrap = 1 if (is_rot and prev >= max_sz) else 0
+                slot_main = (0 if kv._idx == max_sz else int(kv._idx)) if rot_wrap else prev
+                idx_now = (slot_main + 1) if is_rot else 0
+                attn_out, kv_new, w0, w1 = RS.sdpa_mid_b1(
+                    layer, qkv_flat, qkv_lay, kv._packed, cs[0], cs[1], rel_w_bf,
+                    S_now, prev + 1, idx_now, 1 if is_rot else 0, int(kv._packed.shape[2]),
+                    slot_main, rot_wrap, max_sz,
+                    scale=a.scaling, window=a.sliding_window or 0, tau=tau_1d,
+                )
+                if pending is not None:
+                    pending[v] = kv_new
+                else:
+                    kv.update_packed_b1(kv_new, FD._wpos)
+            else:
+                q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
+                    layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=True
+                )
+                if b1_stage is not None:
+                    is_ring, kv_layer_idx = self._kv_vmap[v]
+                    kv_buf = self._kv_ring if is_ring else self._kv_full
+                    kv_st = self._kv_ring_st if is_ring else self._kv_full_st
+                    meta_arr = b1_stage[0] if is_ring else b1_stage[1]
+                    s_bounds = b1_stage[2] if is_ring else b1_stage[3]
+                    tree_meta = b1_stage[4]
+                    rot = 1 if is_ring else 0
+                    max_size = b1_stage[5] if is_ring else 0
+                    cap = kv_buf.shape[3]
+                    attn_out = RS.sdpa_causal_w_packed(
+                        q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off,
+                        0, 0, 0, rot, cap, max_size, 1,
+                        scale=a.scaling, window=a.sliding_window or 0,
+                        kv_layer_idx=kv_layer_idx, tree_meta=tree_meta, depths=(0,),
+                        meta_arr=meta_arr, s_bounds=s_bounds, kv_stage=kv_st,
+                        gate_stride=gate_stride, sink_stride=sink_stride,
+                    )
+                    b1_stage[6][v] = kv_new
+                else:
+                    kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, FD._wpos)
+                    attn_out = RS.sdpa_b1_packed(
+                        q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap,
+                        scale=a.scaling, window=a.sliding_window or 0,
+                        gate_stride=gate_stride, sink_stride=sink_stride,
+                    )
         op_m = a["o_proj"]
         op = mx.quantized_matmul(
             attn_out.reshape(1, 1, -1), op_m["weight"], scales=op_m["scales"], biases=op_m["biases"],
@@ -1038,6 +1267,11 @@ class BatchDecoder:
         conv_list,
         prev_moe=None,
         skip_combine=False,
+        tau_override=None,
+        st_info_arr=None,
+        stage_buf=None,
+        ks_v=None,
+        vs_v=None,
     ):
         a, sliding, op_m, rel_proj, scale, window = self._batch_meta[id(layer)]
         cs = conv_list[v]
@@ -1049,12 +1283,17 @@ class BatchDecoder:
             r1 = RL.k1_pre_layer(layer, h, bs, msg)
         nr = r1["normed_residual"]
         if msg is None:
-            q_in, k_in, v_in = r1["q_in"], r1["k_in"], r1["v_in"]
+            qkv_flat, qkv_lay = RP.qkv_rows(a, r1["q_in"], r1["k_in"], r1["v_in"], flat=True)
+        elif (
+            os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
+            and int(r1["s_q"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
+        ):
+            qkv_flat, qkv_lay = RP.qkv_msg_rows(layer, r1, msg, flat=True)
         else:
             gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
             mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), msg, (0, 1, 2), r1["qkv_gate_in"])
             q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
-        qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
+            qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
         if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
             gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
             gate_stride, sink_stride = qkv_lay[2][2], qkv_lay[3][2]
@@ -1064,22 +1303,34 @@ class BatchDecoder:
             sink_off, sink_stride = dm["sinks"]
         tau_1d = None
         if not sliding:
-            oarr, max_p = full_offs if full_offs is not None else stage.full_off_for_visit(v, st_len)
-            tkey = (id(stage), -1 if full_offs is not None else v, a.log_scaling_alpha, a.log_scaling_n_floor)
-            tau_1d = tau_cache.get(tkey)
-            if tau_1d is None:
-                tau_1d = _get_tau_table(layer, max_p)[oarr]
-                tau_cache[tkey] = tau_1d
+            if tau_override is not None:
+                tau_1d = tau_override
+            else:
+                oarr, max_p = full_offs if full_offs is not None else stage.full_off_for_visit(v, st_len)
+                tkey = (id(stage), -1 if full_offs is not None else v, a.log_scaling_alpha, a.log_scaling_n_floor)
+                tau_1d = tau_cache.get(tkey)
+                if tau_1d is None:
+                    tau_1d = _get_tau_table(layer, max_p)[oarr]
+                    tau_cache[tkey] = tau_1d
         rel_w_bf = FD._rel_w_bf(rel_proj)
         q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
             layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv_b=True
         )
         kv_news[v] = kv_new
-        attn_out = RS.sdpa_rows_staged(
-            q, stage.ks_main[v], stage.vs_main[v], stage.buf, kv_new, pb, qkv_flat,
-            gate_off, gate_stride, sink_off, sink_stride, None,
+        sdpa_kw = dict(
             scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
             meta_arr=step_metas[v], Ss=step_Ss[v],
+        )
+        if st_info_arr is not None:
+            sdpa_kw["st_info_arr"] = st_info_arr
+        attn_out = RS.sdpa_rows_staged(
+            q,
+            stage.ks_main[v] if ks_v is None else ks_v,
+            stage.vs_main[v] if vs_v is None else vs_v,
+            stage.buf if stage_buf is None else stage_buf,
+            kv_new, pb, qkv_flat,
+            gate_off, gate_stride, sink_off, sink_stride, None,
+            **sdpa_kw,
         )
         op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
         r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False)
@@ -1115,12 +1366,17 @@ class BatchDecoder:
             prev_w3 = None
         nr = r1["normed_residual"]
         if msg is None:
-            q_in, k_in, v_in = r1["q_in"], r1["k_in"], r1["v_in"]
+            qkv_flat, qkv_lay = RP.qkv_rows(a, r1["q_in"], r1["k_in"], r1["v_in"], flat=True)
+        elif (
+            os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
+            and int(r1["s_q"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
+        ):
+            qkv_flat, qkv_lay = RP.qkv_msg_rows(layer, r1, msg, flat=True)
         else:
             gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
             mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), msg, (0, 1, 2), r1["qkv_gate_in"])
             q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
-        qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
+            qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
         if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
             gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
             gate_stride, sink_stride = qkv_lay[2][2], qkv_lay[3][2]
@@ -1182,20 +1438,225 @@ class BatchDecoder:
             return e, bs, kv_new, (w0, w1, r10["w2"]), prev_w3, h
         return e["out"], bs, kv_new, (w0, w1, r10["w2"], e["w3"]), prev_w3, h
 
+    def _get_b1_compiled(self, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, max_size_r, num_passes, cd_key, fuse_k3b):
+        key = (r_key, f_key, cap_r, cap_f, num_passes, cd_key, fuse_k3b, self._b1_st_cap)
+        ent = self._b1_compiled.get(key)
+        if ent is not None:
+            return ent
+        tm = self.tm
+        layers_seq = tm.layer_visits
+        core = tm.args.loop_core
+        cfg = tm.loopcd
+        use_cd = cd_key is not None
+        ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        nv = self.nv
+        pre_n = sum(1 for v in range(0, core.start) if layers_seq[v].is_block_boundary)
+        n_core = core.stop - core.start
+        n_bs_core = pre_n + sum(1 for v in range(core.start, core.stop) if layers_seq[v].is_block_boundary)
+        use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
+        _, b1_tree_meta = RS._default_tree_meta(1)
+
+        def make_chunk(v0, v1, *, is_first=False, is_last=False, use_msg=False, apply_cd=False):
+            f_vs = [v for v in range(v0, v1) if not self._cw_meta[v][1]]
+            f_pos = {v: i for i, v in enumerate(f_vs)}
+
+            @mx.compile
+            def fn(h_in, bs_in, h_aux, bs_aux, kv_r, kv_f, kv_st_r, kv_st_f, m_r, m_f, tau_1ds, *convs):
+                old = (self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st, self.conv)
+                try:
+                    self._kv_ring = kv_r
+                    self._kv_full = kv_f
+                    self._kv_ring_st = kv_st_r
+                    self._kv_full_st = kv_st_f
+                    self.conv = [None] * nv
+                    for j, v in enumerate(range(v0, v1)):
+                        self.conv[v] = [convs[4 * j], convs[4 * j + 1], convs[4 * j + 2], convs[4 * j + 3]]
+                    if is_first:
+                        h = tm.embed(h_in.reshape(1, 1)).reshape(1, 2304)
+                        bs = None
+                        msgs = None
+                    elif use_msg:
+                        bank = (
+                            mx.stack(list(bs_in[pre_n + 1 :]), axis=0),
+                            L.unweighted_rms_norm(h_in.astype(mx.float32)),
+                        )
+                        if use_batch_msg:
+                            msgs = IK.depth_attention_batch(bank[0], bank[1], tm.message_input.query, scale=2304 ** -0.5)
+                        else:
+                            msgs = [tm.message_input(bank, i) for i in range(v1 - v0)]
+                        h = h_aux
+                        bs = list(bs_aux)
+                    else:
+                        h = h_in
+                        bs = list(bs_in) if bs_in else None
+                        msgs = None
+                        if apply_cd:
+                            h, bs = loopcd.apply_hidden(
+                                h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg
+                            )
+                    kv_news = [None] * nv
+                    for j, v in enumerate(range(v0, v1)):
+                        msg_v = None if msgs is None else msgs[j]
+                        tau_v = tau_1ds[f_pos[v]] if v in f_pos else None
+                        b1_stage = (m_r, m_f, s_bounds_r, s_bounds_f, b1_tree_meta, max_size_r, kv_news, tau_v)
+                        h, bs = self._layer_b1(layers_seq[v], v, h, bs, msg_v, b1_stage=b1_stage)
+                    kvns = [kv_news[v] for v in range(v0, v1)]
+                    cws = [x for v in range(v0, v1) for x in self.conv[v]]
+                    if is_last:
+                        h_out = RL.k1_pre(
+                            h, bs, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps
+                        )["q_in"].reshape(1, 1, 2304)
+                        return [h_out] + kvns + cws
+                    return [h] + (list(bs) if bs is not None else []) + kvns + cws
+                finally:
+                    self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st, self.conv = old
+
+            n_bs_out = 0 if is_last else (pre_n if is_first else n_bs_core)
+            return fn, v0, v1, n_bs_out, f_vs
+
+        chunks = [make_chunk(0, core.start, is_first=True)]
+        for p in range(num_passes):
+            v0 = core.start + p * n_core
+            chunks.append(make_chunk(v0, v0 + n_core, use_msg=(p > 0)))
+        coda_v0 = core.start + num_passes * n_core
+        chunks.append(make_chunk(coda_v0, nv, is_last=True, apply_cd=use_cd))
+        if len(self._b1_compiled) >= 64:
+            self._b1_compiled.clear()
+        ent = self._b1_compiled[key] = (chunks, pre_n, n_bs_core, use_cd, ref_pass, bool(cfg.blend_bs))
+        return ent
+
     def _b1_hidden_pair(self, tokens, tap_set=None, tap_buf=None):
-        self.unstack_kv()
         tm = self.tm
         core = tm.args.loop_core
         layers = tm.layers
-        self._v = 0
-        tau_cache = {}
         num_passes = tm.args.loop_config["num_passes"]
         cfg = tm.loopcd
         use_cd = cfg.enabled_for(num_passes)
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        do_logits_cd = use_cd and cfg.mode == "logits"
+        if do_logits_cd and self._ref_caches is None:
+            raise RuntimeError("LoopCD-Logits shadow coda cache missing in BatchDecoder.")
+
+        b1_staged = self._ensure_b1_kv_stage()
+        if not b1_staged:
+            self.unstack_kv()
+        else:
+            meta_r, meta_f = self.get_gpu_meta(staged=True)
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            kv_f = self.caches[0][self._full_visits[0]][0]
+            max_size_r = int(kv_r.max_size)
+            end0_r = int(kv_r.offset)
+            end0_f = int(kv_f.offset)
+            s_r = min(end0_r + 1, max_size_r)
+            s_f = end0_f + 1
+            s_bounds_r = (s_r, s_r)
+            s_bounds_f = (s_f, s_f)
+            r_key = self._regime_key(s_r, s_r)
+            f_key = self._regime_key(s_f, s_f)
+
+            use_compile = (
+                tap_set is None
+                and not do_logits_cd
+                and os.environ.get("LOOPLING_COMPILE_B1", "1") not in ("0", "")
+                and self.nv == len(tm.layer_visits)
+                and r_key is not None
+                and f_key is not None
+            )
+            if use_compile:
+                cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if (use_cd and cfg.mode == "hidden") else None
+                fuse_k3b = (
+                os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
+                and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
+            )
+                cap_r = int(self._kv_ring.shape[3])
+                cap_f = int(self._kv_full.shape[3])
+                chunks, pre_n, n_bs_core, cd_on, r_pass, blend_bs = self._get_b1_compiled(
+                    r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, max_size_r, num_passes, cd_key, fuse_k3b,
+                )
+                layers_seq = tm.layer_visits
+                conv_flat = [x for cs in self.conv for x in cs]
+                tau_cache = {}
+
+                def _taus(fvs):
+                    out = []
+                    for v in fvs:
+                        layer = layers_seq[v]
+                        a = layer["self_attn"]
+                        tk = (end0_f, a.log_scaling_alpha, a.log_scaling_n_floor)
+                        tv = tau_cache.get(tk)
+                        if tv is None:
+                            tv = tau_cache[tk] = FD._full_tau(layer, end0_f).reshape(-1)
+                        out.append(tv)
+                    return out
+
+                outs_all = []
+                fn0, v0, v1, nbs_pre, fvs0 = chunks[0]
+                o_pre = fn0(
+                    tokens, [], [], [], self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st,
+                    meta_r, meta_f, _taus(fvs0), *conv_flat[4 * v0 : 4 * v1],
+                )
+                mx.async_eval(o_pre[0])
+                outs_all.append((o_pre, v1 - v0, nbs_pre))
+                h_pre = o_pre[0]
+                bs_pre = o_pre[1 : 1 + nbs_pre]
+                o_prev = o_pre
+                ref_o = None
+                for p in range(num_passes):
+                    fn_p, pv0, pv1, nbs_p, pfvs = chunks[1 + p]
+                    if p == 0:
+                        o_p = fn_p(
+                            h_pre, bs_pre, [], [], self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st,
+                            meta_r, meta_f, _taus(pfvs), *conv_flat[4 * pv0 : 4 * pv1],
+                        )
+                    else:
+                        o_p = fn_p(
+                            o_prev[0], o_prev[1 : 1 + n_bs_core], h_pre, bs_pre,
+                            self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st,
+                            meta_r, meta_f, _taus(pfvs), *conv_flat[4 * pv0 : 4 * pv1],
+                        )
+                    mx.async_eval(o_p[0])
+                    outs_all.append((o_p, pv1 - pv0, nbs_p))
+                    o_prev = o_p
+                    if cd_on and p == r_pass:
+                        ref_o = o_p
+                fn_c, cv0, cv1, _, cfvs = chunks[-1]
+                h_aux = ref_o[0] if cd_on else []
+                bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
+                o_c = fn_c(
+                    o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
+                    self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st,
+                    meta_r, meta_f, _taus(cfvs), *conv_flat[4 * cv0 : 4 * cv1],
+                )
+                outs_all.append((o_c, cv1 - cv0, 0))
+                kv_news, cws = [], []
+                for out_i, nvi, nbsi in outs_all:
+                    head = 1 + nbsi
+                    kv_news.extend(out_i[head : head + nvi])
+                    cws.extend(out_i[head + nvi : head + nvi + 4 * nvi])
+                for v in range(self.nv):
+                    self.conv[v] = [cws[4 * v], cws[4 * v + 1], cws[4 * v + 2], cws[4 * v + 3]]
+                self._commit_b1_kv_stage(kv_news)
+                deps = [self._kv_ring_st, self._kv_full_st]
+                h_out = o_c[0]
+                if self._stage_dep_mode == "hidden":
+                    h_out = mx.depends(h_out, deps)
+                    self._pending_stage_deps = ()
+                elif self._stage_dep_mode == "step":
+                    self._pending_stage_deps = tuple(deps)
+                else:
+                    self._pending_stage_deps = ()
+                return h_out, None
+
+        self._v = 0
+        tau_cache = {}
         ref_state = None
         h = tm.embed(tokens.reshape(1, 1)).reshape(1, 2304)
         use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
+        kv_news = [None] * self.nv if b1_staged else None
+        b1_stage_base = None
+        if b1_staged:
+            _, b1_tree_meta = RS._default_tree_meta(1)
+            b1_stage_base = (meta_r, meta_f, s_bounds_r, s_bounds_f, b1_tree_meta, max_size_r, kv_news, None)
 
         def run_b1(ls, h, bs, bank=None, rec=True):
             msgs = None
@@ -1205,7 +1666,7 @@ class BatchDecoder:
                 if tap_buf is not None and rec and self._v in tap_set:
                     tap_buf[self._v] = h.reshape(1, 2304)
                 msg = None if bank is None else (msgs[i] if msgs is not None else tm.message_input(bank, i))
-                h, bs = self._layer_b1(layer, self._v, h, bs, msg, tau_cache)
+                h, bs = self._layer_b1(layer, self._v, h, bs, msg, tau_cache, b1_stage=b1_stage_base)
                 self._v += 1
             return h, bs
 
@@ -1229,6 +1690,8 @@ class BatchDecoder:
         coda_layers = layers[core.stop :]
         h, bs = run_b1(coda_layers, h, bs)
         assert self._v == self.nv
+        if b1_staged:
+            self._commit_b1_kv_stage(kv_news)
         if tap_buf is not None and "o" in tap_set:
             tap_buf["o"] = h.reshape(1, 2304)
         h_out = RL.k1_pre(h, bs, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps)[
@@ -1237,9 +1700,7 @@ class BatchDecoder:
         if tap_buf is not None:
             tap_buf["F"] = h_out.reshape(1, 2304)
         h_ref_out = None
-        if use_cd and cfg.mode == "logits":
-            if self._ref_caches is None:
-                raise RuntimeError("LoopCD-Logits shadow coda cache missing in BatchDecoder.")
+        if do_logits_cd:
             hr, bsr = ref_state
             for j, layer in enumerate(coda_layers):
                 hr, bsr = self._layer_b1(
@@ -1248,7 +1709,123 @@ class BatchDecoder:
             h_ref_out = RL.k1_pre(
                 hr, bsr, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps
             )["q_in"].reshape(1, 1, 2304)
+        if b1_staged:
+            deps = [self._kv_ring_st, self._kv_full_st]
+            if self._stage_dep_mode == "hidden":
+                h_out = mx.depends(h_out, deps)
+                self._pending_stage_deps = ()
+            elif self._stage_dep_mode == "step":
+                self._pending_stage_deps = tuple(deps)
+            else:
+                self._pending_stage_deps = ()
         return h_out, h_ref_out
+
+    def _get_batch_compiled(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap):
+        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, scap)
+        ent = self._batch_compiled.get(key)
+        if ent is not None:
+            return ent
+        tm = self.tm
+        layers_seq = tm.layer_visits
+        core = tm.args.loop_core
+        cfg = tm.loopcd
+        use_cd = cd_key is not None
+        ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        C = self.C
+        nv = self.nv
+        pre_n = sum(1 for v in range(0, core.start) if layers_seq[v].is_block_boundary)
+        n_core = core.stop - core.start
+        n_bs_core = pre_n + sum(1 for v in range(core.start, core.stop) if layers_seq[v].is_block_boundary)
+        use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
+        stage = self._stage_main
+
+        def make_chunk(v0, v1, *, is_first=False, is_last=False, use_msg=False, apply_cd=False):
+            n_v = v1 - v0
+            f_vs = [v for v in range(v0, v1) if not self._batch_meta[id(layers_seq[v])][1]]
+            f_pos = {v: i for i, v in enumerate(f_vs)}
+            ss_slice = [step_Ss[v] for v in range(v0, v1)]
+
+            @mx.compile
+            def fn(h_in, bs_in, h_aux, bs_aux, stage_buf, metas_in, st_infos_in, taus_in, ks_flat, vs_flat, *convs):
+                conv_local = [None] * nv
+                for j, v in enumerate(range(v0, v1)):
+                    conv_local[v] = [convs[4 * j], convs[4 * j + 1], convs[4 * j + 2], convs[4 * j + 3]]
+                if is_first:
+                    h = tm.embed(h_in.reshape(C, 1)).reshape(C, 2304)
+                    bs = None
+                    msgs = None
+                    bank4 = None
+                elif use_msg:
+                    bank = (
+                        mx.stack(list(bs_in[pre_n + 1 :]), axis=0),
+                        L.unweighted_rms_norm(h_in.astype(mx.float32)),
+                    )
+                    if use_batch_msg:
+                        msgs = IK.depth_attention_batch(bank[0], bank[1], tm.message_input.query, scale=2304 ** -0.5)
+                        bank4 = None
+                    else:
+                        msgs = None
+                        bank4 = (bank[0][:, :, None, :], bank[1][:, None, :])
+                    h = h_aux
+                    bs = list(bs_aux)
+                else:
+                    h = h_in
+                    bs = list(bs_in) if bs_in else None
+                    msgs = None
+                    bank4 = None
+                    if apply_cd:
+                        h, bs = loopcd.apply_hidden(
+                            h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg
+                        )
+                kv_news = [None] * nv
+                metas_map = [None] * nv
+                ss_map = [None] * nv
+                for j, v in enumerate(range(v0, v1)):
+                    metas_map[v] = metas_in[j]
+                    ss_map[v] = ss_slice[j]
+                prev_moe = None
+                last_j = n_v - 1
+                for j, v in enumerate(range(v0, v1)):
+                    layer = layers_seq[v]
+                    if not use_msg:
+                        msg_v = None
+                    elif msgs is not None:
+                        msg_v = msgs[j]
+                    else:
+                        msg_v = tm.message_input(bank4, j).reshape(C, 4, 2304)
+                    next_gpar1 = j < last_j and (isinstance(layers_seq[v + 1], L.SlidingDecoderLayer) or use_msg)
+                    tau_v = taus_in[f_pos[v]] if v in f_pos else None
+                    ks_v = ks_flat[j * C : (j + 1) * C]
+                    vs_v = vs_flat[j * C : (j + 1) * C]
+                    h, bs, prev_moe = self._layer_batch(
+                        layer, v, h, bs, msg_v,
+                        stage, metas_map, ss_map, None, 0, kv_news,
+                        {}, conv_local, prev_moe=prev_moe, skip_combine=(fuse_ck1 and next_gpar1),
+                        tau_override=tau_v, st_info_arr=st_infos_in[j], stage_buf=stage_buf,
+                        ks_v=ks_v, vs_v=vs_v,
+                    )
+                kvns = [kv_news[v] for v in range(v0, v1)]
+                cws = [x for v in range(v0, v1) for x in conv_local[v]]
+                if is_last:
+                    h_out = RL.k1_pre(
+                        h, bs, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps
+                    )["q_in"].reshape(C, 1, 2304)
+                    return [h_out] + kvns + cws
+                return [h] + (list(bs) if bs is not None else []) + kvns + cws
+
+            n_bs_out = 0 if is_last else (pre_n if is_first else n_bs_core)
+            return fn, v0, v1, n_bs_out, f_vs
+
+        chunks = [make_chunk(0, core.start, is_first=True)]
+        for p in range(num_passes):
+            v0 = core.start + p * n_core
+            chunks.append(make_chunk(v0, v0 + n_core, use_msg=(p > 0)))
+        coda_v0 = core.start + num_passes * n_core
+        chunks.append(make_chunk(coda_v0, nv, is_last=True, apply_cd=use_cd))
+        if len(self._batch_compiled) >= 64:
+            self._batch_compiled.clear()
+        ent = self._batch_compiled[key] = (chunks, pre_n, n_bs_core, use_cd, ref_pass, bool(cfg.blend_bs))
+        return ent
 
     def _batch_hidden_pair(self, tokens):
         tm = self.tm
@@ -1266,15 +1843,127 @@ class BatchDecoder:
         if do_logits_cd:
             self._stage_ref.maybe_flush_before_step()
         step_metas, step_Ss, full_offs, st_len = self._stage_main.step_view()
-        kv_news = [None] * self.nv
+        fuse_ck1 = os.environ.get("LOOPLING_FUSE_COMB_K1_BATCH", "0") not in ("0", "")
 
+        if (
+            self._sdpa_staged_has_st_info
+            and not do_logits_cd
+            and os.environ.get("LOOPLING_COMPILE_BATCH", "1") not in ("0", "")
+            and self.nv == len(tm.layer_visits)
+        ):
+            stage = self._stage_main
+            regime_sig = tuple(
+                (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N))
+                for Ss in step_Ss
+            )
+            cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if (use_cd and cfg.mode == "hidden") else None
+            fuse_k3b = (
+                os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
+                and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
+            )
+            chunks, pre_n, n_bs_core, cd_on, r_pass, blend_bs = self._get_batch_compiled(
+                regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap,
+            )
+            layers_seq = tm.layer_visits
+            conv_flat = [x for cs in self.conv for x in cs]
+            tau_cache = {}
+            st_infos = []
+            for v in range(self.nv):
+                sk = (v, stage.scap, st_len)
+                si = RS._ST_INFO_CACHE.get(sk)
+                if si is None:
+                    if len(RS._ST_INFO_CACHE) >= 4096:
+                        RS._ST_INFO_CACHE.clear()
+                    si = RS._ST_INFO_CACHE[sk] = mx.array(sk, mx.int32)
+                st_infos.append(si)
+
+            def _taus_b(fvs):
+                out = []
+                for v in fvs:
+                    layer = layers_seq[v]
+                    a = layer["self_attn"]
+                    oarr, max_p = full_offs if full_offs is not None else stage.full_off_for_visit(v, st_len)
+                    tk = (-1 if full_offs is not None else v, a.log_scaling_alpha, a.log_scaling_n_floor)
+                    tv = tau_cache.get(tk)
+                    if tv is None:
+                        tv = tau_cache[tk] = _get_tau_table(layer, max_p)[oarr]
+                    out.append(tv)
+                return out
+
+            def _kv_flat(v0, v1):
+                ks = [x for v in range(v0, v1) for x in stage.ks_main[v]]
+                vs = [x for v in range(v0, v1) for x in stage.vs_main[v]]
+                return ks, vs
+
+            outs_all = []
+            fn0, v0, v1, nbs_pre, fvs0 = chunks[0]
+            ks0, vs0 = _kv_flat(v0, v1)
+            o_pre = fn0(
+                tokens, [], [], [], stage.buf, step_metas[v0:v1], st_infos[v0:v1], _taus_b(fvs0),
+                ks0, vs0, *conv_flat[4 * v0 : 4 * v1],
+            )
+            mx.async_eval(o_pre[0])
+            outs_all.append((o_pre, v1 - v0, nbs_pre))
+            h_pre = o_pre[0]
+            bs_pre = o_pre[1 : 1 + nbs_pre]
+            o_prev = o_pre
+            ref_o = None
+            for p in range(num_passes):
+                fn_p, pv0, pv1, nbs_p, pfvs = chunks[1 + p]
+                ksp, vsp = _kv_flat(pv0, pv1)
+                if p == 0:
+                    o_p = fn_p(
+                        h_pre, bs_pre, [], [], stage.buf, step_metas[pv0:pv1], st_infos[pv0:pv1], _taus_b(pfvs),
+                        ksp, vsp, *conv_flat[4 * pv0 : 4 * pv1],
+                    )
+                else:
+                    o_p = fn_p(
+                        o_prev[0], o_prev[1 : 1 + n_bs_core], h_pre, bs_pre,
+                        stage.buf, step_metas[pv0:pv1], st_infos[pv0:pv1], _taus_b(pfvs),
+                        ksp, vsp, *conv_flat[4 * pv0 : 4 * pv1],
+                    )
+                mx.async_eval(o_p[0])
+                outs_all.append((o_p, pv1 - pv0, nbs_p))
+                o_prev = o_p
+                if cd_on and p == r_pass:
+                    ref_o = o_p
+            fn_c, cv0, cv1, _, cfvs = chunks[-1]
+            ksc, vsc = _kv_flat(cv0, cv1)
+            h_aux = ref_o[0] if cd_on else []
+            bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
+            o_c = fn_c(
+                o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
+                stage.buf, step_metas[cv0:cv1], st_infos[cv0:cv1], _taus_b(cfvs),
+                ksc, vsc, *conv_flat[4 * cv0 : 4 * cv1],
+            )
+            outs_all.append((o_c, cv1 - cv0, 0))
+            kv_news, cws = [], []
+            for out_i, nvi, nbsi in outs_all:
+                head = 1 + nbsi
+                kv_news.extend(out_i[head : head + nvi])
+                cws.extend(out_i[head + nvi : head + nvi + 4 * nvi])
+            for v in range(self.nv):
+                self.conv[v] = [cws[4 * v], cws[4 * v + 1], cws[4 * v + 2], cws[4 * v + 3]]
+            stage.commit_step(kv_news)
+            deps = [stage.buf]
+            h_out = o_c[0]
+            if self._stage_dep_mode == "hidden":
+                h_out = mx.depends(h_out, deps)
+                self._pending_stage_deps = ()
+            elif self._stage_dep_mode == "step":
+                self._pending_stage_deps = tuple(deps)
+            else:
+                self._pending_stage_deps = ()
+            return h_out, None
+
+        kv_news = [None] * self.nv
         self._v = 0
         tau_cache = {}
         ref_state = None
         C = self.C
         h = tm.embed(tokens.reshape(C, 1)).reshape(C, 2304)
         use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
-        fuse_ck1 = os.environ.get("LOOPLING_FUSE_COMB_K1_BATCH", "0") not in ("0", "")
+        split_batch = os.environ.get("LOOPLING_BATCH_SPLIT", "1") not in ("0", "")
 
         def run_batch(ls, h, bs, bank=None):
             msgs = None
@@ -1304,6 +1993,8 @@ class BatchDecoder:
 
         prelude = run_batch(layers[: core.start], h, None)
         h, bs = prelude
+        if split_batch:
+            mx.async_eval(h)
         pre_n = len(prelude[1])
         for p in range(num_passes):
             bank = None
@@ -1314,6 +2005,8 @@ class BatchDecoder:
                 )
                 h, bs = prelude
             h, bs = run_batch(layers[core.start : core.stop], h, bs, bank)
+            if split_batch:
+                mx.async_eval(h)
             if p == ref_pass:
                 keep_bs = cfg.blend_bs or do_logits_cd
                 ref_state = (h, list(bs) if keep_bs else None)
@@ -1359,6 +2052,7 @@ class BatchDecoder:
         tap_set = set(tap_visits) if tap_visits is not None else set()
         tap_buf = {}
         h, h_ref = self._b1_hidden_pair(tokens, tap_set=tap_set, tap_buf=tap_buf)
+        self._flush_b1_pending()
         if h_ref is not None:
             z_R, z_ref = self._pair_logits_softcap(h, h_ref)
             logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd)
@@ -1368,9 +2062,11 @@ class BatchDecoder:
             text = m.args.text
             if "head" not in _PLAIN and FD._is_aff8(lm) and h.dtype == mx.bfloat16:
                 return (
-                    RQ.qmv_softcap_argmax_rows(
-                        h.reshape(1, 2304), lm["weight"], lm["scales"], lm["biases"],
-                        text.final_logit_softcapping, text.unpadded_vocab_size,
+                    self._with_stage_deps(
+                        RQ.qmv_softcap_argmax_rows(
+                            h.reshape(1, 2304), lm["weight"], lm["scales"], lm["biases"],
+                            text.final_logit_softcapping, text.unpadded_vocab_size,
+                        )
                     ),
                     tap_buf,
                 )
@@ -1379,11 +2075,11 @@ class BatchDecoder:
             else:
                 with _RowsMode():
                     logits = lm(h)
-            return RH.softcap_argmax_rows(logits, text.final_logit_softcapping, text.unpadded_vocab_size), tap_buf
+            return self._with_stage_deps(RH.softcap_argmax_rows(logits, text.final_logit_softcapping, text.unpadded_vocab_size)), tap_buf
         else:
             logits = self._project_logits_softcap(h)
         lp = logits - mx.logsumexp(logits, keepdims=True)
-        return mx.argmax(lp, axis=-1), tap_buf
+        return self._with_stage_deps(mx.argmax(lp, axis=-1)), tap_buf
 
     @staticmethod
     def _regime_key(s_min: int, s_max: int):
@@ -1608,8 +2304,9 @@ class BatchDecoder:
         """Non-mutating causal W-token verify using GPU `meta_arr` and `tau_table`, without mid-async_eval."""
         assert self._b1_fast and self._kv_stacked
         tm = self.tm
+        num_passes = tm.args.loop_config["num_passes"]
         assert not (tm.loopcd.enabled_for(num_passes) and tm.loopcd.mode != "hidden")
-        assert tm.args.loop_config["num_passes"] == 1 and self.nv == 24
+        assert self.nv == len(tm.layer_visits) and ((num_passes == 1 and self.nv == 24) or num_passes > 1)
         W = int(tokens.shape[0])
         assert 2 <= W <= 8
         use_walk = par_arr is not None and dr_pos is not None
@@ -1623,25 +2320,86 @@ class BatchDecoder:
         )
         layers_seq = tm.layer_visits
         tau_size = max(4096, ((int(tau_cap) + 4095) // 4096) * 4096)
-        (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
-            W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-            use_tau_table=True, tau_size=tau_size, use_walk=use_walk, use_stage=use_stage, use_dyn=use_dyn,
-        )
         conv_flat = [x for cs in self.conv for x in cs]
-        ttbl0 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs0]
-        ttbl1 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs1]
-        ttbl2 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs2]
         kst_r = self._kv_ring_st if use_stage else []
         kst_f = self._kv_full_st if use_stage else []
         wa_in = [w_act] if use_dyn else []
 
-        o0 = fn0(tokens, [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl0, wa_in, [], *conv_flat[:24])
-        o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl1, wa_in, [], *conv_flat[24:56])
-        o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl2, wa_in, [tokens, par_arr, dr_pos] if use_walk else [], *conv_flat[56:])
-        return self._unpack_cw_outputs(
-            o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None,
-            use_walk=use_walk, use_stage=use_stage,
+        if num_passes == 1 and self.nv == 24:
+            (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
+                W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
+                use_tau_table=True, tau_size=tau_size, use_walk=use_walk, use_stage=use_stage, use_dyn=use_dyn,
+            )
+            ttbl0 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs0]
+            ttbl1 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs1]
+            ttbl2 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs2]
+
+            o0 = fn0(tokens, [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl0, wa_in, [], *conv_flat[:24])
+            o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl1, wa_in, [], *conv_flat[24:56])
+            o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl2, wa_in, [tokens, par_arr, dr_pos] if use_walk else [], *conv_flat[56:])
+            return self._unpack_cw_outputs(
+                o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None,
+                use_walk=use_walk, use_stage=use_stage,
+            )
+
+        chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
+            W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
+            use_tau_table=True, tau_size=tau_size, use_walk=use_walk, use_stage=use_stage, use_dyn=use_dyn,
         )
+        outs_all = []
+        fn0, v0, v1, nbs_pre, fvs0, tks0 = chunks[0]
+        ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in fvs0]
+        o_pre = fn0(
+            tokens, [], [], [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
+            depths_arr, meta_r, meta_f, ttbl, wa_in, [], *conv_flat[4 * v0 : 4 * v1],
+        )
+        outs_all.append((o_pre, v1 - v0, 1 + nbs_pre, tks0))
+        h_pre = o_pre[0]
+        bs_pre = o_pre[1 : 1 + nbs_pre]
+        o_prev = o_pre
+        ref_o = None
+        for p in range(num_passes):
+            fn_p, pv0, pv1, nbs_p, pfvs, ptks = chunks[1 + p]
+            ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in pfvs]
+            if p == 0:
+                o_p = fn_p(
+                    h_pre, bs_pre, [], [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
+                    depths_arr, meta_r, meta_f, ttbl, wa_in, [], *conv_flat[4 * pv0 : 4 * pv1],
+                )
+            else:
+                o_p = fn_p(
+                    o_prev[0], o_prev[1 : 1 + n_bs_core], h_pre, bs_pre,
+                    self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
+                    depths_arr, meta_r, meta_f, ttbl, wa_in, [], *conv_flat[4 * pv0 : 4 * pv1],
+                )
+            outs_all.append((o_p, pv1 - pv0, 1 + nbs_p, ptks))
+            o_prev = o_p
+            if cd_on and p == ref_pass:
+                ref_o = o_p
+        fn_c, cv0, cv1, _, cfvs, ctks = chunks[-1]
+        ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in cfvs]
+        h_aux = ref_o[0] if cd_on else []
+        bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
+        head_c = (12 if use_stage else 11) if use_walk else 1
+        o_c = fn_c(
+            o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
+            self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
+            depths_arr, meta_r, meta_f, ttbl, wa_in, [tokens, par_arr, dr_pos] if use_walk else [],
+            *conv_flat[4 * cv0 : 4 * cv1],
+        )
+        outs_all.append((o_c, cv1 - cv0, head_c, ctks))
+        kv_news, conv_ws = [], []
+        tap_buf = {} if tap_visits is not None else None
+        for out_i, nvi, head_i, tksi in outs_all:
+            ncw = 4 * nvi
+            kv_news.extend(out_i[head_i : head_i + nvi])
+            conv_ws.extend(out_i[head_i + nvi : head_i + nvi + ncw])
+            if tap_buf is not None:
+                for k, arr in zip(tksi, out_i[head_i + nvi + ncw :]):
+                    tap_buf[k] = arr
+        conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
+        ret = tuple(o_c[:head_c]) if use_walk else o_c[0]
+        return ret, kv_news, conv_ws, tap_buf
 
     def _get_cw_compiled_loop(
         self, W, max_depth, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, tap_tuple,
@@ -1779,6 +2537,14 @@ class BatchDecoder:
                             taps_out.append(h_out)
                         lm = m.lm_head
                         text = m.args.text
+                        if use_walk and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
+                            w_blk, w_par, w_dr_pos = walk_in
+                            nt_or_walk = list(RQ.qmv_softcap_argmax_walk_rows(
+                                h_out, lm["weight"], lm["scales"], lm["biases"],
+                                w_blk, w_par, m_r, m_f, w_dr_pos,
+                                text.final_logit_softcapping, text.unpadded_vocab_size, w_act=wa,
+                            ))
+                            return nt_or_walk + kvns + cws + taps_out
                         if "head" in _FUSED and "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
                             nt = RQ.qmv_softcap_argmax_rows(
                                 h_out, lm["weight"], lm["scales"], lm["biases"],
@@ -1787,6 +2553,10 @@ class BatchDecoder:
                         else:
                             lg = RQ.qmv_rows(h_out, lm["weight"], lm["scales"], lm["biases"])
                             nt = RH.softcap_argmax_rows(lg, text.final_logit_softcapping, text.unpadded_vocab_size)
+                        if use_walk:
+                            from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
+                            w_blk, w_par, w_dr_pos = walk_in
+                            return list(tree_walk_commit_meta_gpu(nt, w_blk, w_par, m_r, m_f, w_dr_pos, W, w_act=wa)) + kvns + cws + taps_out
                         return [nt] + kvns + cws + taps_out
                     return [h] + (list(bs) if bs is not None else []) + kvns + cws + taps_out
                 finally:
@@ -2250,6 +3020,34 @@ class BatchDecoder:
             z_R, z_ref = self._pair_logits_softcap(h_R, h_ref)
             return self._with_stage_deps(loopcd.combine_logits(z_R, z_ref, self.tm.loopcd))
         return self._with_stage_deps(self._project_logits_softcap(h))
+
+    def logprobs(self, h, *, argmax: bool = False):
+        """Return exact per-row logprobs (C, V) f32, or (toks (C,) u32, logprobs (C, V) f32) when argmax=True."""
+        h_R, h_ref = h if isinstance(h, tuple) else (h, None)
+        if h_ref is None:
+            m = self.model
+            lm = m.lm_head
+            text = m.args.text
+            softcap = text.final_logit_softcapping
+            unpadded = text.unpadded_vocab_size
+            if (
+                "head" not in _PLAIN
+                and (self._b1_fast or self._batch_fast or "qmv" in _USE)
+                and 1 <= self.C <= RQ.MAX_B
+                and FD._is_aff8(lm)
+                and h_R.dtype == mx.bfloat16
+            ):
+                raw_bf16 = RQ.qmv_rows(h_R.reshape(self.C, 2304), lm["weight"], lm["scales"], lm["biases"])
+                out = RH.softcap_logprobs_rows(raw_bf16, softcap, unpadded, argmax=argmax)
+                if argmax:
+                    toks, lp = out
+                    return self._with_stage_deps(toks), lp
+                return self._with_stage_deps(out)
+        z = self.logits((h_R, h_ref))
+        lp = z - mx.logsumexp(z, axis=-1, keepdims=True)
+        if argmax:
+            return mx.argmax(lp, axis=-1), lp
+        return lp
 
     def step(self, tokens):
         h, h_ref = self._hidden_pair(tokens)

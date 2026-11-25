@@ -842,8 +842,7 @@ def mtp_exact_generate_step(
 
         use_pipe_ahead = (
             os.environ.get("LOOPLING_MTP_PIPE_AHEAD", "1") not in ("0", "")
-            and passes == 1
-            and dec.nv == 24
+            and ((passes == 1 and dec.nv == 24) or passes > 1)
             and os.environ.get("LOOPLING_COMPILE_VERIFY", "1") not in ("0", "")
         )
         use_stage = use_pipe_ahead and os.environ.get("LOOPLING_KV_STAGE", "0") not in ("0", "")
@@ -878,27 +877,32 @@ def mtp_exact_generate_step(
             assert 2 <= W_MAX <= 6
             D_DYN = int(os.environ.get("LOOPLING_MTP_DYN_D", str(min(3, W_MAX - 1))))
             assert 1 <= D_DYN <= min(5, B - 1)
-            PA_DEPTH = max(1, min(3, int(os.environ.get("LOOPLING_MTP_PA", "3"))))
+            default_pa = "2" if passes > 1 else "3"
+            PA_DEPTH = max(1, min(3, int(os.environ.get("LOOPLING_MTP_PA", default_pa))))
 
             costs_env = os.environ.get("LOOPLING_MTP_DYN_COSTS")
             if costs_env:
                 vals = [float(x) for x in costs_env.split(",")]
                 if len(vals) == W_MAX - 1:
-                    costs = [0.0, 4.88] + vals
+                    costs = [0.0, 4.88 * fscale] + vals
                 elif len(vals) == W_MAX:
                     costs = [0.0] + vals
                 else:
                     raise ValueError(f"Expected {W_MAX - 1} or {W_MAX} costs, got {len(vals)}")
             else:
-                base_costs = [0.0, 4.88, 7.88, 8.48, 9.38, 10.30, 11.20]
-                costs = base_costs[: W_MAX + 1]
+                if passes == 3:
+                    base_costs = [0.0, 9.60, 13.60, 15.40, 17.60, 18.70, 20.20]
+                    costs = base_costs[: W_MAX + 1]
+                else:
+                    base_costs = [0.0, 4.88, 7.88, 8.48, 9.38, 10.30, 11.20]
+                    costs = [c * fscale for c in base_costs[: W_MAX + 1]]
             cost_arr = mx.array(costs, mx.float32)
 
             cal_scale = float(os.environ.get("LOOPLING_MTP_DYN_CAL", "1.25"))
             force_dyn_w = int(os.environ.get("LOOPLING_MTP_DYN_FORCE_W", "0"))
             dink_cfg = mx.array([cal_scale, float(force_dyn_w)], mx.float32)
 
-            w1_ms = float(os.environ.get("LOOPLING_MTP_W1_MS", "4.88"))
+            w1_ms = float(os.environ.get("LOOPLING_MTP_W1_MS", str(4.88 * fscale)))
             rate_w1_dyn = 1.0 / w1_ms
             alpha_dyn = float(os.environ.get("LOOPLING_MTP_DYN_ALPHA", "0.08"))
             min_tree_dyn = int(os.environ.get("LOOPLING_MTP_DYN_MIN_CYC", "20"))

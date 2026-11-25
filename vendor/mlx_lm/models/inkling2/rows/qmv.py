@@ -41,7 +41,7 @@ _TILE_SRC = r"""
 // One tile (NSG simdgroups x RPS rows) for RB input rows starting at row b0; mirrors qmv_fast_impl<bfloat16_t, 64, 8, PR>
 // (per output row: same per-lane K partition, same accumulation order, same simd_sum), with RPS and the row group RB free.
 // STG (prologue kernels only): the x block is computed once per threadgroup into threadgroup memory sx (double buffered).
-template <int B, int K, bool PR, int RPS, int NSG, int RB, int STG>
+template <int B, int K, bool PR, int RPS, int NSG, int RB, int STG, bool PACKW = @PACKW_DEF@>
 METAL_FUNC void rows_qmv_tile(
     const device uint32_t* w,
     const device bfloat16_t* scales,
@@ -103,42 +103,84 @@ METAL_FUNC void rows_qmv_tile(
 
   static_assert(values_per_thread == 8, "wreg uint2 expects values_per_thread == 8");
   for (int k = 0; k < K; k += block_size) {
-    thread float4 w0[RPS];
-    thread float4 w1[RPS];
-    thread U sc[RPS];
-    thread U bi[RPS];
-    if (active) {
-      _Pragma("clang loop unroll(full)")
-      for (int row = 0; row < RPS; row++) {
-        int src = row;
-        if (PR) src = min(row, last_row);
-        uint2 wr = ((const device uint2*)(ws + src * in_vec_size_w))[0];
-        w0[row] = float4(as_type<uchar4>(wr.x));
-        w1[row] = float4(as_type<uchar4>(wr.y));
-        sc[row] = scales[src * in_vec_size_g];
-        bi[row] = biases[src * in_vec_size_g];
+    if constexpr (PACKW) {
+      thread uint2 wr_r[RPS];
+      thread bfloat16_t sc_bf[RPS];
+      thread bfloat16_t bi_bf[RPS];
+      if (active) {
+        _Pragma("clang loop unroll(full)")
+        for (int row = 0; row < RPS; row++) {
+          int src = row;
+          if (PR) src = min(row, last_row);
+          wr_r[row] = ((const device uint2*)(ws + src * in_vec_size_w))[0];
+          sc_bf[row] = scales[src * in_vec_size_g];
+          bi_bf[row] = biases[src * in_vec_size_g];
+        }
       }
-    }
-    //@STG_FILL@
-    _Pragma("clang loop unroll(full)")
-    for (int b = 0; b < RB; b++) {
-      if (FULL || b < nb) {
-        thread U xtb[values_per_thread];
-        U smb;
-        //@XLOAD@
-        if (active) {
-          _Pragma("clang loop unroll(full)")
-          for (int row = 0; row < RPS; row++) {
-            U accum = 0;
-            accum += xtb[0] * w0[row].x;
-            accum += xtb[1] * w0[row].y;
-            accum += xtb[2] * w0[row].z;
-            accum += xtb[3] * w0[row].w;
-            accum += xtb[4] * w1[row].x;
-            accum += xtb[5] * w1[row].y;
-            accum += xtb[6] * w1[row].z;
-            accum += xtb[7] * w1[row].w;
-            result[b][row] += sc[row] * accum + smb * bi[row];
+      //@STG_FILL@
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < RB; b++) {
+        if (FULL || b < nb) {
+          thread U xtb[values_per_thread];
+          U smb;
+          //@XLOAD@
+          if (active) {
+            _Pragma("clang loop unroll(full)")
+            for (int row = 0; row < RPS; row++) {
+              float4 w0 = float4(as_type<uchar4>(wr_r[row].x));
+              float4 w1 = float4(as_type<uchar4>(wr_r[row].y));
+              U accum = 0;
+              accum += xtb[0] * w0.x;
+              accum += xtb[1] * w0.y;
+              accum += xtb[2] * w0.z;
+              accum += xtb[3] * w0.w;
+              accum += xtb[4] * w1.x;
+              accum += xtb[5] * w1.y;
+              accum += xtb[6] * w1.z;
+              accum += xtb[7] * w1.w;
+              result[b][row] += static_cast<U>(sc_bf[row]) * accum + smb * static_cast<U>(bi_bf[row]);
+            }
+          }
+        }
+      }
+    } else {
+      thread float4 w0[RPS];
+      thread float4 w1[RPS];
+      thread U sc[RPS];
+      thread U bi[RPS];
+      if (active) {
+        _Pragma("clang loop unroll(full)")
+        for (int row = 0; row < RPS; row++) {
+          int src = row;
+          if (PR) src = min(row, last_row);
+          uint2 wr = ((const device uint2*)(ws + src * in_vec_size_w))[0];
+          w0[row] = float4(as_type<uchar4>(wr.x));
+          w1[row] = float4(as_type<uchar4>(wr.y));
+          sc[row] = scales[src * in_vec_size_g];
+          bi[row] = biases[src * in_vec_size_g];
+        }
+      }
+      //@STG_FILL@
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < RB; b++) {
+        if (FULL || b < nb) {
+          thread U xtb[values_per_thread];
+          U smb;
+          //@XLOAD@
+          if (active) {
+            _Pragma("clang loop unroll(full)")
+            for (int row = 0; row < RPS; row++) {
+              U accum = 0;
+              accum += xtb[0] * w0[row].x;
+              accum += xtb[1] * w0[row].y;
+              accum += xtb[2] * w0[row].z;
+              accum += xtb[3] * w0[row].w;
+              accum += xtb[4] * w1[row].x;
+              accum += xtb[5] * w1[row].y;
+              accum += xtb[6] * w1[row].z;
+              accum += xtb[7] * w1[row].w;
+              result[b][row] += sc[row] * accum + smb * bi[row];
+            }
           }
         }
       }
@@ -165,7 +207,7 @@ METAL_FUNC void rows_qmv_tile(
 """
 
 _ROUT_TILE_SRC = r"""
-template <int B, int K, bool PR, int RPS, int NSG, int RB>
+template <int B, int K, bool PR, int RPS, int NSG, int RB, bool STG_X = false, bool PACKX = @PACKX_DEF@>
 METAL_FUNC void rows_qmv_rout(
     const device uint32_t* w,
     const device bfloat16_t* scales,
@@ -180,7 +222,7 @@ METAL_FUNC void rows_qmv_rout(
     const uint simd_lid,
     threadgroup bfloat16_t* sx) {
   (void)gt;
-  (void)sx;
+  if (!STG_X) (void)sx;
   constexpr int group_size = 64;
   constexpr int bits = 8;
   constexpr int packs_per_thread = 2;
@@ -203,67 +245,163 @@ METAL_FUNC void rows_qmv_rout(
 
   const int in_vec_size_w = K * bytes_per_pack / pack_factor;
   const int in_vec_size_g = K / group_size;
-  const int out_row = ty * (NSG * RPS) + simd_gid * RPS;
+  const int out_row = int(ty) * (NSG * RPS) + int(simd_gid) * RPS;
 
+  bool active = true;
   int last_row = RPS - 1;
   if (PR) {
-    if (out_row >= N) return;
-    last_row = min(last_row, N - 1 - out_row);
+    if (out_row >= N) {
+      active = false;
+      if (!STG_X) return;
+    } else {
+      last_row = min(last_row, N - 1 - out_row);
+    }
   }
 
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += b0 * K + simd_lid * values_per_thread;
-  y += b0 * N + out_row;
+  if (active) {
+    ws += size_t(out_row) * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    scales += size_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+    biases += size_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  }
+  x += size_t(b0) * K + simd_lid * values_per_thread;
+  y += size_t(b0) * N + out_row;
+  threadgroup float* smb_s = (threadgroup float*)(sx + RB * block_size);
 
   for (int k = 0; k < K; k += block_size) {
-    thread U xtb[RB][8];
-    thread U smb[RB];
-    _Pragma("clang loop unroll(full)")
-    for (int b = 0; b < RB; b++) {
-      if (FULL || b < nb) {
-        smb[b] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + b * K, xtb[b]);
+    if constexpr (STG_X) {
+      for (int b = (int)simd_gid; b < nb; b += NSG) {
+        threadgroup uint4* dst_s = (threadgroup uint4*)(sx + b * block_size) + simd_lid;
+        dst_s[0] = ((const device uint4*)(x + size_t(b) * K))[0];
+        thread U xtmp[8];
+        smb_s[b * 32 + simd_lid] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + size_t(b) * K, xtmp);
       }
-    }
-    _Pragma("clang loop unroll(full)")
-    for (int row = 0; row < RPS; row++) {
-      int src = row;
-      if (PR) src = min(row, last_row);
-      uint2 wr = ((const device uint2*)(ws + src * in_vec_size_w))[0];
-      U sc = scales[src * in_vec_size_g];
-      U bi = biases[src * in_vec_size_g];
-      float4 w0 = float4(as_type<uchar4>(wr.x));
-      float4 w1 = float4(as_type<uchar4>(wr.y));
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (active) {
+        _Pragma("clang loop unroll(full)")
+        for (int row = 0; row < RPS; row++) {
+          int src = row;
+          if (PR) src = min(row, last_row);
+          uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+          U sc = scales[size_t(src) * in_vec_size_g];
+          U bi = biases[size_t(src) * in_vec_size_g];
+          float4 w0 = float4(as_type<uchar4>(wr.x));
+          float4 w1 = float4(as_type<uchar4>(wr.y));
+          _Pragma("clang loop unroll(full)")
+          for (int b = 0; b < RB; b++) {
+            if (FULL || b < nb) {
+              uint4 xpk = ((const threadgroup uint4*)(sx + b * block_size) + simd_lid)[0];
+              bfloat4 v0 = as_type<bfloat4>(xpk.xy);
+              bfloat4 v1 = as_type<bfloat4>(xpk.zw);
+              U smb = smb_s[b * 32 + simd_lid];
+              U accum = 0;
+              accum += static_cast<U>(v0.x) * w0.x;
+              accum += static_cast<U>(v0.y) * w0.y;
+              accum += static_cast<U>(v0.z) * w0.z;
+              accum += static_cast<U>(v0.w) * w0.w;
+              accum += static_cast<U>(v1.x) * w1.x;
+              accum += static_cast<U>(v1.y) * w1.y;
+              accum += static_cast<U>(v1.z) * w1.z;
+              accum += static_cast<U>(v1.w) * w1.w;
+              result[b][row] += sc * accum + smb * bi;
+            }
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if constexpr (PACKX) {
+      thread uint4 xpk[RB];
+      thread U smb[RB];
       _Pragma("clang loop unroll(full)")
       for (int b = 0; b < RB; b++) {
         if (FULL || b < nb) {
-          U accum = 0;
-          accum += xtb[b][0] * w0.x;
-          accum += xtb[b][1] * w0.y;
-          accum += xtb[b][2] * w0.z;
-          accum += xtb[b][3] * w0.w;
-          accum += xtb[b][4] * w1.x;
-          accum += xtb[b][5] * w1.y;
-          accum += xtb[b][6] * w1.z;
-          accum += xtb[b][7] * w1.w;
-          result[b][row] += sc * accum + smb[b] * bi;
+          uint4 xp = ((const device uint4*)(x + size_t(b) * K))[0];
+          xpk[b] = xp;
+          bfloat4 v0 = as_type<bfloat4>(xp.xy);
+          bfloat4 v1 = as_type<bfloat4>(xp.zw);
+          U s = 0;
+          s += static_cast<U>(v0.x); s += static_cast<U>(v0.y); s += static_cast<U>(v0.z); s += static_cast<U>(v0.w);
+          s += static_cast<U>(v1.x); s += static_cast<U>(v1.y); s += static_cast<U>(v1.z); s += static_cast<U>(v1.w);
+          smb[b] = s;
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int row = 0; row < RPS; row++) {
+        int src = row;
+        if (PR) src = min(row, last_row);
+        uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+        U sc = scales[size_t(src) * in_vec_size_g];
+        U bi = biases[size_t(src) * in_vec_size_g];
+        float4 w0 = float4(as_type<uchar4>(wr.x));
+        float4 w1 = float4(as_type<uchar4>(wr.y));
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < RB; b++) {
+          if (FULL || b < nb) {
+            bfloat4 v0 = as_type<bfloat4>(xpk[b].xy);
+            bfloat4 v1 = as_type<bfloat4>(xpk[b].zw);
+            U accum = 0;
+            accum += static_cast<U>(v0.x) * w0.x;
+            accum += static_cast<U>(v0.y) * w0.y;
+            accum += static_cast<U>(v0.z) * w0.z;
+            accum += static_cast<U>(v0.w) * w0.w;
+            accum += static_cast<U>(v1.x) * w1.x;
+            accum += static_cast<U>(v1.y) * w1.y;
+            accum += static_cast<U>(v1.z) * w1.z;
+            accum += static_cast<U>(v1.w) * w1.w;
+            result[b][row] += sc * accum + smb[b] * bi;
+          }
+        }
+      }
+    } else {
+      thread U xtb[RB][8];
+      thread U smb[RB];
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < RB; b++) {
+        if (FULL || b < nb) {
+          smb[b] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + size_t(b) * K, xtb[b]);
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int row = 0; row < RPS; row++) {
+        int src = row;
+        if (PR) src = min(row, last_row);
+        uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+        U sc = scales[size_t(src) * in_vec_size_g];
+        U bi = biases[size_t(src) * in_vec_size_g];
+        float4 w0 = float4(as_type<uchar4>(wr.x));
+        float4 w1 = float4(as_type<uchar4>(wr.y));
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < RB; b++) {
+          if (FULL || b < nb) {
+            U accum = 0;
+            accum += xtb[b][0] * w0.x;
+            accum += xtb[b][1] * w0.y;
+            accum += xtb[b][2] * w0.z;
+            accum += xtb[b][3] * w0.w;
+            accum += xtb[b][4] * w1.x;
+            accum += xtb[b][5] * w1.y;
+            accum += xtb[b][6] * w1.z;
+            accum += xtb[b][7] * w1.w;
+            result[b][row] += sc * accum + smb[b] * bi;
+          }
         }
       }
     }
-    ws += block_size * bytes_per_pack / pack_factor;
-    scales += block_size / group_size;
-    biases += block_size / group_size;
+    if (active) {
+      ws += block_size * bytes_per_pack / pack_factor;
+      scales += block_size / group_size;
+      biases += block_size / group_size;
+    }
     x += block_size;
   }
 
+  if (STG_X && !active) return;
   _Pragma("clang loop unroll(full)")
   for (int b = 0; b < RB; b++) {
     _Pragma("clang loop unroll(full)")
     for (int row = 0; row < RPS; row++) {
       U r = simd_sum(result[b][row]);
       if (simd_lid == 0 && row <= last_row && (FULL || b < nb)) {
-        y[b * N + row] = static_cast<bfloat16_t>(r);
+        y[size_t(b) * N + row] = static_cast<bfloat16_t>(r);
       }
     }
   }
@@ -373,16 +511,28 @@ METAL_FUNC void rows_qmv_ro(
 }
 """
 
-_XLOAD_PLAIN = "smb = load_vector<bfloat16_t, U, values_per_thread, bits>(x + b * K, xtb);"
+_XLOAD_PLAIN = (
+    "uint4 xpk = ((const device uint4*)(x + size_t(b) * K))[0]; "
+    "bfloat4 xv0 = as_type<bfloat4>(xpk.xy); bfloat4 xv1 = as_type<bfloat4>(xpk.zw); "
+    "xtb[0] = static_cast<U>(xv0.x); xtb[1] = static_cast<U>(xv0.y); xtb[2] = static_cast<U>(xv0.z); xtb[3] = static_cast<U>(xv0.w); "
+    "xtb[4] = static_cast<U>(xv1.x); xtb[5] = static_cast<U>(xv1.y); xtb[6] = static_cast<U>(xv1.z); xtb[7] = static_cast<U>(xv1.w); "
+    "smb = 0; smb += xtb[0]; smb += xtb[1]; smb += xtb[2]; smb += xtb[3]; smb += xtb[4]; smb += xtb[5]; smb += xtb[6]; smb += xtb[7];"
+)
 
 
 def tile_source(xload=_XLOAD_PLAIN, stg_fill="", include_rout=False, include_ro=False):
     """The tile text; `xload` computes smb and xtb[*] for row b of the current block (x, gt point at this lane's slice of
     block k, row 0), `stg_fill` runs once per block before the x loads (cooperative staging)."""
-    assert _TILE_SRC.count("//@XLOAD@") == 1 and _TILE_SRC.count("//@STG_FILL@") == 1
-    src = _TILE_SRC.replace("//@XLOAD@", xload).replace("//@STG_FILL@", stg_fill)
+    assert _TILE_SRC.count("//@XLOAD@") == 2 and _TILE_SRC.count("//@STG_FILL@") == 2
+    packw = "true" if os.environ.get("LOOPLING_QMV_PACKW", "1") not in ("0", "") else "false"
+    packx = "true" if os.environ.get("LOOPLING_QMV_PACKX", "1") not in ("0", "") else "false"
+    src = (
+        _TILE_SRC.replace("@PACKW_DEF@", packw)
+        .replace("//@XLOAD@", xload)
+        .replace("//@STG_FILL@", stg_fill)
+    )
     if include_rout:
-        src += _ROUT_TILE_SRC
+        src += _ROUT_TILE_SRC.replace("@PACKX_DEF@", packx)
     if include_ro:
         src += _RO_TILE_SRC
     return src
@@ -400,11 +550,11 @@ _CFG_DEFAULT = (4, 2, 4, 0)
 _CFG_TABLE = {
     0: {  # N <= 4096 (e.g. o_proj N=2304)
         1: (1, 1, 2, 1), 2: (0, 1, 2, 2), 3: (1, 2, 4, 3), 4: (1, 4, 4, 4),
-        5: (0, 2, 4, 5), 6: (1, 2, 4, 6), 7: (1, 2, 4, 7), 8: (0, 4, 4, 4),
+        5: (0, 2, 4, 5), 6: (1, 2, 4, 6), 7: (1, 2, 4, 7), 8: (1, 4, 2, 4),
     },
     1: {  # 4096 < N < 16384 (e.g. QKV concat)
-        1: (1, 1, 2, 1), 2: (2, 2, 4, 2), 3: (2, 2, 4, 3), 4: (2, 4, 2, 4),
-        5: (2, 2, 4, 5), 6: (1, 2, 2, 6), 7: (1, 2, 2, 7), 8: (0, 4, 2, 8),
+        1: (1, 4, 2, 1), 2: (2, 2, 4, 2), 3: (2, 2, 4, 3), 4: (2, 4, 2, 4),
+        5: (2, 2, 4, 5), 6: (1, 2, 2, 6), 7: (1, 2, 2, 7), 8: (1, 4, 2, 4),
     },
     2: {  # N >= 16384 (e.g. lm_head)
         1: (1, 1, 2, 1), 2: (0, 1, 4, 2), 3: (0, 4, 2, 3), 4: (1, 2, 4, 4),
@@ -417,6 +567,10 @@ def _cfg_bucket(B, tot_n, nw, pro):
     if pro or B > 8 or (tot_n >= 16384 and nw != 1):
         return None
     bkt = 2 if tot_n >= 16384 else (1 if tot_n > 4096 else 0)
+    ov = os.environ.get(f"LOOPLING_QMV_BKT{bkt}")
+    if ov:
+        v = [int(t) for t in ov.split(",")]
+        return (v[0], v[1], v[2], min(v[3], B))
     return _CFG_TABLE[bkt].get(B)
 
 
@@ -450,6 +604,15 @@ def _use_ro(B, tot_n, pro=False, rout=False):
     if ent is not None and not os.environ.get("LOOPLING_QMV_ROUT"):
         return ent[0] == 2
     return B <= 6 and tot_n < 16384
+
+
+def _use_stg_x(B, tot_n, rout, pro=False):
+    if pro or not rout:
+        return False
+    ov = os.environ.get("LOOPLING_QMV_STG_X")
+    if ov is not None:
+        return ov not in ("0", "", "false", "False") and B >= 2
+    return False
 
 
 def _cfg(B, pro=False, N=0, rout=False, ro=False):
@@ -509,8 +672,9 @@ def _header():
 _kernels = {}
 
 
-def _kernel(nw, rout=False, ro=False):
-    key = (nw, rout, ro)
+def _kernel(nw, rout=False, ro=False, stg_x=False):
+    stg_x = bool(stg_x and rout and not ro)
+    key = (nw, rout, ro, stg_x)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -518,14 +682,19 @@ def _kernel(nw, rout=False, ro=False):
     for i in range(nw):
         ins += [f"w{i}", f"s{i}", f"b{i}"]
     outs = [f"y{i}" for i in range(nw)]
-    lines = [
+    lines = []
+    if stg_x:
+        lines.append("threadgroup uint32_t sx_raw[RB * 160]; threadgroup bfloat16_t* sx = (threadgroup bfloat16_t*)sx_raw;")
+    else:
+        lines.append("threadgroup bfloat16_t* sx = (threadgroup bfloat16_t*)0;")
+    lines += [
         "uint ty = threadgroup_position_in_grid.y;",
         "uint rb0 = threadgroup_position_in_grid.z * RB;",
         "uint sg = simdgroup_index_in_threadgroup;",
         "uint sl = thread_index_in_simdgroup;",
     ]
     fn = "rows_qmv_ro" if ro else ("rows_qmv_rout" if rout else "rows_qmv_tile")
-    tail_t = "" if (rout or ro) else ", 0"
+    tail_t = (", true" if stg_x else "") if rout else ("" if ro else ", 0")
     prev = "0"
     for i in range(nw):
         end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
@@ -537,10 +706,10 @@ def _kernel(nw, rout=False, ro=False):
         head = f"{pre} ({cond})" if cond != "true" or i == 0 else "else"
         lines.append(
             f"{head} {{ {fn}<B, K, (N{i} % (RPS * NSG)) != 0, RPS, NSG, RB{tail_t}>"
-            f"(w{i}, s{i}, b{i}, x, x, y{i}, N{i}, ty - ({prev}), rb0, sg, sl, (threadgroup bfloat16_t*)0); }}"
+            f"(w{i}, s{i}, b{i}, x, x, y{i}, N{i}, ty - ({prev}), rb0, sg, sl, sx); }}"
         )
         prev = end
-    suf = "_ro" if ro else ("_rout" if rout else "")
+    suf = ("_rout_sx" if stg_x else "_rout") if rout else ("_ro" if ro else "")
     k = mx.fast.metal_kernel(
         name=f"rows_qmv_aff8_gs64_n{nw}{suf}",
         input_names=ins,
@@ -571,6 +740,7 @@ def qmv_rows_multi(x, weights, group_size=64, bits=8):
     tot_n = sum(w.shape[0] for w, _, _ in weights)
     rout = _use_rout(B, tot_n, nw, pro=False)
     ro = _use_ro(B, tot_n, pro=False, rout=rout)
+    stg_x = _use_stg_x(B, tot_n, rout, pro=False)
     rps, nsg, rb, _ = _cfg(B, N=tot_n, rout=rout, ro=ro)
     tmpl = [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb)]
     shapes = []
@@ -583,7 +753,7 @@ def qmv_rows_multi(x, weights, group_size=64, bits=8):
         tmpl.append((f"N{i}", N))
         shapes.append((B, N))
         tiles += (N + rps * nsg - 1) // (rps * nsg)
-    return _kernel(nw, rout=rout, ro=ro)(
+    return _kernel(nw, rout=rout, ro=ro, stg_x=stg_x)(
         inputs=args,
         template=tmpl,
         grid=(32, nsg * tiles, (B + rb - 1) // rb),
@@ -694,12 +864,19 @@ _ARG_P1_SRC = r"""
           }
         }
       } else if (MODE == 1) {
-        thread U xtb[RB][8];
+        thread uint4 xpk[RB];
         thread U smb[RB];
         _Pragma("clang loop unroll(full)")
         for (int b = 0; b < RB; b++) {
           if (FULL || b < nb) {
-            smb[b] = load_vector<bfloat16_t, U, values_per_thread, bits>(xp + size_t(b) * K, xtb[b]);
+            uint4 x4 = ((const device uint4*)(xp + size_t(b) * K))[0];
+            xpk[b] = x4;
+            bfloat4 v0 = as_type<bfloat4>(x4.xy);
+            bfloat4 v1 = as_type<bfloat4>(x4.zw);
+            U s = 0;
+            s += static_cast<U>(v0.x); s += static_cast<U>(v0.y); s += static_cast<U>(v0.z); s += static_cast<U>(v0.w);
+            s += static_cast<U>(v1.x); s += static_cast<U>(v1.y); s += static_cast<U>(v1.z); s += static_cast<U>(v1.w);
+            smb[b] = s;
           }
         }
         _Pragma("clang loop unroll(full)")
@@ -713,50 +890,57 @@ _ARG_P1_SRC = r"""
           _Pragma("clang loop unroll(full)")
           for (int b = 0; b < RB; b++) {
             if (FULL || b < nb) {
+              bfloat4 v0 = as_type<bfloat4>(xpk[b].xy);
+              bfloat4 v1 = as_type<bfloat4>(xpk[b].zw);
               U accum = 0;
-              accum += xtb[b][0] * w0.x;
-              accum += xtb[b][1] * w0.y;
-              accum += xtb[b][2] * w0.z;
-              accum += xtb[b][3] * w0.w;
-              accum += xtb[b][4] * w1.x;
-              accum += xtb[b][5] * w1.y;
-              accum += xtb[b][6] * w1.z;
-              accum += xtb[b][7] * w1.w;
+              accum += static_cast<U>(v0.x) * w0.x;
+              accum += static_cast<U>(v0.y) * w0.y;
+              accum += static_cast<U>(v0.z) * w0.z;
+              accum += static_cast<U>(v0.w) * w0.w;
+              accum += static_cast<U>(v1.x) * w1.x;
+              accum += static_cast<U>(v1.y) * w1.y;
+              accum += static_cast<U>(v1.z) * w1.z;
+              accum += static_cast<U>(v1.w) * w1.w;
               result[b][row] += sc * accum + smb[b] * bi;
             }
           }
         }
       } else {
-        thread float4 w0[RPS];
-        thread float4 w1[RPS];
-        thread U sc[RPS];
-        thread U bi[RPS];
+        thread uint2 wr_r[RPS];
+        thread bfloat16_t sc_bf[RPS];
+        thread bfloat16_t bi_bf[RPS];
         _Pragma("clang loop unroll(full)")
         for (int row = 0; row < RPS; row++) {
           int src = min(row, last_row);
-          uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
-          w0[row] = float4(as_type<uchar4>(wr.x));
-          w1[row] = float4(as_type<uchar4>(wr.y));
-          sc[row] = sc_p[size_t(src) * in_vec_size_g];
-          bi[row] = bi_p[size_t(src) * in_vec_size_g];
+          wr_r[row] = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+          sc_bf[row] = sc_p[size_t(src) * in_vec_size_g];
+          bi_bf[row] = bi_p[size_t(src) * in_vec_size_g];
         }
         _Pragma("clang loop unroll(full)")
         for (int b = 0; b < RB; b++) {
           if (FULL || b < nb) {
-            thread U xtb[values_per_thread];
-            U smb = load_vector<bfloat16_t, U, values_per_thread, bits>(xp + size_t(b) * K, xtb);
+            uint4 xpk = ((const device uint4*)(xp + size_t(b) * K))[0];
+            bfloat4 xv0 = as_type<bfloat4>(xpk.xy);
+            bfloat4 xv1 = as_type<bfloat4>(xpk.zw);
+            U xtb0 = static_cast<U>(xv0.x), xtb1 = static_cast<U>(xv0.y), xtb2 = static_cast<U>(xv0.z), xtb3 = static_cast<U>(xv0.w);
+            U xtb4 = static_cast<U>(xv1.x), xtb5 = static_cast<U>(xv1.y), xtb6 = static_cast<U>(xv1.z), xtb7 = static_cast<U>(xv1.w);
+            U smb = 0;
+            smb += xtb0; smb += xtb1; smb += xtb2; smb += xtb3;
+            smb += xtb4; smb += xtb5; smb += xtb6; smb += xtb7;
             _Pragma("clang loop unroll(full)")
             for (int row = 0; row < RPS; row++) {
+              float4 w0 = float4(as_type<uchar4>(wr_r[row].x));
+              float4 w1 = float4(as_type<uchar4>(wr_r[row].y));
               U accum = 0;
-              accum += xtb[0] * w0[row].x;
-              accum += xtb[1] * w0[row].y;
-              accum += xtb[2] * w0[row].z;
-              accum += xtb[3] * w0[row].w;
-              accum += xtb[4] * w1[row].x;
-              accum += xtb[5] * w1[row].y;
-              accum += xtb[6] * w1[row].z;
-              accum += xtb[7] * w1[row].w;
-              result[b][row] += sc[row] * accum + smb * bi[row];
+              accum += xtb0 * w0.x;
+              accum += xtb1 * w0.y;
+              accum += xtb2 * w0.z;
+              accum += xtb3 * w0.w;
+              accum += xtb4 * w1.x;
+              accum += xtb5 * w1.y;
+              accum += xtb6 * w1.z;
+              accum += xtb7 * w1.w;
+              result[b][row] += static_cast<U>(sc_bf[row]) * accum + smb * static_cast<U>(bi_bf[row]);
             }
           }
         }

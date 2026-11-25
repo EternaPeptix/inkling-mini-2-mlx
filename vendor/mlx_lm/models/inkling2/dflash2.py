@@ -17,6 +17,10 @@ import mlx.nn as nn
 
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2.rows import qmv as RQ
+from mlx_lm.models.inkling2.rows import qmv4 as RQ4
+
+_USE_QMV4 = os.environ.get("LOOPLING_DFLASH2_QMV4", "0") not in ("0", "", "false", "False")
+_LOOKUP_BYPASS_MIN = int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_BYPASS", "6"))
 
 DFLASH2_DIR = os.environ.get(
     "LOOPLING_DFLASH2_DIR",
@@ -25,7 +29,9 @@ DFLASH2_DIR = os.environ.get(
 _EPS = 1e-6
 
 
-def _quantize_if(w: mx.array, bits: int):
+def _quantize_if(w: mx.array, bits: int, *, fp16: bool = False):
+    if fp16:
+        w = w.astype(mx.float16)
     if bits == 4:
         return mx.quantize(w, group_size=64, bits=4, mode="affine")
     if bits == 8:
@@ -88,6 +94,17 @@ def _get_df_compiled(nh: int, nkv: int, hd: int, inter: int, qbits: int):
 
     def _dlin(x: mx.array, w) -> mx.array:
         if qbits:
+            if (
+                qbits == 4
+                and _USE_QMV4
+                and x.ndim == 2
+                and x.dtype == mx.bfloat16
+                and x.shape[0] <= 16
+                and x.shape[1] % 256 == 0
+                and x.shape[1] not in (64, 128)
+                and w[1].dtype == mx.bfloat16
+            ):
+                return RQ4.qmv4_rows(x, w[0], w[1], w[2])
             return mx.quantized_matmul(
                 x, w[0], scales=w[1], biases=w[2], transpose=True, group_size=64, bits=qbits, mode="affine"
             )
@@ -124,6 +141,32 @@ def _get_df_compiled(nh: int, nkv: int, hd: int, inter: int, qbits: int):
 
 
 @mx.compile
+def _selector_scores_from_top16(
+    top_idx: mx.array,
+    unary: mx.array,
+    sel_h: mx.array,
+    pred_cb: mx.array,
+    succ_cb: mx.array,
+    anchor_tok: mx.array,
+    softcap: float,
+):
+    """Bigram codebook scores from pre-extracted Top-16 `(top_idx (P, 16), unary (P, 16) f32)`."""
+    succ_vecs = succ_cb[top_idx].astype(mx.float32)  # (P, 16, R)
+
+    anc = anchor_tok.reshape(())
+    pred0 = pred_cb[anc].astype(mx.float32) * sel_h[0]  # (R,)
+    edge0 = succ_vecs[0] @ pred0  # (16,)
+    sum0 = unary[0] + edge0
+    sc0 = softcap * mx.tanh(sum0 / softcap) if softcap > 0.0 else sum0
+
+    pred_vecs = pred_cb[top_idx[:-1]].astype(mx.float32) * sel_h[1:, None, :]  # (P-1, 16, R)
+    edges = mx.matmul(pred_vecs, succ_vecs[1:].swapaxes(-1, -2))  # (P-1, 16, 16)
+    sums = unary[1:, None, :] + edges
+    sc16 = softcap * mx.tanh(sums / softcap) if softcap > 0.0 else sums
+    return top_idx, sc0, sc16
+
+
+@mx.compile
 def _selector_scores(
     raw_logits: mx.array,
     sel_h: mx.array,
@@ -135,20 +178,7 @@ def _selector_scores(
     """Top-16 candidates + bigram codebook scores for positions 0..n_pos-1 (Splash sampling.metal)."""
     top_idx = mx.argpartition(-raw_logits, 16, axis=-1)[:, :16]  # (P, 16)
     unary = mx.take_along_axis(raw_logits, top_idx, axis=-1).astype(mx.float32)  # (P, 16)
-    succ_vecs = succ_cb[top_idx].astype(mx.float32)  # (P, 16, R)
-
-    anc = anchor_tok.reshape(())
-    pred0 = pred_cb[anc].astype(mx.float32) * sel_h[0]  # (R,)
-    edge0 = succ_vecs[0] @ pred0  # (16,)
-    sum0 = unary[0] + edge0
-    sc0 = softcap * mx.tanh(sum0 / softcap) if softcap > 0.0 else sum0
-
-    # Conditional edges for positions 1..P-1 across all 16 predecessors x 16 successors
-    pred_vecs = pred_cb[top_idx[:-1]].astype(mx.float32) * sel_h[1:, None, :]  # (P-1, 16, R)
-    edges = mx.matmul(pred_vecs, succ_vecs[1:].swapaxes(-1, -2))  # (P-1, 16, 16)
-    sums = unary[1:, None, :] + edges
-    sc16 = softcap * mx.tanh(sums / softcap) if softcap > 0.0 else sums
-    return top_idx, sc0, sc16
+    return _selector_scores_from_top16(top_idx, unary, sel_h, pred_cb, succ_cb, anchor_tok, softcap)
 
 
 # ---------------------------------------------------------------------------------------------------- Splash LookupIndex
@@ -278,12 +308,12 @@ def _solve_linear(h: list[list[float]], g: list[float]) -> list[float]:
 class VerifyBudget:
     """Online-calibrated acceptance estimator (Splash runtime/model/VerifyBudget.cpp)."""
 
-    PRIOR_SLOPE = 0.85
-    PRIOR_INTERCEPTS = (0.20, 0.0, -0.10, -0.15, -0.20, -0.25, -0.25)
+    PRIOR_SLOPE = 0.80
+    PRIOR_INTERCEPTS = (0.0, -0.15, -0.25, -0.35, -0.40, -0.45, -0.50)
     SLOPE_PREC = 10.0
-    INTERCEPT_PREC = 2.0
-    MAX_LABELS = 4096
-    REFIT_CYCLES = 16
+    INTERCEPT_PREC = 1.5
+    MAX_LABELS = 256
+    REFIT_CYCLES = 4
 
     def __init__(self):
         self.slope = self.PRIOR_SLOPE
@@ -380,10 +410,10 @@ class MoEStepCosts:
     """2-point online MoE step cost model + AR fallback (Splash StepCosts / CostLine)."""
 
     def __init__(self, quant_bits: int):
-        self.t_ar = 10.2
-        self.t_draft = 2.8 if quant_bits else 5.5
-        self.t_v2 = 17.5
-        self.t_v8 = 23.8
+        self.t_ar = 9.9
+        self.t_draft = 1.7 if quant_bits else 5.5
+        self.t_v2 = 12.73
+        self.t_v8 = 23.14
         self._seeded_verify = False
         self.ar_cooldown = 0
         self.ar_backoff = 4
@@ -395,8 +425,8 @@ class MoEStepCosts:
             return
         if not self._seeded_verify:
             self.t_ar = ms
-            self.t_v2 = 1.72 * ms
-            self.t_v8 = 2.35 * ms
+            self.t_v2 = 1.28 * ms
+            self.t_v8 = 2.32 * ms
         else:
             self.t_ar = 0.8 * self.t_ar + 0.2 * ms
 
@@ -407,16 +437,15 @@ class MoEStepCosts:
     def observe_verify(self, width: int, ms: float, keep: int, draft_ms: float) -> None:
         if ms <= 0.0 or width < 2:
             return
+        u = max(0.0, min(1.0, (width - 2) / 6.0))
         if not self._seeded_verify:
             self._seeded_verify = True
-            if width >= 6:
-                self.t_v8 = ms
-                self.t_v2 = max(self.t_ar * 1.35, ms * 0.73)
-            else:
-                self.t_v2 = ms
-                self.t_v8 = ms * 1.35
+            # Preserve the empirical p3 MoE width slope while shifting the baseline to observed ms.
+            pred0 = self.t_v2 + u * (self.t_v8 - self.t_v2)
+            shift = max(-0.4 * pred0, min(0.4 * pred0, ms - pred0))
+            self.t_v2 = max(self.t_ar * 1.15, self.t_v2 + shift)
+            self.t_v8 = max(self.t_v2 + 3.0, self.t_v8 + shift)
         else:
-            u = max(0.0, min(1.0, (width - 2) / 6.0))
             pred = self.t_v2 + u * (self.t_v8 - self.t_v2)
             err = max(-0.5 * pred, min(0.5 * pred, ms - pred))
             lr = 0.25
@@ -487,6 +516,17 @@ class DFlash2Drafter:
         if quant_bits is None:
             quant_bits = int(os.environ.get("LOOPLING_DFLASH2_QUANT", "4"))
         self.qbits = quant_bits
+        self._fused = (
+            quant_bits == 4
+            and self.H == 2304
+            and self.hd == 128
+            and os.environ.get("LOOPLING_DFLASH2_FUSED", "1") not in ("0", "", "false", "False")
+        )
+        self._body_mode = os.environ.get("LOOPLING_DFLASH2_BODY_MODE", "qmm")
+        self._gu_block8 = self._fused and self._body_mode in ("mma1", "u2")
+        self._kv_dtype = mx.bfloat16
+        self._fwd_compiled: dict = {}
+        self._ctx_compiled: dict = {}
 
         w = mx.load(os.path.join(draft_dir, "model.safetensors"))
         self.fc = _quantize_if(w["fc.weight"], quant_bits)
@@ -507,7 +547,10 @@ class DFlash2Drafter:
             u_w = w[p + "mlp.up_proj.weight"]
             qkv_w = mx.concatenate([q_w, k_w, v_w], axis=0)
             kv_w = mx.concatenate([k_w, v_w], axis=0)
-            gu_w = mx.concatenate([g_w, u_w], axis=0)
+            if self._gu_block8:
+                gu_w = mx.stack([g_w.reshape(-1, 8, self.H), u_w.reshape(-1, 8, self.H)], axis=1).reshape(-1, self.H)
+            else:
+                gu_w = mx.concatenate([g_w, u_w], axis=0)
             lw = {
                 "in_ln": w[p + "input_layernorm.weight"],
                 "post_ln": w[p + "post_attention_layernorm.weight"],
@@ -566,6 +609,14 @@ class DFlash2Drafter:
             )
         return x @ w
 
+    def _lin_body(self, x: mx.array, w, use_qmv4: bool) -> mx.array:
+        wq, sc, bi = w
+        if use_qmv4:
+            return RQ4.qmv4_bf16_ro_rows(x, wq, sc, bi)
+        return mx.quantized_matmul(
+            x, wq, scales=sc, biases=bi, transpose=True, group_size=64, bits=4, mode="affine"
+        )
+
     def reset(self) -> None:
         self.ck = [None] * self.nl
         self.cv = [None] * self.nl
@@ -575,39 +626,100 @@ class DFlash2Drafter:
         cur = 0 if self.ck[0] is None else int(self.ck[0].shape[2])
         if need <= cur:
             return
-        new_cap = max(512, ((need + 511) // 512) * 512)
+        new_cap = max(2048, ((need + 1023) // 1024) * 1024)
+        dt = self._kv_dtype
         for i in range(self.nl):
-            nk = mx.zeros((1, self.nkv, new_cap, self.hd), mx.bfloat16)
-            nv = mx.zeros((1, self.nkv, new_cap, self.hd), mx.bfloat16)
+            nk = mx.zeros((1, self.nkv, new_cap, self.hd), dt)
+            nv = mx.zeros((1, self.nkv, new_cap, self.hd), dt)
             if self.ck[i] is not None and self.n > 0:
                 nk[:, :, : self.n, :] = self.ck[i][:, :, : self.n, :]
                 nv[:, :, : self.n, :] = self.cv[i][:, :, : self.n, :]
             self.ck[i], self.cv[i] = nk, nv
+
+    def _get_append_ctx_compiled(self, n_tok: int, cap: int):
+        key = (n_tok, cap)
+        fn = self._ctx_compiled.get(key)
+        if fn is not None:
+            return fn
+        H = self.H
+        nl = self.nl
+        nkv, hd, theta = self.nkv, self.hd, self.theta
+        kw = nkv * hd
+        fc = self.fc
+        hidden_norm = self.hidden_norm
+        layers = self.layers
+        qbits = self.qbits
+
+        def _qmm(x, w):
+            if qbits:
+                return mx.quantized_matmul(
+                    x, w[0], scales=w[1], biases=w[2], transpose=True, group_size=64, bits=qbits, mode="affine"
+                )
+            return x @ w
+
+        @mx.compile
+        def _run(feats, pos_arr, *ckv):
+            cks = list(ckv[:nl])
+            cvs = list(ckv[nl:])
+            flat = feats.reshape(n_tok, 4 * H)
+            ctx = mx.fast.rms_norm(_qmm(flat, fc), hidden_norm, _EPS)
+            rope_off = pos_arr[0]
+            out_k = []
+            out_v = []
+            for i in range(nl):
+                lw = layers[i]
+                kv = _qmm(ctx, lw["kv"])
+                k = mx.fast.rms_norm(kv[:, :kw].reshape(1, n_tok, nkv, hd), lw["k_norm"], _EPS).transpose(0, 2, 1, 3)
+                k = mx.fast.rope(k, hd, traditional=False, base=theta, scale=1.0, offset=rope_off)
+                v = kv[:, kw:].reshape(1, n_tok, nkv, hd).transpose(0, 2, 1, 3)
+                out_k.append(mx.slice_update(cks[i], k, pos_arr, axes=(2,)))
+                out_v.append(mx.slice_update(cvs[i], v, pos_arr, axes=(2,)))
+            return tuple(out_k) + tuple(out_v)
+
+        self._ctx_compiled[key] = _run
+        return _run
+
+    def append_ctx_gpu(self, feats: mx.array, pos_arr: mx.array) -> None:
+        """Project target taps `(1, N, 4, H)` -> context K/V at GPU `pos_arr (1,) i32` (zero sync)."""
+        n_tok = int(feats.shape[1])
+        if n_tok == 0:
+            return
+        if self._fused and n_tok <= 8 and self.ck[0] is not None:
+            cap = int(self.ck[0].shape[2])
+            fn = self._get_append_ctx_compiled(n_tok, cap)
+            cks = self.ck
+            cvs = self.cv
+            self.ck = [None] * self.nl
+            self.cv = [None] * self.nl
+            res = fn(feats, pos_arr, *cks, *cvs)
+            self.ck = list(res[: self.nl])
+            self.cv = list(res[self.nl :])
+            return
+        flat = feats.reshape(n_tok, 4 * self.H)
+        ctx = _rms(self._lin(flat, self.fc), self.hidden_norm)  # (N, H)
+        rope_off = pos_arr[0]
+        kw = self.nkv * self.hd
+        for i, lw in enumerate(self.layers):
+            kv = self._lin(ctx, lw["kv"])  # (N, 2*nkv*hd)
+            k = kv[:, :kw].reshape(1, n_tok, self.nkv, self.hd)
+            v = kv[:, kw:].reshape(1, n_tok, self.nkv, self.hd)
+            k = _rms(k, lw["k_norm"]).transpose(0, 2, 1, 3)
+            k = mx.fast.rope(k, self.hd, traditional=False, base=self.theta, scale=1.0, offset=rope_off)
+            v = v.transpose(0, 2, 1, 3)
+            ck_i = self.ck[i]
+            self.ck[i] = None
+            self.ck[i] = mx.slice_update(ck_i, k, pos_arr, axes=(2,))
+            cv_i = self.cv[i]
+            self.cv[i] = None
+            self.cv[i] = mx.slice_update(cv_i, v, pos_arr, axes=(2,))
 
     def append_ctx(self, feats: mx.array) -> None:
         """Project target taps `(1, N, 4, H)` -> context K/V for all 5 draft layers."""
         n_tok = int(feats.shape[1])
         if n_tok == 0:
             return
-        self._ensure_cap(self.n + n_tok)
-        flat = feats.reshape(n_tok, 4 * self.H)
-        ctx = _rms(self._lin(flat, self.fc), self.hidden_norm)  # (N, H)
-        pos = self.n
-        for i, lw in enumerate(self.layers):
-            kv = self._lin(ctx, lw["kv"])  # (N, 2*nkv*hd)
-            kw = self.nkv * self.hd
-            k = kv[:, :kw].reshape(1, n_tok, self.nkv, self.hd)
-            v = kv[:, kw:].reshape(1, n_tok, self.nkv, self.hd)
-            k = _rms(k, lw["k_norm"]).transpose(0, 2, 1, 3)
-            k = mx.fast.rope(k, self.hd, traditional=False, base=self.theta, scale=1.0, offset=pos)
-            v = v.transpose(0, 2, 1, 3)
-            wpos = FD._wpos(pos)
-            ck_i = self.ck[i]
-            self.ck[i] = None
-            self.ck[i] = mx.slice_update(ck_i, k, wpos, axes=(2,))
-            cv_i = self.cv[i]
-            self.cv[i] = None
-            self.cv[i] = mx.slice_update(cv_i, v, wpos, axes=(2,))
+        self._ensure_cap(self.n + n_tok + self.block)
+        self.append_ctx_gpu(feats, FD._wpos(self.n))
         self.n += n_tok
 
     def _ctx_slice(self, i: int):
@@ -616,7 +728,137 @@ class DFlash2Drafter:
         start = max(0, self.n - self.window)
         return self.ck[i][:, :, start : self.n, :], self.cv[i][:, :, start : self.n, :]
 
+    def _get_fwd_bf16_compiled(self, n_pos: int, cap: int, body_mode: str, use_fuse_top16: bool, top16_cfg: str, sdpa_q2: bool):
+        key = (n_pos, cap, body_mode, use_fuse_top16, top16_cfg, sdpa_q2)
+        fn = self._fwd_compiled.get(key)
+        if fn is not None:
+            return fn
+        scale = self.hd ** -0.5
+        layers = self.layers
+        nl = self.nl
+        nh, nkv, hd, theta, window = self.nh, self.nkv, self.hd, self.theta, self.window
+        mask_7 = self._mask_7
+        final_norm = self.final_norm
+        sel_proj = self.sel_proj
+        lm_q4 = self._lm_q4
+        lm_aff8 = self._lm_aff8
+        lm_t = self._lm_t
+        unpadded_vocab = self._unpadded_vocab
+        pred_cb, succ_cb, softcap = self.pred_cb, self.succ_cb, self.softcap
+        embed = self.target.model.language_model.embed
+        target_lm = self.target.lm_head
+
+        gu_block8 = self._gu_block8
+        inter = self.inter
+
+        def _lin_b(x, w):
+            wq, sc, bi = w
+            if body_mode == "mma1" and int(x.shape[0]) == 8:
+                return RQ4.qmv4_bf16_mma8_rows(x, wq, sc, bi)
+            if body_mode == "u2":
+                return RQ4.qmv4_bf16_u2_rows(x, wq, sc, bi)
+            if body_mode in ("ro", "mma1"):
+                return RQ4.qmv4_bf16_ro_rows(x, wq, sc, bi)
+            return mx.quantized_matmul(
+                x, wq, scales=sc, biases=bi, transpose=True, group_size=64, bits=4, mode="affine"
+            )
+
+        def _swiglu_b(x, w):
+            wq, sc, bi = w
+            if gu_block8:
+                if body_mode == "mma1" and int(x.shape[0]) == 8:
+                    return RQ4.qmv4_bf16_mma8_swiglu_rows(x, wq, sc, bi)
+                return RQ4.qmv4_bf16_u2_swiglu_b8_rows(x, wq, sc, bi)
+            gu = _lin_b(x, w)
+            return nn.silu(gu[:, :inter]) * gu[:, inter:]
+
+        @mx.compile
+        def _run(anchor_tok, pos_arr, *ckv):
+            cks = ckv[:nl]
+            cvs = ckv[nl:]
+            anc_emb = embed(anchor_tok.reshape(1, 1))[0]
+            x = mx.concatenate([anc_emb, mask_7], axis=0)
+            h_norm = mx.fast.rms_norm(x, layers[0]["in_ln"], _EPS)
+            for i in range(nl):
+                lw = layers[i]
+                dyn_a = _lin_b(h_norm, lw["a_dyn"])
+                c_in = RQ4.dyn_conv_stage0_bf16(h_norm, dyn_a, lw["a_base"])
+                qkv = _lin_b(c_in, lw["qkv"])
+                q, k, v = RQ4.qkv_norm_rope_bf16(qkv, lw["q_norm"], lw["k_norm"], pos_arr, nh, nkv, hd, theta)
+                attn = RQ4.sdpa_draft_bf16_gpu(q, cks[i], cvs[i], k, v, pos_arr, scale=scale, window=window)
+                proj = _lin_b(attn, lw["o_proj"])
+                res, m_norm = RQ4.dyn_conv_res_rms_bf16(proj, dyn_a, lw["a_base"], x, lw["post_ln"])
+                dyn_m = _lin_b(m_norm, lw["m_dyn"])
+                m_in = RQ4.dyn_conv_stage0_bf16(m_norm, dyn_m, lw["m_base"])
+                act = _swiglu_b(m_in, lw["gu"])
+                m_out = _lin_b(act, lw["down"])
+                next_ln = layers[i + 1]["in_ln"] if i + 1 < nl else final_norm
+                x, h_norm = RQ4.dyn_conv_res_rms_bf16(m_out, dyn_m, lw["m_base"], res, next_ln)
+
+            hid = h_norm[1 : 1 + n_pos]
+            sel_h = _lin_b(hid, sel_proj).astype(mx.float32)
+            if lm_q4 is not None:
+                wq4, sc4, bi4 = lm_q4
+                if use_fuse_top16:
+                    top_idx, unary = RQ4.qmv4_bf16_top16_rows(hid, wq4, sc4, bi4)
+                    return _selector_scores_from_top16(
+                        top_idx, unary, sel_h, pred_cb, succ_cb, anchor_tok, softcap
+                    )
+                raw_logits = RQ4.qmv4_bf16_ro_rows(hid, wq4, sc4, bi4)
+            elif lm_aff8:
+                raw_logits = RQ.qmv_rows(hid, *lm_t)[:, :unpadded_vocab]
+            else:
+                raw_logits = target_lm(hid)[:, :unpadded_vocab]
+            return _selector_scores(raw_logits, sel_h, pred_cb, succ_cb, anchor_tok, softcap)
+
+        self._fwd_compiled[key] = _run
+        return _run
+
+    def _forward_block_fused(self, anchor_tok: mx.array, n_pos: int = 7, pos_arr: mx.array | None = None):
+        if self.ck[0] is None:
+            self._ensure_cap(1)
+        n_pos = max(2, min(self.block - 1, int(n_pos)))
+        cap = int(self.ck[0].shape[2])
+        body_mode = os.environ.get("LOOPLING_DFLASH2_BODY_MODE", self._body_mode)
+        use_fuse_top16 = os.environ.get("LOOPLING_DFLASH2_FUSE_TOP16", "1") not in ("0", "", "false", "False")
+        top16_cfg = (
+            os.environ.get("LOOPLING_DFLASH2_TOP16_MODE", "mma")
+            + "|"
+            + os.environ.get("LOOPLING_DFLASH2_TOP16_MMA_CFG", "")
+            + "|"
+            + os.environ.get("LOOPLING_DFLASH2_TOP16_CFG", "")
+            + "|"
+            + os.environ.get("LOOPLING_DFLASH2_MMA_NSG", "")
+        )
+        sdpa_q2 = os.environ.get("LOOPLING_DFLASH2_SDPA_Q2", "0") not in ("0", "", "false", "False")
+        fn = self._get_fwd_bf16_compiled(n_pos, cap, body_mode, use_fuse_top16, top16_cfg, sdpa_q2)
+        if pos_arr is None:
+            pos_arr = FD._wpos(self.n)
+        anc = anchor_tok.reshape(1)
+        if anc.dtype != mx.uint32:
+            anc = anc.astype(mx.uint32)
+        return fn(anc, pos_arr, *self.ck, *self.cv)
+
+    def draft_and_pack_gpu(
+        self,
+        anchor_tok: mx.array,
+        w_max: int,
+        *,
+        pos_arr: mx.array | None = None,
+        use_tree: bool = False,
+        cost_arr: mx.array | None = None,
+        prior_cfg: mx.array | None = None,
+    ):
+        """Zero-sync DFlash2 forward + chain/tree packer on GPU."""
+        w_max = max(2, min(self.block, int(w_max)))
+        top_idx, sc0, sc16 = self._forward_block_fused(anchor_tok, n_pos=w_max - 1, pos_arr=pos_arr)
+        if use_tree:
+            return RQ4.dflash2_pack_tree_dink_gpu(top_idx, sc0, sc16, anchor_tok, w_max, cost_arr, prior_cfg)
+        return RQ4.dflash2_pack_chain_gpu(top_idx, sc0, sc16, anchor_tok, w_max)
+
     def _forward_block(self, anchor_tok: mx.array, n_pos: int = 7):
+        if self._fused:
+            return self._forward_block_fused(anchor_tok, n_pos=n_pos)
         anc_emb = self.target.model.language_model.embed(anchor_tok.reshape(1, 1))[0]  # (1, H)
         x = mx.concatenate([anc_emb, self._mask_7], axis=0)  # (8, H)
         B = self.block
@@ -644,9 +886,12 @@ class DFlash2Drafter:
         hid = _rms(x, self.final_norm)[1 : 1 + n_pos]  # (n_pos, H)
         if self._lm_q4 is not None:
             wq4, sc4, bi4 = self._lm_q4
-            raw_logits = mx.quantized_matmul(
-                hid, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
-            )
+            if _USE_QMV4 and hid.dtype == mx.bfloat16 and 1 <= hid.shape[0] <= 16 and hid.shape[1] % 256 == 0 and sc4.dtype == mx.bfloat16:
+                raw_logits = RQ4.qmv4_rows(hid, wq4, sc4, bi4)
+            else:
+                raw_logits = mx.quantized_matmul(
+                    hid, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
+                )
         elif self._lm_aff8:
             raw_logits = RQ.qmv_rows(hid, *self._lm_t)[:, : self._unpadded_vocab]
         else:
@@ -654,10 +899,10 @@ class DFlash2Drafter:
         sel_h = self._lin(hid, self.sel_proj).astype(mx.float32)  # (n_pos, R)
         return _selector_scores(raw_logits, sel_h, self.pred_cb, self.succ_cb, anchor_tok, self.softcap)
 
-    def draft_chain(self, anchor_tok: mx.array, width: int = 8) -> mx.array:
+    def draft_chain(self, anchor_tok: mx.array, width: int = 8, prefetched=None) -> mx.array:
         """Return `[anchor, d_1 .. d_{width-1}]` `(width,)` int32 via greedy selector chain."""
         width = max(2, min(self.block, int(width)))
-        top_idx, sc0, sc16 = self._forward_block(anchor_tok, n_pos=width - 1)
+        top_idx, sc0, sc16 = prefetched if prefetched is not None else self._forward_block(anchor_tok, n_pos=width - 1)
         mx.eval(top_idx, sc0, sc16)
         tl = top_idx.tolist()
         s0 = sc0.tolist()
@@ -679,10 +924,11 @@ class DFlash2Drafter:
         lookup_props: list[int] | None = None,
         lookup_len: int = 0,
         use_tree: bool = True,
+        prefetched=None,
     ):
         """Return `(toks (W,) i32, parents, depths, raw_probs)` or `(None, ...)` when StepCosts picks W=1."""
         w_max = max(2, min(self.block, int(w_max)))
-        top_idx, sc0, sc16 = self._forward_block(anchor_tok, n_pos=w_max - 1)
+        top_idx, sc0, sc16 = prefetched if prefetched is not None else self._forward_block(anchor_tok, n_pos=w_max - 1)
         p0 = mx.softmax(sc0, axis=-1)
         p16 = mx.softmax(sc16, axis=-1)
         mx.eval(top_idx, p0, p16)
@@ -798,7 +1044,9 @@ _DF2_INST: dict = {}
 def _get_drafter(model, draft_dir: str = DFLASH2_DIR) -> DFlash2Drafter:
     lm_w = model.lm_head["weight"]
     qbits = int(os.environ.get("LOOPLING_DFLASH2_QUANT", "4"))
-    key = (id(model), draft_dir, qbits)
+    fused = qbits == 4 and os.environ.get("LOOPLING_DFLASH2_FUSED", "1") not in ("0", "", "false", "False")
+    gu_b8 = fused and os.environ.get("LOOPLING_DFLASH2_BODY_MODE", "qmm") in ("mma1", "u2")
+    key = (id(model), draft_dir, qbits, fused, gu_b8)
     entry = _DF2_INST.get(key)
     if entry is not None and entry[0] is lm_w:
         dr = entry[1]
@@ -873,7 +1121,7 @@ def dflash2_exact_generate_step(
         return
 
     anchor = y
-    W_cfg = int(os.environ.get("LOOPLING_DFLASH2_W", "8"))
+    W_cfg = int(os.environ.get("LOOPLING_DFLASH2_W", "6"))
     use_budget = os.environ.get("LOOPLING_DFLASH2_BUDGET", "1") not in ("0", "", "false", "False")
     use_lookup = os.environ.get("LOOPLING_DFLASH2_LOOKUP", "1") not in ("0", "", "false", "False")
     tree_env = os.environ.get("LOOPLING_DFLASH2_TREE", "")
@@ -919,7 +1167,272 @@ def dflash2_exact_generate_step(
             costs.observe_ar((time.perf_counter() - tar0) * 1000.0)
         return y_cur, int(y_cur.item())
 
+    prefetched_fwd = None
+    prefetched_npos = 0
+    prefetched_t0 = 0.0
+
+    use_pipe_ahead = (
+        os.environ.get("LOOPLING_DFLASH2_PIPE_AHEAD", "1") not in ("0", "", "false", "False")
+        and dr._fused
+        and W_cfg >= 2
+        and os.environ.get("LOOPLING_COMPILE_VERIFY", "1") not in ("0", "")
+        and not (tm.loopcd.enabled_for(passes) and tm.loopcd.mode != "hidden")
+    )
+    off_cpu = int(dec.caches[0][0][0].offset)
+    if use_pipe_ahead and max_tokens > 1:
+        if not dec.ensure_gpu_cap(max_tokens + 16):
+            use_pipe_ahead = False
+        else:
+            dr._ensure_cap(dr.n + max_tokens + 32)
+    tau_cap = off_cpu + max_tokens + 32
+
+    pa_tree = bool(use_tree or use_budget)
+    pa_depth = max(1, min(2, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
+    fscale = (12 + 12 * passes) / 24.0
+    pa_costs_env = os.environ.get("LOOPLING_DFLASH2_PA_COSTS")
+    if pa_costs_env:
+        _pa_c_ov = mx.array([float(x) for x in pa_costs_env.split(",")], mx.float32)
+        pa_cost_map = {4: _pa_c_ov, 6: _pa_c_ov, 8: _pa_c_ov}
+    else:
+        # Proven #85 empirical verify_w_gpu(W_max, w_act) + fused draft marginal cost curves on p3.
+        s = fscale / 2.0
+        _c_def = mx.array([c * s for c in (0.0, 9.6, 17.8, 18.7, 19.6, 20.5, 21.3, 22.1, 22.8)], mx.float32)
+        pa_cost_map = {4: _c_def, 6: _c_def, 8: _c_def}
+    pa_priors_env = os.environ.get("LOOPLING_DFLASH2_PA_PRIORS")
+    if pa_priors_env:
+        pa_prior_cfg = mx.array([float(x) for x in pa_priors_env.split(",")], mx.float32)
+    else:
+        pa_prior_cfg = mx.array([VerifyBudget.PRIOR_SLOPE, *VerifyBudget.PRIOR_INTERCEPTS], mx.float32)
+
+    pa_adapt = bool(use_budget) and os.environ.get("LOOPLING_DFLASH2_PA_ADAPT", "1") not in ("0", "", "false", "False")
+    pa_w_run = min(W_cfg, 6) if (pa_adapt and W_cfg > 6) else W_cfg
+    pa_ema_tpc = 3.0
+    pa_ema_ms = 21.5 * (fscale / 2.0)
+    pa_t_ar = 9.6 * (fscale / 2.0)
+    pa_low_streak = 0
+    pa_ar_burst = 0
+    pa_ar_backoff = 16
+    pa_queue: deque = deque()
+    pa_packed = None
+    pa_packed_w = 0
+    pa_last_t = time.perf_counter()
+
+    def _pa_cost_for(w_val: int) -> mx.array:
+        if w_val <= 4:
+            return pa_cost_map[4]
+        if w_val <= 6:
+            return pa_cost_map[6]
+        return pa_cost_map[8]
+
+    def _launch_pa_cycle(packed, meta_r, meta_f, dr_pos, binfo, ring_may_wrap, launch_next_draft=True, next_w=None):
+        if pa_tree:
+            blk_c, par_c, dep_c, ca_c, tm_c, wa_c = packed
+        else:
+            blk_c, par_c, dep_c, ca_c, tm_c = packed
+            wa_c = None
+        w_c = int(blk_c.shape[0])
+        walk_res, kv_news, conv_ws, tap_buf = dec.verify_w_gpu(
+            blk_c,
+            meta_r=meta_r,
+            meta_f=meta_f,
+            depths_arr=dep_c,
+            conv_anc=ca_c,
+            tree_meta=tm_c,
+            max_depth=w_c - 1,
+            binfo=binfo,
+            tau_cap=tau_cap,
+            tap_visits=tap_check,
+            par_arr=par_c,
+            dr_pos=dr_pos,
+            use_stage=False,
+            w_act=wa_c,
+        )
+        (
+            path_pad, emitted, keep_arr, last_slot, anc_nxt,
+            slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
+        ) = walk_res
+        eval_a = [
+            emitted, keep_arr, path_pad, last_slot, anc_nxt,
+            slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
+            *kv_news,
+        ]
+        for cw in conv_ws:
+            eval_a.extend(cw)
+        eval_a.extend(tap_buf.values())
+        mx.async_eval(*eval_a)
+
+        dec.commit_w_gpu(
+            kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, w_c,
+            ring_may_wrap=ring_may_wrap,
+        )
+        f_w = _feats_from_dict(tap_buf, tap_keys)
+        f_pad = f_w[:, path_pad]
+        dr.append_ctx_gpu(f_pad, dr_pos_old)
+
+        eval_b = [*dec.kv_eval_targets()]
+        for cs in dec.conv:
+            eval_b.extend(cs)
+        eval_b.extend(dr.ck)
+        eval_b.extend(dr.cv)
+        if launch_next_draft:
+            wn = w_c if next_w is None else int(next_w)
+            packed_nxt = dr.draft_and_pack_gpu(
+                anc_nxt, wn, pos_arr=dr_pos_nxt, use_tree=pa_tree, cost_arr=_pa_cost_for(wn), prior_cfg=pa_prior_cfg
+            )
+            eval_b.extend(packed_nxt)
+        else:
+            packed_nxt = None
+        mx.async_eval(*eval_b)
+        return (emitted, keep_arr, anc_nxt, meta_r_nxt, meta_f_nxt, dr_pos_nxt, packed_nxt, w_c)
+
+    def _can_launch_pa(w_launch: int):
+        hi_d = sum(item[7] for item in pa_queue)
+        lo_d = len(pa_queue)
+        if n + hi_d + w_launch > max_tokens or not dec._kv_stacked or dr.ck[0] is None:
+            return False, None
+        ok_b, binfo = dec._cw_safe_bounds_range(off_cpu + lo_d, off_cpu + hi_d, w_launch - 1)
+        if not ok_b:
+            return False, None
+        cap_r, cap_f, max_size_r = binfo[4], binfo[5], binfo[6]
+        if (
+            off_cpu + hi_d + w_launch > cap_f
+            or (cap_r < max_size_r and off_cpu + hi_d + w_launch > cap_r)
+            or dr.n + hi_d + w_launch + dr.block > int(dr.ck[0].shape[2])
+        ):
+            return False, None
+        return True, binfo
+
     while n < max_tokens:
+        if use_pipe_ahead:
+            l_len_pa = lookup.match_len if lookup is not None else 0
+            want_lookup_bypass = (
+                lookup is not None and _LOOKUP_BYPASS_MIN > 0 and l_len_pa >= _LOOKUP_BYPASS_MIN
+            )
+            want_ar_burst = pa_ar_burst > 0 and not want_lookup_bypass
+            if not want_lookup_bypass and not want_ar_burst:
+                if deferred_feats:
+                    flush_deferred()
+                    if not dec._kv_stacked:
+                        dec.ensure_gpu_cap(max_tokens - n + 16)
+                        off_cpu = int(dec.caches[0][0][0].offset)
+                    dr._ensure_cap(dr.n + max_tokens - n + 32)
+                while len(pa_queue) < pa_depth:
+                    qlen = len(pa_queue)
+                    w_l = pa_w_run
+                    ok_pa, binfo_pa = _can_launch_pa(w_l)
+                    if not ok_pa:
+                        break
+                    if qlen == 0:
+                        if pa_packed is None or pa_packed_w != w_l:
+                            pa_packed = dr.draft_and_pack_gpu(
+                                anchor, w_l, pos_arr=FD._wpos(dr.n), use_tree=pa_tree,
+                                cost_arr=_pa_cost_for(w_l), prior_cfg=pa_prior_cfg,
+                            )
+                            pa_packed_w = w_l
+                        meta_r0, meta_f0 = dec.get_gpu_meta(staged=False)
+                        dr_pos0 = FD._wpos(dr.n)
+                        lnxt = (pa_depth >= 2) and (n + 2 * w_l <= max_tokens)
+                        pa_last_t = time.perf_counter()
+                        pa_queue.append(
+                            _launch_pa_cycle(
+                                pa_packed, meta_r0, meta_f0, dr_pos0, binfo_pa,
+                                ring_may_wrap=(off_cpu + w_l > binfo_pa[6]),
+                                launch_next_draft=lnxt,
+                                next_w=w_l,
+                            )
+                        )
+                        pa_packed = None
+                        pa_packed_w = 0
+                    else:
+                        prev = pa_queue[-1]
+                        p_nxt = prev[6]
+                        if p_nxt is None or int(p_nxt[0].shape[0]) != w_l:
+                            break
+                        hi_d = sum(item[7] for item in pa_queue)
+                        lnxt = (n + hi_d + 2 * w_l <= max_tokens)
+                        pa_queue.append(
+                            _launch_pa_cycle(
+                                p_nxt, prev[3], prev[4], prev[5], binfo_pa,
+                                ring_may_wrap=(off_cpu + hi_d + w_l > binfo_pa[6]),
+                                launch_next_draft=lnxt,
+                                next_w=w_l,
+                            )
+                        )
+
+            if pa_queue:
+                emitted_c, keep_arr_c, anc_nxt, _, _, _, p_nxt, w_done = pa_queue.popleft()
+                mx.eval(emitted_c, keep_arr_c)
+                now_t = time.perf_counter()
+                cyc_ms = (now_t - pa_last_t) * 1000.0
+                stats["verify_ms"] += cyc_ms
+                pa_last_t = now_t
+                keep = int(keep_arr_c.item())
+                em = emitted_c.tolist()[:keep]
+                dec.sync_kv_offsets(keep, staged=False)
+                dr.n += keep
+                off_cpu += keep
+                stats["cycles"] += 1
+                stats["accepted"] += keep - 1
+                if lookup is not None:
+                    for tok_e in em:
+                        lookup.append_one(tok_e)
+                if pa_adapt:
+                    pa_ema_tpc = 0.72 * pa_ema_tpc + 0.28 * keep
+                    if 4.0 <= cyc_ms <= 60.0:
+                        pa_ema_ms = 0.75 * pa_ema_ms + 0.25 * cyc_ms
+                    # Keep W=6 as neural floor (proved 134.13 MEAN8 in #85); promote 6->8 only on high-tpc prompts.
+                    if W_cfg >= 8 and pa_w_run < 8 and pa_ema_tpc >= 4.4:
+                        pa_w_run = 8
+                    elif pa_w_run == 8 and pa_ema_tpc < 3.8:
+                        pa_w_run = 6
+                    # AR fallback only on genuinely low-acceptance prompts (e.g. P1) where spec trails AR.
+                    spec_rate = pa_ema_tpc / max(1.0, pa_ema_ms)
+                    ar_rate = 1.0 / max(1.0, pa_t_ar)
+                    if keep <= 2 and pa_ema_tpc < 2.05 and spec_rate < 0.92 * ar_rate:
+                        pa_low_streak += 1
+                        if pa_low_streak >= 4:
+                            pa_ar_burst = pa_ar_backoff
+                            pa_ar_backoff = min(32, pa_ar_backoff + 8)
+                            pa_low_streak = 0
+                    elif spec_rate >= 1.00 * ar_rate:
+                        pa_low_streak = 0
+                        if keep >= 3:
+                            pa_ar_backoff = 16
+                if not pa_queue:
+                    anchor = anc_nxt
+                    pa_packed = p_nxt
+                    pa_packed_w = int(p_nxt[0].shape[0]) if p_nxt is not None else 0
+                for j in range(keep):
+                    stats["tokens"] += 1
+                    yield em[j], None, (j < keep - 1)
+                    n += 1
+                    if n >= max_tokens:
+                        break
+                continue
+            pa_packed = None
+            pa_packed_w = 0
+            if want_ar_burst:
+                pa_ar_burst -= 1
+                tar0 = time.perf_counter()
+                anchor, tok = ar_step(anchor)
+                pa_t_ar = 0.75 * pa_t_ar + 0.25 * ((time.perf_counter() - tar0) * 1000.0)
+                off_cpu = int(dec.caches[0][0][0].offset)
+                if lookup is not None:
+                    lookup.append_one(tok)
+                if pa_ar_burst == 0:
+                    flush_deferred()
+                    if not dec._kv_stacked:
+                        dec.ensure_gpu_cap(max_tokens - n + 16)
+                        off_cpu = int(dec.caches[0][0][0].offset)
+                    dr._ensure_cap(dr.n + max_tokens - n + 32)
+                    pa_ema_tpc = 2.6
+                    pa_w_run = min(6, W_cfg)
+                stats["cycles"] += 1
+                stats["tokens"] += 1
+                yield tok, None, False
+                n += 1
+                continue
+
         rem = max_tokens - n
         w_cur = max(1, min(W_cfg, dr.block, rem))
         l_len = lookup.match_len if lookup is not None else 0
@@ -927,9 +1440,11 @@ def dflash2_exact_generate_step(
 
         in_cooldown = costs is not None and costs.ar_cooldown > 0 and l_len < 4
         if w_cur == 1 or in_cooldown:
+            prefetched_fwd = None
             if costs is not None and costs.ar_cooldown > 0:
                 costs.ar_cooldown -= 1
             anchor, tok = ar_step(anchor)
+            off_cpu = int(dec.caches[0][0][0].offset)
             if lookup is not None:
                 lookup.append_one(tok)
             stats["cycles"] += 1
@@ -938,31 +1453,46 @@ def dflash2_exact_generate_step(
             n += 1
             continue
 
-        flush_deferred()
-        td0 = time.perf_counter()
-        if use_budget or use_tree or l_props:
-            blk, parents, depths, raw_probs = dr.draft_hybrid_tree(
-                anchor,
-                w_max=w_cur,
-                budget=budget,
-                step_costs=costs,
-                lookup_props=l_props,
-                lookup_len=l_len,
-                use_tree=use_tree,
-            )
+        did_lookup_bypass = bool(l_props and _LOOKUP_BYPASS_MIN > 0 and l_len >= _LOOKUP_BYPASS_MIN)
+        if not did_lookup_bypass:
+            flush_deferred()
+        pf = prefetched_fwd if (prefetched_fwd is not None and prefetched_npos == w_cur - 1) else None
+        td0 = prefetched_t0 if pf is not None else time.perf_counter()
+        prefetched_fwd = None
+        if did_lookup_bypass:
+            anc_int = int(anchor.item())
+            toks_lp = [anc_int] + l_props[: w_cur - 1]
+            blk = mx.array(toks_lp, mx.int32)
+            parents = tuple(range(-1, len(toks_lp) - 1))
+            depths = tuple(range(len(toks_lp)))
+            raw_probs = [-1.0] * len(toks_lp)
+            td_ms = (time.perf_counter() - td0) * 1000.0
         else:
-            blk = dr.draft_chain(anchor, width=w_cur)
-            parents = tuple(range(-1, w_cur - 1))
-            depths = tuple(range(w_cur))
-            raw_probs = [-1.0] * w_cur
-        td_ms = (time.perf_counter() - td0) * 1000.0
-        if costs is not None:
-            costs.observe_draft(td_ms)
+            if use_budget or use_tree or l_props:
+                blk, parents, depths, raw_probs = dr.draft_hybrid_tree(
+                    anchor,
+                    w_max=w_cur,
+                    budget=budget,
+                    step_costs=costs,
+                    lookup_props=l_props,
+                    lookup_len=l_len,
+                    use_tree=use_tree,
+                    prefetched=pf,
+                )
+            else:
+                blk = dr.draft_chain(anchor, width=w_cur, prefetched=pf)
+                parents = tuple(range(-1, w_cur - 1))
+                depths = tuple(range(w_cur))
+                raw_probs = [-1.0] * w_cur
+            td_ms = (time.perf_counter() - td0) * 1000.0
+            if costs is not None:
+                costs.observe_draft(td_ms)
         if blk is None:
             stats["draft_ms"] += td_ms
             if costs is not None:
                 costs.ar_cooldown = max(costs.ar_cooldown, 3)
             anchor, tok = ar_step(anchor)
+            off_cpu = int(dec.caches[0][0][0].offset)
             if lookup is not None:
                 lookup.append_one(tok)
             stats["cycles"] += 1
@@ -1017,24 +1547,46 @@ def dflash2_exact_generate_step(
         stats["cycles"] += 1
         stats["accepted"] += keep - 1
 
-        if n + keep < max_tokens:
-            anchor_next = t[cur_slot : cur_slot + 1]
-            dec.commit_w(kv_news, conv_ws, keep, path=path)
-            f_w = _feats_from_dict(tap_buf, tap_keys)
-            f_keep = f_w[:, :keep] if path == list(range(keep)) else f_w[:, mx.array(path, mx.int32)]
-            dr.append_ctx(f_keep)
-            mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv)
-            anchor = anchor_next
+        if lookup is not None:
+            for j in range(1, keep):
+                lookup.append_one(bl[path[j]])
+            lookup.append_one(bonus_tok)
 
         tc_ms = (time.perf_counter() - tv0) * 1000.0
         stats["verify_ms"] += tv_ms
         if costs is not None:
             costs.observe_verify(w_act, tc_ms, keep, td_ms)
 
-        if lookup is not None:
-            for j in range(1, keep):
-                lookup.append_one(bl[path[j]])
-            lookup.append_one(bonus_tok)
+        if n + keep < max_tokens:
+            anchor_next = t[cur_slot : cur_slot + 1]
+            dec.commit_w(kv_news, conv_ws, keep, path=path)
+            off_cpu = int(dec.caches[0][0][0].offset)
+            f_w = _feats_from_dict(tap_buf, tap_keys)
+            f_keep = f_w[:, :keep] if path == list(range(keep)) else f_w[:, mx.array(path, mx.int32)]
+            anchor = anchor_next
+
+            rem_next = max_tokens - (n + keep)
+            w_next = max(1, min(W_cfg, dr.block, rem_next))
+            l_next = lookup.match_len if lookup is not None else 0
+            byp_next = _LOOKUP_BYPASS_MIN > 0 and l_next >= _LOOKUP_BYPASS_MIN
+            if did_lookup_bypass and byp_next:
+                # Defer drafter KV update while continuing zero-draft lookup streak (-0.5ms/cycle on P8!).
+                deferred_feats.append(f_keep)
+                mx.async_eval(*dec.kv_eval_targets(), dec.conv, f_keep)
+            else:
+                if deferred_feats:
+                    deferred_feats.append(f_keep)
+                    flush_deferred()
+                else:
+                    dr.append_ctx(f_keep)
+                cd_next = costs is not None and costs.ar_cooldown > 0 and l_next < 4
+                if not use_pipe_ahead and w_next >= 2 and not cd_next and not byp_next:
+                    prefetched_t0 = time.perf_counter()
+                    prefetched_npos = w_next - 1
+                    prefetched_fwd = dr._forward_block(anchor, n_pos=prefetched_npos)
+                    mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv, *prefetched_fwd)
+                else:
+                    mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv)
 
         for j in range(1, keep):
             stats["tokens"] += 1

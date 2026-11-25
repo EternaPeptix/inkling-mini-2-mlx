@@ -2111,8 +2111,8 @@ def main():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=2048,
-        help="Step size for prefill processing (default: 2048)",
+        default=4096,
+        help="Step size for prefill processing (default: 4096)",
     )
     parser.add_argument(
         "--prompt-cache-size",

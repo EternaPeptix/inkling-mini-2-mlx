@@ -17,6 +17,7 @@ __all__ = [
 # kernel.
 _DEPTH_ATTENTION_SOURCE = """
     constexpr int N = K + 1;
+    constexpr int MAX_IT = (D + TG - 1) / TG;
     uint row = threadgroup_position_in_grid.x;
     uint rows = threadgroups_per_grid.x;
     uint tid = thread_position_in_threadgroup.x;
@@ -27,16 +28,17 @@ _DEPTH_ATTENTION_SOURCE = """
     for (int i = 0; i < N * Q; i++) {
         acc[i] = 0.0f;
     }
-    for (int d = tid; d < D; d += TG) {
-        float x[N];
+    float xc[MAX_IT][N];
+    int it_idx = 0;
+    for (int d = tid; d < D; d += TG, it_idx++) {
         for (int i = 0; i < K; i++) {
-            x[i] = blocks[(size_t(i) * rows + row) * D + d];
+            xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
         }
-        x[K] = partial[size_t(row) * D + d];
+        xc[it_idx][K] = partial[size_t(row) * D + d];
         for (int j = 0; j < Q; j++) {
             float qv = queries[j * D + d];
             for (int i = 0; i < N; i++) {
-                acc[i * Q + j] += x[i] * qv;
+                acc[i * Q + j] += xc[it_idx][i] * qv;
             }
         }
     }
@@ -73,16 +75,12 @@ _DEPTH_ATTENTION_SOURCE = """
         }
     }
 
-    for (int d = tid; d < D; d += TG) {
-        float x[N];
-        for (int i = 0; i < K; i++) {
-            x[i] = blocks[(size_t(i) * rows + row) * D + d];
-        }
-        x[K] = partial[size_t(row) * D + d];
+    it_idx = 0;
+    for (int d = tid; d < D; d += TG, it_idx++) {
         for (int j = 0; j < Q; j++) {
             float o = 0.0f;
             for (int i = 0; i < N; i++) {
-                o += w[i * Q + j] * x[i];
+                o += w[i * Q + j] * xc[it_idx][i];
             }
             out[(size_t(row) * Q + j) * D + d] = o;
         }
@@ -323,16 +321,18 @@ _REL_CFG_ENV = os.environ.get("LOOPLING_REL_ATTN_CFG", "")
 _REL_GQA_BLK, _REL_QSG, _REL_TRANS_K, _REL_DBUF = (
     (int(x) for x in _REL_CFG_ENV.split(",")) if _REL_CFG_ENV else (1, 0, 1, 0)
 )
+_REL_VEC_BIAS = int(os.environ.get("LOOPLING_REL_VEC_BIAS", "1"))
+_REL_BK_LOAD = int(os.environ.get("LOOPLING_REL_BK_LOAD", "32"))
 
 _RELATIVE_ATTENTION_FAST_SOURCE = """
     constexpr float LOG2E = 1.4426950408889634f;
     constexpr int BK = 16;
-    constexpr int LDK = BK + 8;
+    constexpr int LDK = BK_LOAD + 8;
     constexpr int LDV = D + 8;
     constexpr int BQ = QSG * 8;
     constexpr int TG = GQA_BLK * QSG * 32;
     constexpr int GQA = HQ / HKV;
-    constexpr int KS_STRIDE = TRANS_K ? (BK * LDV) : (D * LDK);
+    constexpr int KS_STRIDE = TRANS_K ? (BK_LOAD * LDV) : (D * LDK);
     constexpr int NBUF = DBUF ? 2 : 1;
     const int L = sizes[0];
     const int S = sizes[1];
@@ -358,7 +358,7 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
     const int diag = S - L + row;
 
     threadgroup half Ks[NBUF * KS_STRIDE];
-    threadgroup half Vs[NBUF * BK * LDV];
+    threadgroup half Vs[NBUF * BK_LOAD * LDV];
 
     simdgroup_half8x8 q_frag[D / 8];
     for (int db = 0; db < D / 8; ++db) {
@@ -392,17 +392,18 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
     const int sg_last_diag = S - L + sg_last_row;
     const bool all_rows_ok = (sg_first_row + 7 < L);
 
-    for (int k0 = first_key / BK * BK, tile = 0; k0 <= last_diag; k0 += BK, ++tile) {
+    const int k_start_blk = (first_key / BK) * BK;
+    for (int k_blk = k_start_blk, tile = 0; k_blk <= last_diag; k_blk += BK_LOAD, ++tile) {
         if constexpr (!DBUF) {
             if (tile > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         const int buf = DBUF ? (tile & 1) : 0;
-        threadgroup half* Kc = Ks + buf * KS_STRIDE;
-        threadgroup half* Vc = Vs + buf * BK * LDV;
-        for (int c = tid; c < BK * D / 8; c += TG) {
+        threadgroup half* Kc_base = Ks + buf * KS_STRIDE;
+        threadgroup half* Vc_base = Vs + buf * BK_LOAD * LDV;
+        for (int c = tid; c < BK_LOAD * D / 8; c += TG) {
             const int r = c / (D / 8);
             const int col = (c % (D / 8)) * 8;
-            const int key = k0 + r;
+            const int key = k_blk + r;
             vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
             vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
             if (key < S) {
@@ -414,114 +415,148 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
                 vv[1] = vp[1];
             }
             if constexpr (TRANS_K) {
-                ((threadgroup half4*)(Kc + r * LDV + col))[0] = half4(float4(kv[0]));
-                ((threadgroup half4*)(Kc + r * LDV + col))[1] = half4(float4(kv[1]));
-                ((threadgroup half4*)(Vc + r * LDV + col))[0] = half4(float4(vv[0]));
-                ((threadgroup half4*)(Vc + r * LDV + col))[1] = half4(float4(vv[1]));
+                ((threadgroup half4*)(Kc_base + r * LDV + col))[0] = half4(float4(kv[0]));
+                ((threadgroup half4*)(Kc_base + r * LDV + col))[1] = half4(float4(kv[1]));
+                ((threadgroup half4*)(Vc_base + r * LDV + col))[0] = half4(float4(vv[0]));
+                ((threadgroup half4*)(Vc_base + r * LDV + col))[1] = half4(float4(vv[1]));
             } else {
                 for (int j = 0; j < 8; ++j) {
-                    Kc[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
-                    Vc[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
+                    Kc_base[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
+                    Vc_base[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_first_row >= L || k0 > sg_last_diag
-            || (WINDOW > 0 && (sg_first_diag - (k0 + BK - 1)) >= WINDOW)) {
+        if (sg_first_row >= L || k_blk > sg_last_diag
+            || (WINDOW > 0 && (sg_first_diag - (k_blk + BK_LOAD - 1)) >= WINDOW)) {
             continue;
         }
 
-        simdgroup_float8x8 scores[BK / 8];
-        for (int kb = 0; kb < BK / 8; ++kb) {
-            scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        }
-        for (int db = 0; db < D / 8; ++db) {
-            for (int kb = 0; kb < BK / 8; ++kb) {
-                simdgroup_half8x8 k_frag;
-                if constexpr (TRANS_K) {
-                    simdgroup_load(k_frag, Kc + kb * 8 * LDV + db * 8, LDV, ulong2(0, 0), true);
-                } else {
-                    simdgroup_load(k_frag, Kc + db * 8 * LDK + kb * 8, LDK);
-                }
-                simdgroup_multiply_accumulate(scores[kb], q_frag[db], k_frag, scores[kb]);
+        for (int sub = 0; sub < BK_LOAD; sub += BK) {
+            const int k0 = k_blk + sub;
+            if (k0 > sg_last_diag || (WINDOW > 0 && (sg_first_diag - (k0 + BK - 1)) >= WINDOW)) {
+                continue;
             }
-        }
+            threadgroup half* Kc = Kc_base + (TRANS_K ? (sub * LDV) : sub);
+            threadgroup half* Vc = Vc_base + sub * LDV;
 
-        float tile_max = -INFINITY;
-        const bool full_visible = all_rows_ok && (k0 >= start) && (k0 + BK - 1 <= sg_first_diag)
-            && (WINDOW == 0 || (sg_last_diag - k0) < WINDOW);
-        if (full_visible) {
-            if ((sg_first_diag - (k0 + BK - 1)) >= R) {
+            simdgroup_float8x8 scores[BK / 8];
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            for (int db = 0; db < D / 8; ++db) {
                 for (int kb = 0; kb < BK / 8; ++kb) {
-                    for (int e = 0; e < 2; ++e) {
-                        float s = scores[kb].thread_elements()[e] * qscale;
-                        scores[kb].thread_elements()[e] = s;
-                        tile_max = max(tile_max, s);
+                    simdgroup_half8x8 k_frag;
+                    if constexpr (TRANS_K) {
+                        simdgroup_load(k_frag, Kc + kb * 8 * LDV + db * 8, LDV, ulong2(0, 0), true);
+                    } else {
+                        simdgroup_load(k_frag, Kc + db * 8 * LDK + kb * 8, LDK);
+                    }
+                    simdgroup_multiply_accumulate(scores[kb], q_frag[db], k_frag, scores[kb]);
+                }
+            }
+
+            float tile_max = -INFINITY;
+            const bool full_visible = all_rows_ok && (k0 >= start) && (k0 + BK - 1 <= sg_first_diag)
+                && (WINDOW == 0 || (sg_last_diag - k0) < WINDOW);
+            if (full_visible) {
+                if ((sg_first_diag - (k0 + BK - 1)) >= R) {
+                    for (int kb = 0; kb < BK / 8; ++kb) {
+                        for (int e = 0; e < 2; ++e) {
+                            float s = scores[kb].thread_elements()[e] * qscale;
+                            scores[kb].thread_elements()[e] = s;
+                            tile_max = max(tile_max, s);
+                        }
+                    }
+                } else if (VEC_BIAS && (sg_last_diag - k0) < R) {
+                    if constexpr (sizeof(T) == 2) {
+                        for (int kb = 0; kb < BK / 8; ++kb) {
+                            const int d0 = diag - (k0 + kb * 8 + fn);
+                            const packed_ushort2 raw = *(const device packed_ushort2*)(bias + d0 - 1);
+                            float s0 = scores[kb].thread_elements()[0] * qscale;
+                            s0 += float(as_type<T>(raw.y)) * LOG2E;
+                            float s1 = scores[kb].thread_elements()[1] * qscale;
+                            s1 += float(as_type<T>(raw.x)) * LOG2E;
+                            scores[kb].thread_elements()[0] = s0;
+                            scores[kb].thread_elements()[1] = s1;
+                            tile_max = max(tile_max, s0);
+                            tile_max = max(tile_max, s1);
+                        }
+                    } else {
+                        for (int kb = 0; kb < BK / 8; ++kb) {
+                            for (int e = 0; e < 2; ++e) {
+                                const int d = diag - (k0 + kb * 8 + fn + e);
+                                float s = scores[kb].thread_elements()[e] * qscale;
+                                s += float(bias[d]) * LOG2E;
+                                scores[kb].thread_elements()[e] = s;
+                                tile_max = max(tile_max, s);
+                            }
+                        }
+                    }
+                } else {
+                    for (int kb = 0; kb < BK / 8; ++kb) {
+                        for (int e = 0; e < 2; ++e) {
+                            const int d = diag - (k0 + kb * 8 + fn + e);
+                            float s = scores[kb].thread_elements()[e] * qscale;
+                            if (d < R) {
+                                s += float(bias[d]) * LOG2E;
+                            }
+                            scores[kb].thread_elements()[e] = s;
+                            tile_max = max(tile_max, s);
+                        }
                     }
                 }
             } else {
                 for (int kb = 0; kb < BK / 8; ++kb) {
                     for (int e = 0; e < 2; ++e) {
-                        const int d = diag - (k0 + kb * 8 + fn + e);
-                        float s = scores[kb].thread_elements()[e] * qscale;
-                        if (d < R) {
-                            s += float(bias[d]) * LOG2E;
+                        const int key = k0 + kb * 8 + fn + e;
+                        const int d = diag - key;
+                        const bool visible = row_ok && d >= 0 && key >= start
+                            && (WINDOW == 0 || d < WINDOW);
+                        float s = -INFINITY;
+                        if (visible) {
+                            s = scores[kb].thread_elements()[e] * qscale;
+                            if (d < R) {
+                                s += float(bias[d]) * LOG2E;
+                            }
                         }
                         scores[kb].thread_elements()[e] = s;
                         tile_max = max(tile_max, s);
                     }
                 }
             }
-        } else {
+            // The 4 lanes of a row are lane ^ 1 and lane ^ 8 apart.
+            tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
+            tile_max = max(tile_max, simd_shuffle_xor(tile_max, 8));
+            const float new_max = max(row_max, tile_max);
+            const float factor = fast::exp2(row_max - new_max);
+            const bool skip_pv = simd_all(tile_max - new_max < -25.0f);
+            float tile_sum = 0.0f;
+            simdgroup_half8x8 probs[BK / 8];
             for (int kb = 0; kb < BK / 8; ++kb) {
                 for (int e = 0; e < 2; ++e) {
-                    const int key = k0 + kb * 8 + fn + e;
-                    const int d = diag - key;
-                    const bool visible = row_ok && d >= 0 && key >= start
-                        && (WINDOW == 0 || d < WINDOW);
-                    float s = -INFINITY;
-                    if (visible) {
-                        s = scores[kb].thread_elements()[e] * qscale;
-                        if (d < R) {
-                            s += float(bias[d]) * LOG2E;
-                        }
-                    }
-                    scores[kb].thread_elements()[e] = s;
-                    tile_max = max(tile_max, s);
+                    const float p = fast::exp2(scores[kb].thread_elements()[e] - new_max);
+                    probs[kb].thread_elements()[e] = half(p);
+                    tile_sum += p;
                 }
             }
-        }
-        // The 4 lanes of a row are lane ^ 1 and lane ^ 8 apart.
-        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
-        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 8));
-        const float new_max = max(row_max, tile_max);
-        const float factor = fast::exp2(row_max - new_max);
-        const bool skip_pv = simd_all(tile_max - new_max < -25.0f);
-        float tile_sum = 0.0f;
-        simdgroup_half8x8 probs[BK / 8];
-        for (int kb = 0; kb < BK / 8; ++kb) {
-            for (int e = 0; e < 2; ++e) {
-                const float p = fast::exp2(scores[kb].thread_elements()[e] - new_max);
-                probs[kb].thread_elements()[e] = half(p);
-                tile_sum += p;
+            tile_sum += simd_shuffle_xor(tile_sum, 1);
+            tile_sum += simd_shuffle_xor(tile_sum, 8);
+            row_sum = row_sum * factor + tile_sum;
+            row_max = new_max;
+            if (factor != 1.0f) {
+                for (int db = 0; db < D / 8; ++db) {
+                    acc[db].thread_elements()[0] *= factor;
+                    acc[db].thread_elements()[1] *= factor;
+                }
             }
-        }
-        tile_sum += simd_shuffle_xor(tile_sum, 1);
-        tile_sum += simd_shuffle_xor(tile_sum, 8);
-        row_sum = row_sum * factor + tile_sum;
-        row_max = new_max;
-        if (factor != 1.0f) {
-            for (int db = 0; db < D / 8; ++db) {
-                acc[db].thread_elements()[0] *= factor;
-                acc[db].thread_elements()[1] *= factor;
-            }
-        }
-        if (!skip_pv) {
-            for (int db = 0; db < D / 8; ++db) {
-                for (int kb = 0; kb < BK / 8; ++kb) {
-                    simdgroup_half8x8 v_frag;
-                    simdgroup_load(v_frag, Vc + kb * 8 * LDV + db * 8, LDV);
-                    simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+            if (!skip_pv) {
+                for (int db = 0; db < D / 8; ++db) {
+                    for (int kb = 0; kb < BK / 8; ++kb) {
+                        simdgroup_half8x8 v_frag;
+                        simdgroup_load(v_frag, Vc + kb * 8 * LDV + db * 8, LDV);
+                        simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+                    }
                 }
             }
         }
@@ -563,7 +598,7 @@ def relative_attention(
     B, Hq, L, D = q.shape
     Hkv, S = k.shape[1], k.shape[2]
     if _FAST_REL_ATTN and Hq % Hkv == 0 and (Hq // Hkv) % _REL_GQA_BLK == 0:
-        qsg = _REL_QSG if _REL_QSG > 0 else (8 if S >= 4096 and L >= 256 else 4)
+        qsg = _REL_QSG if _REL_QSG > 0 else (8 if (L >= 1024 or (S >= 4096 and L >= 256)) else 4)
         bq = qsg * 8
         nq_tiles = (L + bq - 1) // bq
         tg = _REL_GQA_BLK * qsg * 32
@@ -590,6 +625,8 @@ def relative_attention(
                 ("QSG", qsg),
                 ("TRANS_K", _REL_TRANS_K),
                 ("DBUF", _REL_DBUF),
+                ("VEC_BIAS", _REL_VEC_BIAS),
+                ("BK_LOAD", _REL_BK_LOAD),
             ],
             grid=(nq_tiles * tg, ny, B),
             threadgroup=(tg, 1, 1),

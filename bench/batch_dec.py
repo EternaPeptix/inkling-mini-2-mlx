@@ -41,7 +41,7 @@ def prefill(model, ids):
     cache = make_prompt_cache(model)
     p = mx.array(ids)
     while p.size > 1:
-        n = min(2048, p.size - 1)
+        n = min(4096, p.size - 1)
         model(p[:n][None], cache=cache)
         mx.eval([c.state for c in cache])
         p = p[n:]

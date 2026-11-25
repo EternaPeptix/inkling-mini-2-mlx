@@ -22,6 +22,8 @@ _MODE = os.environ.get("LOOPLING_COMPILE_DECODE", "1")
 _COMPILE = _MODE == "1"
 _FCONV = os.environ.get("LOOPLING_FUSED_CONV", "1") not in ("0", "")
 _FD_FUSED = os.environ.get("LOOPLING_FD_FUSED", "1") not in ("0", "")
+_QKV_MID_B1 = os.environ.get("LOOPLING_QKV_MID_B1", "0") not in ("0", "")
+_SDPA_MID_B1 = os.environ.get("LOOPLING_SDPA_MID_B1", "1") not in ("0", "")
 _ctx: dict = {}
 _tau: dict = {}
 _wpos_cache: dict = {}
@@ -439,19 +441,6 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
 
     r1 = RL.k1_pre_layer(layer, h2, bs_in, m2)
     nr = r1["normed_residual"]
-    if m2 is None:
-        q_in, k_in, v_in = r1["q_in"], r1["k_in"], r1["v_in"]
-    else:
-        gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
-        mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), m2, (0, 1, 2), r1["qkv_gate_in"])
-        q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
-
-    qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
-    if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
-        gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
-    else:
-        dm = {nm: off for nm, off, _ in qkv_lay}
-        gate_off, sink_off = dm["gate"], dm["sinks"]
     tau_1d = None if sliding else _full_tau(layer, _end(kv)).reshape(-1)
     rel_w_bf = _rel_w_bf(a["rel_logits_proj"])
 
@@ -473,65 +462,121 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
         )
     )
     op_m = a["o_proj"]
-    if use_int8_kv:
-        q, kk, vv, pb, w0, w1 = RM.mid_rows_flat(
-            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=False
-        )
-        kq_n, vq_n, ks_n, vs_n = RS.quantize_kv_b1_int8(kk, vv)
-        k_q, v_q, k_s, v_s, end_int, cap = kv.update_b1_int8(kq_n, vq_n, ks_n, vs_n, _wpos)
-        attn_out = RS.sdpa_b1_int8(
-            q, k_q, v_q, k_s, v_s, pb, qkv_flat, gate_off, sink_off, end_int, end_int, cap, scale=a.scaling
-        )
-        op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
-    elif use_packed_kv:
+    if use_packed_kv and _QKV_MID_B1:
         if kv._packed is None:
             kv.pack_b1()
-        q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
-            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=True
-        )
+        if m2 is None:
+            q, kv_new, pb, gs_flat, w0, w1 = RP.qkv_mid_rel_b1(
+                layer, r1["q_in"], r1["k_in"], r1["v_in"], cs[0], cs[1], rel_w_bf, tau=tau_1d
+            )
+        else:
+            q, kv_new, pb, gs_flat, w0, w1 = RP.qkv_mid_rel_msg_b1(
+                layer, r1, m2, cs[0], cs[1], rel_w_bf, tau=tau_1d
+            )
         kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, _wpos)
         attn_out = RS.sdpa_b1_packed(
-            q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap,
+            q, kv_buf, pb, gs_flat, 0, 3072, S, end, idx, rot, cap,
             scale=a.scaling, window=a.sliding_window or 0,
         )
-        op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
+        op = mx.quantized_matmul(
+            attn_out, op_m["weight"], scales=op_m["scales"], biases=op_m["biases"],
+            transpose=True, group_size=64, bits=8, mode="affine",
+        )
     else:
-        q, kk, vv, pb, w0, w1 = RM.mid_rows_flat(
-            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=False
-        )
-        gate = qkv_flat[gate_off : gate_off + 3072].reshape(1, 3072)
-        sinks = qkv_flat[sink_off : sink_off + 24].reshape(1, 1, 24)
-        use_sdpa_rows = (
-            type(kv) in (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
-            and getattr(kv, "keep", 0) == 0
-            and q.dtype == mx.bfloat16
-            and kk.dtype == mx.bfloat16
-            and (kv.keys is None or kv.keys.dtype == mx.bfloat16)
-            and q.shape[0] == 1
-            and q.shape[1] == 24
-            and q.shape[2] == 128
-            and kk.shape[1] == 8
-        )
-        if use_sdpa_rows:
-            k_all, v_all = kv.update_and_fetch(kk[:, :, None, :], vv[:, :, None, :])
-            is_rot = isinstance(kv, (RotatingKVCache, BatchRotatingKVCache))
-            meta = [
-                (
-                    int(_end(kv)),
-                    int(kv._idx) if is_rot else 0,
-                    1 if is_rot else 0,
-                    int(kv.keys.shape[2]),
-                    int(kv.values.shape[2]),
-                )
-            ]
-            attn_out = RS.sdpa_rows(
-                q[:, :, None, :], [k_all], [v_all], pb[:, None], sinks,
-                meta, scale=a.scaling, window=a.sliding_window or 0, gate=gate,
-            ).reshape(1, 3072)
-            op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
+        if m2 is None:
+            q_in, k_in, v_in = r1["q_in"], r1["k_in"], r1["v_in"]
+            qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
         else:
-            attn_out = _core(layer, q[:, :, None, :], kk[:, :, None, :], vv[:, :, None, :], pb[:, None], sinks, kv)
-            op = RP.oproj_rows(attn_out, gate, op_m["weight"], op_m["scales"], op_m["biases"])
+            qkv_flat, qkv_lay = RP.qkv_msg_rows(layer, r1, m2, flat=True)
+        if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
+            gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
+        else:
+            dm = {item[0]: item[1] for item in qkv_lay}
+            gate_off, sink_off = dm["gate"], dm["sinks"]
+        if use_int8_kv:
+            q, kk, vv, pb, w0, w1 = RM.mid_rows_flat(
+                layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=False
+            )
+            kq_n, vq_n, ks_n, vs_n = RS.quantize_kv_b1_int8(kk, vv)
+            k_q, v_q, k_s, v_s, end_int, cap = kv.update_b1_int8(kq_n, vq_n, ks_n, vs_n, _wpos)
+            attn_out = RS.sdpa_b1_int8(
+                q, k_q, v_q, k_s, v_s, pb, qkv_flat, gate_off, sink_off, end_int, end_int, cap, scale=a.scaling
+            )
+            op = mx.quantized_matmul(
+                attn_out, op_m["weight"], scales=op_m["scales"], biases=op_m["biases"],
+                transpose=True, group_size=64, bits=8, mode="affine",
+            )
+        elif use_packed_kv:
+            if kv._packed is None:
+                kv.pack_b1()
+            is_rot = hasattr(kv, "_idx")
+            prev = int(kv.offset)
+            max_sz = int(kv.max_size) if is_rot else 0
+            S_now = min(prev + 1, max_sz) if is_rot else (prev + 1)
+            if _SDPA_MID_B1 and S_now < RS._TWO_PASS_N:
+                rot_wrap = 1 if (is_rot and prev >= max_sz) else 0
+                slot_main = (0 if kv._idx == max_sz else int(kv._idx)) if rot_wrap else prev
+                idx_now = (slot_main + 1) if is_rot else 0
+                attn_out, kv_new, w0, w1 = RS.sdpa_mid_b1(
+                    layer, qkv_flat, qkv_lay, kv._packed, cs[0], cs[1], rel_w_bf,
+                    S_now, prev + 1, idx_now, 1 if is_rot else 0, int(kv._packed.shape[2]),
+                    slot_main, rot_wrap, max_sz,
+                    scale=a.scaling, window=a.sliding_window or 0, tau=tau_1d,
+                )
+                kv.update_packed_b1(kv_new, _wpos)
+            else:
+                q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
+                    layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=True
+                )
+                kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, _wpos)
+                attn_out = RS.sdpa_b1_packed(
+                    q, kv_buf, pb, qkv_flat, gate_off, sink_off, S, end, idx, rot, cap,
+                    scale=a.scaling, window=a.sliding_window or 0,
+                )
+            op = mx.quantized_matmul(
+                attn_out, op_m["weight"], scales=op_m["scales"], biases=op_m["biases"],
+                transpose=True, group_size=64, bits=8, mode="affine",
+            )
+        else:
+            q, kk, vv, pb, w0, w1 = RM.mid_rows_flat(
+                layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv=False
+            )
+            gate = qkv_flat[gate_off : gate_off + 3072].reshape(1, 3072)
+            sinks = qkv_flat[sink_off : sink_off + 24].reshape(1, 1, 24)
+            use_sdpa_rows = (
+                type(kv) in (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
+                and getattr(kv, "keep", 0) == 0
+                and q.dtype == mx.bfloat16
+                and kk.dtype == mx.bfloat16
+                and (kv.keys is None or kv.keys.dtype == mx.bfloat16)
+                and q.shape[0] == 1
+                and q.shape[1] == 24
+                and q.shape[2] == 128
+                and kk.shape[1] == 8
+            )
+            if use_sdpa_rows:
+                k_all, v_all = kv.update_and_fetch(kk[:, :, None, :], vv[:, :, None, :])
+                is_rot = isinstance(kv, (RotatingKVCache, BatchRotatingKVCache))
+                meta = [
+                    (
+                        int(_end(kv)),
+                        int(kv._idx) if is_rot else 0,
+                        1 if is_rot else 0,
+                        int(kv.keys.shape[2]),
+                        int(kv.values.shape[2]),
+                    )
+                ]
+                attn_out = RS.sdpa_rows(
+                    q[:, :, None, :], [k_all], [v_all], pb[:, None], sinks,
+                    meta, scale=a.scaling, window=a.sliding_window or 0, gate=gate,
+                ).reshape(1, 3072)
+                op = mx.quantized_matmul(
+                    attn_out, op_m["weight"], scales=op_m["scales"], biases=op_m["biases"],
+                    transpose=True, group_size=64, bits=8, mode="affine",
+                )
+            else:
+                attn_out = _core(layer, q[:, :, None, :], kk[:, :, None, :], vv[:, :, None, :], pb[:, None], sinks, kv)
+                op = RP.oproj_rows(attn_out, gate, op_m["weight"], op_m["scales"], op_m["biases"])
 
     r10 = RL.k10_post_layer(layer, op, h2, nr, bs_in, cs[2], m2, debug=False)
     if layer.is_block_boundary:

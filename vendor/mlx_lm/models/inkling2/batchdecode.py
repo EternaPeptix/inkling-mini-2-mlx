@@ -1313,25 +1313,41 @@ class BatchDecoder:
                     tau_1d = _get_tau_table(layer, max_p)[oarr]
                     tau_cache[tkey] = tau_1d
         rel_w_bf = FD._rel_w_bf(rel_proj)
-        q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
-            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv_b=True
-        )
-        kv_news[v] = kv_new
-        sdpa_kw = dict(
-            scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
-            meta_arr=step_metas[v], Ss=step_Ss[v],
-        )
-        if st_info_arr is not None:
-            sdpa_kw["st_info_arr"] = st_info_arr
-        attn_out = RS.sdpa_rows_staged(
-            q,
-            stage.ks_main[v] if ks_v is None else ks_v,
-            stage.vs_main[v] if vs_v is None else vs_v,
-            stage.buf if stage_buf is None else stage_buf,
-            kv_new, pb, qkv_flat,
-            gate_off, gate_stride, sink_off, sink_stride, None,
-            **sdpa_kw,
-        )
+        if (
+            os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
+            and (len(step_Ss[v]) <= 2 or max(step_Ss[v]) >= 256)
+            and max(step_Ss[v]) < RS._TWO_PASS_N
+        ):
+            attn_out, kv_new, w0, w1 = RS.sdpa_mid_rows_staged(
+                layer, qkv_flat, qkv_lay,
+                stage.ks_main[v] if ks_v is None else ks_v,
+                stage.vs_main[v] if vs_v is None else vs_v,
+                stage.buf if stage_buf is None else stage_buf,
+                cs[0], cs[1], rel_w_bf,
+                scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
+                meta_arr=step_metas[v], Ss=step_Ss[v], st_info_arr=st_info_arr, tau=tau_1d,
+            )
+            kv_news[v] = kv_new
+        else:
+            q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
+                layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv_b=True
+            )
+            kv_news[v] = kv_new
+            sdpa_kw = dict(
+                scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
+                meta_arr=step_metas[v], Ss=step_Ss[v],
+            )
+            if st_info_arr is not None:
+                sdpa_kw["st_info_arr"] = st_info_arr
+            attn_out = RS.sdpa_rows_staged(
+                q,
+                stage.ks_main[v] if ks_v is None else ks_v,
+                stage.vs_main[v] if vs_v is None else vs_v,
+                stage.buf if stage_buf is None else stage_buf,
+                kv_new, pb, qkv_flat,
+                gate_off, gate_stride, sink_off, sink_stride, None,
+                **sdpa_kw,
+            )
         op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
         r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False)
         if layer.is_block_boundary:
@@ -1720,8 +1736,8 @@ class BatchDecoder:
                 self._pending_stage_deps = ()
         return h_out, h_ref_out
 
-    def _get_batch_compiled(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap):
-        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, scap)
+    def _get_batch_compiled(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, sdpa_mid=True):
+        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, bool(sdpa_mid))
         ent = self._batch_compiled.get(key)
         if ent is not None:
             return ent
@@ -1853,7 +1869,7 @@ class BatchDecoder:
         ):
             stage = self._stage_main
             regime_sig = tuple(
-                (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N))
+                (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N), max(Ss) >= 256)
                 for Ss in step_Ss
             )
             cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if (use_cd and cfg.mode == "hidden") else None
@@ -1861,8 +1877,9 @@ class BatchDecoder:
                 os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
                 and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
             )
+            sdpa_mid = os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
             chunks, pre_n, n_bs_core, cd_on, r_pass, blend_bs = self._get_batch_compiled(
-                regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap,
+                regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap, sdpa_mid=sdpa_mid,
             )
             layers_seq = tm.layer_visits
             conv_flat = [x for cs in self.conv for x in cs]
@@ -1895,6 +1912,7 @@ class BatchDecoder:
                 vs = [x for v in range(v0, v1) for x in stage.vs_main[v]]
                 return ks, vs
 
+            mid_eval = os.environ.get("LOOPLING_BATCH_MID_EVAL", "none")
             outs_all = []
             fn0, v0, v1, nbs_pre, fvs0 = chunks[0]
             ks0, vs0 = _kv_flat(v0, v1)
@@ -1902,7 +1920,8 @@ class BatchDecoder:
                 tokens, [], [], [], stage.buf, step_metas[v0:v1], st_infos[v0:v1], _taus_b(fvs0),
                 ks0, vs0, *conv_flat[4 * v0 : 4 * v1],
             )
-            mx.async_eval(o_pre[0])
+            if mid_eval in ("all", "pre"):
+                mx.async_eval(o_pre[0])
             outs_all.append((o_pre, v1 - v0, nbs_pre))
             h_pre = o_pre[0]
             bs_pre = o_pre[1 : 1 + nbs_pre]
@@ -1922,7 +1941,8 @@ class BatchDecoder:
                         stage.buf, step_metas[pv0:pv1], st_infos[pv0:pv1], _taus_b(pfvs),
                         ksp, vsp, *conv_flat[4 * pv0 : 4 * pv1],
                     )
-                mx.async_eval(o_p[0])
+                if mid_eval == "all":
+                    mx.async_eval(o_p[0])
                 outs_all.append((o_p, pv1 - pv0, nbs_p))
                 o_prev = o_p
                 if cd_on and p == r_pass:

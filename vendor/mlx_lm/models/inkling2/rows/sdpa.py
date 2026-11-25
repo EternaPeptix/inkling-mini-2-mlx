@@ -3225,3 +3225,416 @@ def sdpa_mid_b1(
         output_shapes=[(1, Hq * 128), (2, Hkv, 1, 128), (1, 3, Hkv * 128), (1, 3, Hkv * 128)],
         output_dtypes=[mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
     )
+
+
+# =============================================================================================== Batched (B=1..8) Fused K5 MID+REL + K8 SDPA (S < 1024)
+_SDPA_MID_BATCH_HEADER = _SDPA_MID_HEADER + r"""
+template <int D, int NS>
+METAL_FUNC void sdpa1_head_v32_mid_staged(
+    const threadgroup bfloat16_t* q_s,
+    const device bfloat16_t* K_main,
+    const device bfloat16_t* V_main,
+    const device bfloat16_t* Kst,
+    const device bfloat16_t* Vst,
+    const threadgroup bfloat16_t* knew_s,
+    const threadgroup bfloat16_t* vnew_s,
+    const device bfloat16_t* gate,
+    device bfloat16_t* out,
+    const int N,
+    const float scale,
+    const float sink,
+    const RowMaskTG msk,
+    const int slot_main,
+    const int rot_wrap,
+    const int max_size,
+    const int st_len,
+    threadgroup float* outputs,
+    threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int NV = BN / NS;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  typedef float U;
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread];
+  const int loff = (int)simd_lid * qk_per_thread;
+  bfloat4 qb = as_type<bfloat4>(((const threadgroup uint2*)(q_s + loff))[0]);
+  q[0] = static_cast<U>(scale) * qb.x;
+  q[1] = static_cast<U>(scale) * qb.y;
+  q[2] = static_cast<U>(scale) * qb.z;
+  q[3] = static_cast<U>(scale) * qb.w;
+  for (int v = 0; v < NV; v++) {
+    int vg = (int)simd_gid + v * NS;
+    for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+    if (vg == 0) {
+      max_score = sink;
+      sum_exp_score = 1;
+    }
+    for (int i = vg; i < N; i += BN) {
+      float fm = 0;
+      if (msk.at(i, fm)) {
+        int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+        bfloat4 kb, vb;
+        if (ds == st_len) {
+          kb = as_type<bfloat4>(((const threadgroup uint2*)(knew_s + loff))[0]);
+          vb = as_type<bfloat4>(((const threadgroup uint2*)(vnew_s + loff))[0]);
+        } else if (ds >= 0 && ds < st_len) {
+          kb = as_type<bfloat4>(((const device uint2*)(Kst + (size_t)ds * 128 + loff))[0]);
+          vb = as_type<bfloat4>(((const device uint2*)(Vst + (size_t)ds * 128 + loff))[0]);
+        } else {
+          kb = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)i * 128 + loff))[0]);
+          vb = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)i * 128 + loff))[0]);
+        }
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      }
+    }
+    if (simd_lid == 0) {
+      max_scores[vg] = max_score;
+      sum_exp_scores[vg] = sum_exp_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[(i * BD + simd_lid) * BN + vg] = o[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  U max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  for (int f = (int)simd_gid; f < BD; f += NS) {
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    }
+    if (simd_lid == 0) {
+      int base = f * v_per_thread;
+      bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+      bfloat4 ob = bfloat4(
+          static_cast<bfloat16_t>(glue_gate(static_cast<float>(static_cast<bfloat16_t>(o[0])), static_cast<float>(gb.x))),
+          static_cast<bfloat16_t>(glue_gate(static_cast<float>(static_cast<bfloat16_t>(o[1])), static_cast<float>(gb.y))),
+          static_cast<bfloat16_t>(glue_gate(static_cast<float>(static_cast<bfloat16_t>(o[2])), static_cast<float>(gb.z))),
+          static_cast<bfloat16_t>(glue_gate(static_cast<float>(static_cast<bfloat16_t>(o[3])), static_cast<float>(gb.w))));
+      ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+    }
+  }
+}
+"""
+
+
+def _sdpa_mid_batch_source(full, thr_q, thr_k, thr_r, eps_v, scale_lit, kv_select):
+    scale_conv = flit(np.float32(math.sqrt(5)))
+    k_conv_expr = """
+        float sw[4];
+        for (int k = 0; k < 4; k++) sw[k] = float(cw01[k * 1024 + c]);
+        y[i] = mid_conv_d(x0v, s0v, s1v, s2v, sw, dy);""" if full else f"""
+        bfloat4 cwb = as_type<bfloat4>(((const device uint2*)(cw01 + c * 4))[0]);
+        y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cwb.x), float(cwb.y), float(cwb.z), float(cwb.w), {scale_conv});"""
+    v_conv_expr = """
+        float sw[4];
+        for (int k = 0; k < 4; k++) sw[k] = float(cw01[4096 + k * 1024 + c]);
+        y[i] = mid_conv_d(x0v, s0v, s1v, s2v, sw, dy);""" if full else f"""
+        bfloat4 cwb = as_type<bfloat4>(((const device uint2*)(cw01 + 4096 + c * 4))[0]);
+        y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cwb.x), float(cwb.y), float(cwb.z), float(cwb.w), {scale_conv});"""
+    k_dy_load = """
+      bfloat4 dyp = as_type<bfloat4>(((const device uint2*)(qkv + OFF_KW + (size_t)b * STR_KW + kvh * 4))[0]);
+      float dy[4] = {float(dyp.x), float(dyp.y), float(dyp.z), float(dyp.w)};""" if full else ""
+    v_dy_load = """
+      bfloat4 dyp = as_type<bfloat4>(((const device uint2*)(qkv + OFF_VW + (size_t)b * STR_VW + kvh * 4))[0]);
+      float dy[4] = {float(dyp.x), float(dyp.y), float(dyp.z), float(dyp.w)};""" if full else ""
+    return f"""
+    constexpr int D = 128;
+    constexpr int P_SG = (NS >= 16) ? 8 : (NS - 3);
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    threadgroup uint2 q_raw[32];
+    threadgroup uint2 kn_raw[32];
+    threadgroup uint2 vn_raw[32];
+    threadgroup bfloat16_t pb_s[1024];
+    threadgroup bfloat16_t* q_s = (threadgroup bfloat16_t*)q_raw;
+    threadgroup bfloat16_t* knew_s = (threadgroup bfloat16_t*)kn_raw;
+    threadgroup bfloat16_t* vnew_s = (threadgroup bfloat16_t*)vn_raw;
+
+    const int t = (int)threadgroup_position_in_grid.x;
+    const int b = t / HQ;
+    const int h = t % HQ;
+    const int kvh = h / GQA;
+    const bool kv_owner = (h == kvh * GQA);
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int S = meta[b * MW + 0];
+    {"const float tau_v = tau[b];" if full else ""}
+
+    if (simd_gid == 0u) {{
+      const uint qoff_w = (uint)h * 128u + simd_lid * 4u;
+      const size_t qoff = OFF_Q + (size_t)b * STR_Q + qoff_w;
+      bfloat4 xb = as_type<bfloat4>(((const device uint2*)(qkv + qoff))[0]);
+      bfloat4 qsb = as_type<bfloat4>(((const device uint2*)(qr_scale + qoff_w))[0]);
+      float s[4] = {{
+          float(xb.x) * float(qsb.x),
+          float(xb.y) * float(qsb.y),
+          float(xb.z) * float(qsb.z),
+          float(xb.w) * float(qsb.w),
+      }};
+      glue_l2_clip_lane128(s, {flit(thr_q)});
+      bfloat16_t qo[4];
+      for (int i = 0; i < 4; i++) {{
+        bfloat16_t o = bfloat16_t(s[i]);
+        {"o = bfloat16_t(glue_tau(float(o), tau_v));" if full else ""}
+        qo[i] = o;
+      }}
+      q_raw[simd_lid] = as_type<uint2>(bfloat4(qo[0], qo[1], qo[2], qo[3]));
+    }} else if (simd_gid == 1u) {{
+      const int c0 = kvh * 128 + (int)simd_lid * 4;
+      bfloat4 xb = as_type<bfloat4>(((const device uint2*)(qkv + OFF_K + (size_t)b * STR_K + c0))[0]);
+      float4 x0f = float4(float(xb.x), float(xb.y), float(xb.z), float(xb.w));
+      const device float* cs0b = cs0 + (size_t)b * 3072u;
+      float4 s0f = ((const device float4*)(cs0b + c0))[0];
+      float4 s1f = ((const device float4*)(cs0b + 1024 + c0))[0];
+      float4 s2f = ((const device float4*)(cs0b + 2048 + c0))[0];
+      if (kv_owner) {{
+        device float* w0b = w0 + (size_t)b * 3072u;
+        ((device float4*)(w0b + c0))[0] = s1f;
+        ((device float4*)(w0b + 1024 + c0))[0] = s2f;
+        ((device float4*)(w0b + 2048 + c0))[0] = x0f;
+      }}{k_dy_load}
+      float x0a[4] = {{x0f.x, x0f.y, x0f.z, x0f.w}};
+      float s0a[4] = {{s0f.x, s0f.y, s0f.z, s0f.w}};
+      float s1a[4] = {{s1f.x, s1f.y, s1f.z, s1f.w}};
+      float s2a[4] = {{s2f.x, s2f.y, s2f.z, s2f.w}};
+      float y[4];
+      for (int i = 0; i < 4; i++) {{
+        int c = c0 + i;
+        float x0v = x0a[i], s0v = s0a[i], s1v = s1a[i], s2v = s2a[i];
+        {k_conv_expr}
+      }}
+      glue_l2_clip_lane128(y, {flit(thr_k)});
+      uint2 pk = as_type<uint2>(bfloat4(bfloat16_t(y[0]), bfloat16_t(y[1]), bfloat16_t(y[2]), bfloat16_t(y[3])));
+      kn_raw[simd_lid] = pk;
+      if (kv_owner) ((device uint2*)(kv_out + (size_t)b * 2048u + c0))[0] = pk;
+    }} else if (simd_gid == 2u) {{
+      const int c0 = kvh * 128 + (int)simd_lid * 4;
+      bfloat4 xb = as_type<bfloat4>(((const device uint2*)(qkv + OFF_V + (size_t)b * STR_V + c0))[0]);
+      float4 x0f = float4(float(xb.x), float(xb.y), float(xb.z), float(xb.w));
+      const device float* cs1b = cs1 + (size_t)b * 3072u;
+      float4 s0f = ((const device float4*)(cs1b + c0))[0];
+      float4 s1f = ((const device float4*)(cs1b + 1024 + c0))[0];
+      float4 s2f = ((const device float4*)(cs1b + 2048 + c0))[0];
+      if (kv_owner) {{
+        device float* w1b = w1 + (size_t)b * 3072u;
+        ((device float4*)(w1b + c0))[0] = s1f;
+        ((device float4*)(w1b + 1024 + c0))[0] = s2f;
+        ((device float4*)(w1b + 2048 + c0))[0] = x0f;
+      }}{v_dy_load}
+      float x0a[4] = {{x0f.x, x0f.y, x0f.z, x0f.w}};
+      float s0a[4] = {{s0f.x, s0f.y, s0f.z, s0f.w}};
+      float s1a[4] = {{s1f.x, s1f.y, s1f.z, s1f.w}};
+      float s2a[4] = {{s2f.x, s2f.y, s2f.z, s2f.w}};
+      float y[4];
+      for (int i = 0; i < 4; i++) {{
+        int c = c0 + i;
+        float x0v = x0a[i], s0v = s0a[i], s1v = s1a[i], s2v = s2a[i];
+        {v_conv_expr}
+      }}
+      ((threadgroup float4*)(outputs + simd_lid * 4u))[0] = float4(y[0], y[1], y[2], y[3]);
+      float inv_v = glue_rms_inv_sg<128, true>(outputs, {flit(eps_v)}, simd_lid);
+      uint2 pk = as_type<uint2>(bfloat4(
+          glue_rms_apply_nw<bfloat16_t>(y[0], inv_v),
+          glue_rms_apply_nw<bfloat16_t>(y[1], inv_v),
+          glue_rms_apply_nw<bfloat16_t>(y[2], inv_v),
+          glue_rms_apply_nw<bfloat16_t>(y[3], inv_v)));
+      vn_raw[simd_lid] = pk;
+      if (kv_owner) ((device uint2*)(kv_out + (size_t)b * 2048u + 1024u + c0))[0] = pk;
+    }} else if (simd_gid < uint(3 + P_SG)) {{
+      const int p = (int)simd_gid - 3;
+      const int n_pb = min(S, R);
+      const int n_pb16 = (n_pb + 15) & ~15;
+      if (p * 16 < n_pb16) {{
+        threadgroup bfloat16_t* rel_tile = (threadgroup bfloat16_t*)(outputs + 256u + (uint)p * 64u);
+        ((threadgroup uint2*)rel_tile)[simd_lid] = uint2(0u, 0u);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lid == 0u) {{
+          float s[16];
+          const device bfloat16_t* rp = qkv + OFF_R + (size_t)b * STR_R + (size_t)h * 16u;
+          const device bfloat16_t* rsp = qr_scale + HQ * 128 + h * 16;
+          for (int i = 0; i < 16; i++) s[i] = float(rp[i]) * float(rsp[i]);
+          glue_l2_clip_row16(s, {flit(thr_r)});
+          for (int i = 0; i < 16; i++) {{
+            bfloat16_t o = bfloat16_t(s[i]);
+            {"o = bfloat16_t(glue_tau(float(o), tau_v));" if full else ""}
+            rel_tile[i] = o;
+          }}
+        }}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_bfloat8x8 ma0, ma1;
+        simdgroup_load(ma0, rel_tile + 0, 16);
+        simdgroup_load(ma1, rel_tile + 8, 16);
+        threadgroup float* st = outputs + 1024u + (uint)p * 128u;
+        for (int n0 = p * 16; n0 < n_pb16; n0 += P_SG * 16) {{
+          const device bfloat16_t* Bm = rw + n0;
+          simdgroup_bfloat8x8 mb00, mb10, mb01, mb11;
+          simdgroup_load(mb00, Bm + 0 * R + 0, R);
+          simdgroup_load(mb10, Bm + 8 * R + 0, R);
+          simdgroup_load(mb01, Bm + 0 * R + 8, R);
+          simdgroup_load(mb11, Bm + 8 * R + 8, R);
+          simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+          simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+          simdgroup_multiply_accumulate(acc0, ma0, mb00, acc0);
+          simdgroup_multiply_accumulate(acc0, ma1, mb10, acc0);
+          simdgroup_multiply_accumulate(acc1, ma0, mb01, acc1);
+          simdgroup_multiply_accumulate(acc1, ma1, mb11, acc1);
+          simdgroup_store(acc0, st, 8);
+          simdgroup_store(acc1, st + 64u, 8);
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_lid < 16u) {{
+            int col = n0 + (int)simd_lid;
+            if (col < 1024) pb_s[col] = bfloat16_t(st[(simd_lid < 8u) ? simd_lid : (64u + simd_lid - 8u)]);
+          }}
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+      }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const device bfloat16_t* K;
+    const device bfloat16_t* V;
+    {kv_select}
+    const int kcap = meta[b * MW + 4];
+    const int vcap = meta[b * MW + 5];
+    const int slot_main = meta[b * MW + 6];
+    const int rot_wrap = meta[b * MW + 7];
+    const int max_size = meta[b * MW + 8];
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    const int st_len = st_info[2];
+    const device bfloat16_t* Kst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+    const device bfloat16_t* Vst = stage + ((((size_t)kv_lidx * NROWS + b) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+    RowMaskTG msk;
+    msk.pb = pb_s;
+    msk.S = S; msk.end = meta[b * MW + 1]; msk.idx = meta[b * MW + 2]; msk.rot = meta[b * MW + 3];
+    msk.R = R; msk.window = WIN;
+    float sink = float(static_cast<bfloat16_t>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
+    sdpa1_head_v32_mid_staged<D, NS>(
+        q_s, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D, Kst, Vst,
+        knew_s, vnew_s, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D,
+        out + (size_t)t * D, S, {scale_lit}, sink, msk, slot_main, rot_wrap, max_size, st_len,
+        outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+
+_sdpa_mid_batch_kernels: dict = {}
+_sdpa_mid_batch_layer_cache: dict = {}
+
+
+def _get_sdpa_mid_batch_layer_meta(layer):
+    full, q_sc, r_sc, cw0, cw1, thr_q, thr_k, thr_r, eps_v, Hq, Hkv = _get_sdpa_mid_layer_meta(layer)
+    key = id(layer)
+    refs = (q_sc, r_sc, cw0, cw1)
+    ent = _sdpa_mid_batch_layer_cache.get(key)
+    if ent is not None and all(a is b for a, b in zip(ent[0], refs)):
+        return ent[1]
+    if len(_sdpa_mid_batch_layer_cache) >= 256:
+        _sdpa_mid_batch_layer_cache.clear()
+    qr_scale = mx.contiguous(mx.concatenate([q_sc.reshape(-1), r_sc.reshape(-1)]))
+    cw01 = mx.contiguous(mx.concatenate([cw0.reshape(-1), cw1.reshape(-1)]))
+    mx.eval(qr_scale, cw01)
+    val = (full, qr_scale, cw01, thr_q, thr_k, thr_r, eps_v, Hq, Hkv)
+    _sdpa_mid_batch_layer_cache[key] = (refs, val)
+    if not isinstance(layer, dict) or hasattr(layer, "__weakref__"):
+        try:
+            weakref.finalize(layer, _sdpa_mid_batch_layer_cache.pop, key, None)
+        except TypeError:
+            pass
+    return val
+
+
+def sdpa_mid_rows_staged(
+    layer, qkv_flat, qkv_lay, ks_main, vs_main, stage, cs0, cs1, rel_w,
+    *, scale, window, kv_layer_idx, st_len, scap, meta_arr, Ss, st_info_arr=None, tau=None,
+):
+    """Batched (B=1..8) fused K5 MID+REL + K8 SDPA over main KV + stage buffer (S < 1024).
+    Returns (attn_out (B, Hq*128) bf16, kv_new (B, 2, Hkv, 128) bf16, w0 (B, 3, Hkv*128) f32, w1 (B, 3, Hkv*128) f32)."""
+    B = len(ks_main)
+    assert 1 <= B <= 8 and max(Ss) < _TWO_PASS_N
+    full, qr_scale, cw01, thr_q, thr_k, thr_r, eps_v, Hq, Hkv = _get_sdpa_mid_batch_layer_meta(layer)
+    gqa = Hq // Hkv
+    R = int(rel_w.shape[1])
+    offs = {item[0]: (item[1], item[2]) for item in qkv_lay}
+    if st_info_arr is not None:
+        st_info = st_info_arr
+    else:
+        st_key = (int(kv_layer_idx), int(scap), int(st_len))
+        st_info = _ST_INFO_CACHE.get(st_key)
+        if st_info is None:
+            if len(_ST_INFO_CACHE) >= 4096:
+                _ST_INFO_CACHE.clear()
+            st_info = _ST_INFO_CACHE[st_key] = mx.array(st_key, mx.int32)
+    scale_lit = flit(float(scale))
+    ins = [qkv_flat, stage, cs0, cs1, qr_scale, rel_w, meta_arr, st_info, cw01]
+    if full:
+        ins.append(tau.reshape(-1))
+    ins += list(ks_main) + list(vs_main)
+    kkey = (B, full, thr_q, thr_k, thr_r, eps_v, scale_lit, tuple(x.dtype for x in ins))
+    kern = _sdpa_mid_batch_kernels.get(kkey)
+    if kern is None:
+        sel = "switch (b) {\n" + "".join(
+            f"        case {i}: K = k{i}; V = v{i}; break;\n" for i in range(B)
+        ) + "        default: K = k0; V = v0; break;\n    }"
+        in_names = ["qkv", "stage", "cs0", "cs1", "qr_scale", "rw", "meta", "st_info", "cw01"]
+        if full:
+            in_names.append("tau")
+        in_names += [f"k{i}" for i in range(B)] + [f"v{i}" for i in range(B)]
+        kern = _sdpa_mid_batch_kernels[kkey] = mx.fast.metal_kernel(
+            name="batch_sdpa_mid_b%d_%s_%d" % (B, "F" if full else "S", abs(hash(kkey)) % 10**9),
+            input_names=in_names,
+            output_names=["out", "kv_out", "w0", "w1"],
+            source=_sdpa_mid_batch_source(full, thr_q, thr_k, thr_r, eps_v, scale_lit, sel),
+            header=_SDPA_MID_BATCH_HEADER,
+            ensure_row_contiguous=False,
+        )
+    ns_env = os.environ.get("LOOPLING_SDPA_MID_BATCH_NS", "0")
+    ns = int(ns_env) if ns_env and ns_env != "0" else (32 if B <= 2 else 16)
+    tmpl = [
+        ("NROWS", B), ("MW", _SMW), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+        ("R", R), ("WIN", int(window)), ("NS", ns),
+        ("OFF_Q", offs["q_proj"][0]), ("STR_Q", offs["q_proj"][1]),
+        ("OFF_R", offs["r_proj"][0]), ("STR_R", offs["r_proj"][1]),
+        ("OFF_K", offs["k_proj"][0]), ("STR_K", offs["k_proj"][1]),
+        ("OFF_V", offs["v_proj"][0]), ("STR_V", offs["v_proj"][1]),
+        ("GATE_OFF", offs["gate"][0]), ("GATE_STRIDE", offs["gate"][1]),
+        ("SINK_OFF", offs["sinks"][0]), ("SINK_STRIDE", offs["sinks"][1]),
+    ]
+    if full:
+        tmpl += [
+            ("OFF_KW", offs["k_wproj"][0]), ("STR_KW", offs["k_wproj"][1]),
+            ("OFF_VW", offs["v_wproj"][0]), ("STR_VW", offs["v_wproj"][1]),
+        ]
+    return kern(
+        inputs=ins,
+        template=tmpl,
+        grid=(B * Hq * 32 * ns, 1, 1),
+        threadgroup=(32 * ns, 1, 1),
+        output_shapes=[(B, Hq * 128), (B, 2, Hkv, 128), (B, 3, Hkv * 128), (B, 3, Hkv * 128)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
+    )

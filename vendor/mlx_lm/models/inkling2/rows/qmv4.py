@@ -939,6 +939,8 @@ _qmv4_bf16_top16_p2_k = None
 _zero_pad_bf16_cache = {}
 _dflash2_pack_chain_k = None
 _dflash2_pack_tree_dink_k = None
+_dflash2_pack_coupled_k = None
+_coupled_walk_k = None
 _dyn_conv_s0_bf16_k = None
 _dyn_conv_res_rms_bf16_k = None
 _qkv_norm_rope_bf16_k = {}
@@ -4373,3 +4375,226 @@ def dflash2_pack_tree_dink_gpu(
         output_shapes=[(WW,), (WW,), (WW,), (WW, 3), (WW, 9), (1,)],
         output_dtypes=[mx.uint32, mx.int32, mx.int32, mx.int32, mx.int32, mx.int32],
     )
+
+
+_DFLASH2_PACK_COUPLED_SRC = r"""
+  if (thread_position_in_grid.x != 0u) return;
+  const float inv_dt = draft_cfg[0];
+  uint anc_tok = anchor[0];
+  block_toks[0] = anc_tok;
+  parents_out[0] = -1;
+  depths_out[0] = 0;
+
+  float mx0 = sc0[0];
+  for (int j = 1; j < 16; j++) mx0 = max(mx0, sc0[j]);
+  float p0[16];
+  float sm0 = 0.0f;
+  for (int j = 0; j < 16; j++) {
+    p0[j] = metal::exp((sc0[j] - mx0) * inv_dt);
+    sm0 += p0[j];
+  }
+  float inv_s0 = 1.0f / max(sm0, 1e-12f);
+  for (int j = 0; j < 16; j++) {
+    p0[j] *= inv_s0;
+    q_probs[j] = p0[j];
+  }
+  int slot = 15;
+  float cum0 = 0.0f;
+  float u0 = u_draft[0];
+  for (int j = 0; j < 15; j++) {
+    cum0 += p0[j];
+    if (u0 <= cum0) { slot = j; break; }
+  }
+  block_toks[1] = uint(top_idx[slot]);
+  q_child[0] = p0[slot];
+  parents_out[1] = 0;
+  depths_out[1] = 1;
+
+  for (int p = 1; p < WW - 1; p++) {
+    const device float* row = sc16 + ((p - 1) * 16 + slot) * 16;
+    device float* q_dst = q_probs + p * 16;
+    float mxr = row[0];
+    for (int j = 1; j < 16; j++) mxr = max(mxr, row[j]);
+    float pr[16];
+    float smr = 0.0f;
+    for (int j = 0; j < 16; j++) {
+      pr[j] = metal::exp((row[j] - mxr) * inv_dt);
+      smr += pr[j];
+    }
+    float inv_sr = 1.0f / max(smr, 1e-12f);
+    for (int j = 0; j < 16; j++) {
+      pr[j] *= inv_sr;
+      q_dst[j] = pr[j];
+    }
+    int nslot = 15;
+    float cumr = 0.0f;
+    float up = u_draft[p];
+    for (int j = 0; j < 15; j++) {
+      cumr += pr[j];
+      if (up <= cumr) { nslot = j; break; }
+    }
+    slot = nslot;
+    block_toks[p + 1] = uint(top_idx[p * 16 + slot]);
+    q_child[p] = pr[slot];
+    parents_out[p + 1] = p;
+    depths_out[p + 1] = p + 1;
+  }
+
+  for (int b = 0; b < WW; b++) {
+    conv_anc[b * 3 + 0] = (b >= 3) ? (b - 3) : -(b + 1);
+    conv_anc[b * 3 + 1] = (b >= 2) ? (b - 2) : -(b + 2);
+    conv_anc[b * 3 + 2] = (b >= 1) ? (b - 1) : -3;
+    tree_meta[b * 9 + 0] = b;
+    for (int k = 0; k < 8; k++) {
+      tree_meta[b * 9 + 1 + k] = (k <= b) ? k : 0;
+    }
+  }
+"""
+
+
+def dflash2_pack_coupled_chain_gpu(
+    top_idx: mx.array, sc0: mx.array, sc16: mx.array, anchor: mx.array, W: int, u_draft: mx.array, draft_cfg: mx.array
+):
+    """Zero-sync coupled stochastic chain packer on GPU -> `(blk, par, dep, ca, tm, q_ids, q_probs, q_child)`."""
+    global _dflash2_pack_coupled_k
+    WW = int(W)
+    assert 2 <= WW <= 8
+    if _dflash2_pack_coupled_k is None:
+        _dflash2_pack_coupled_k = mx.fast.metal_kernel(
+            name="dflash2_pack_coupled_chain_gpu",
+            input_names=["top_idx", "sc0", "sc16", "anchor", "u_draft", "draft_cfg"],
+            output_names=["block_toks", "parents_out", "depths_out", "conv_anc", "tree_meta", "q_probs", "q_child"],
+            source=_DFLASH2_PACK_COUPLED_SRC,
+            ensure_row_contiguous=True,
+        )
+    anc_u = anchor.reshape(-1)
+    if anc_u.dtype != mx.uint32:
+        anc_u = anc_u.astype(mx.uint32)
+    ti_u = top_idx.astype(mx.uint32)
+    blk, par, dep, ca, tm, q_probs, q_child = _dflash2_pack_coupled_k(
+        inputs=[ti_u.reshape(-1), sc0.reshape(-1), sc16.reshape(-1), anc_u, u_draft.reshape(-1), draft_cfg.reshape(-1)],
+        template=[("WW", WW)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(WW,), (WW,), (WW,), (WW, 3), (WW, 9), (WW - 1, 16), (WW - 1,)],
+        output_dtypes=[mx.uint32, mx.int32, mx.int32, mx.int32, mx.int32, mx.float32, mx.float32],
+    )
+    return blk, par, dep, ca, tm, ti_u, q_probs, q_child
+
+
+_COUPLED_WALK_SRC = r"""
+  if (thread_position_in_grid.x != 0u) return;
+  int keep = 1;
+  uint last_tok = bonus_tok[0];
+  for (int b = 0; b < WW - 1; b++) {
+    float qc = q_child[b];
+    float pt = child_pt[b];
+    if (qc > 0.0f && u_acc[b] * qc <= pt) {
+      keep++;
+    } else {
+      last_tok = reject_tok[b];
+      break;
+    }
+  }
+  if (keep == WW) {
+    last_tok = bonus_tok[WW - 1];
+  }
+  for (int i = 0; i < WW; i++) {
+    path_pad[i] = (i < keep) ? i : 0;
+    if (i < keep - 1) {
+      emitted[i] = blk[i + 1];
+    } else if (i == keep - 1) {
+      emitted[i] = last_tok;
+    } else {
+      emitted[i] = 0u;
+    }
+  }
+  keep_arr[0] = keep;
+  last_slot[0] = keep - 1;
+  anchor_next[0] = last_tok;
+
+  const int end0_r = meta_r[1];
+  const int slot0_r = meta_r[2];
+  const int cap_r = meta_r[3];
+  const int max_size_r = meta_r[4];
+  const int end1_r = end0_r + keep;
+  const int s1_r = min(end1_r, max_size_r);
+  const int next_slot0_r = (slot0_r + keep) % max_size_r;
+  slot_r_old[0] = slot0_r;
+  next_meta_r[0] = s1_r;
+  next_meta_r[1] = end1_r;
+  next_meta_r[2] = next_slot0_r;
+  next_meta_r[3] = cap_r;
+  next_meta_r[4] = max_size_r;
+  next_meta_r[5] = 0;
+
+  const int end0_f = meta_f[1];
+  const int cap_f = meta_f[3];
+  const int end1_f = end0_f + keep;
+  end_f_old[0] = end0_f;
+  next_meta_f[0] = end1_f;
+  next_meta_f[1] = end1_f;
+  next_meta_f[2] = 0;
+  next_meta_f[3] = cap_f;
+  next_meta_f[4] = 0;
+  next_meta_f[5] = 0;
+
+  if (META_LEN == 8) {
+    const int st_old = meta_r[7];
+    st_pos_old[0] = st_old;
+    next_meta_r[6] = meta_r[6];
+    next_meta_r[7] = st_old + keep;
+    next_meta_f[6] = meta_f[6];
+    next_meta_f[7] = st_old + keep;
+  } else {
+    st_pos_old[0] = 0;
+  }
+
+  const int P = dr_pos[0];
+  dr_pos_old[0] = P;
+  next_dr_pos[0] = P + keep;
+"""
+
+
+def coupled_walk_commit_meta_gpu(
+    blk, bonus_tok, reject_tok, child_pt, q_child, u_acc, meta_r, meta_f, dr_pos, W
+):
+    """On-GPU Leviathan coupled accept/reject chain walk + next KV/drafter metadata update."""
+    global _coupled_walk_k
+    if _coupled_walk_k is None:
+        _coupled_walk_k = mx.fast.metal_kernel(
+            name="coupled_walk_commit_meta_gpu",
+            input_names=["blk", "bonus_tok", "reject_tok", "child_pt", "q_child", "u_acc", "meta_r", "meta_f", "dr_pos"],
+            output_names=[
+                "path_pad", "emitted", "keep_arr", "last_slot", "anchor_next",
+                "slot_r_old", "end_f_old", "dr_pos_old", "next_meta_r", "next_meta_f", "next_dr_pos",
+                "st_pos_old",
+            ],
+            source=_COUPLED_WALK_SRC,
+            ensure_row_contiguous=True,
+        )
+    WW = int(W)
+    assert 2 <= WW <= 8
+    bu = blk.reshape(-1)
+    if bu.dtype != mx.uint32:
+        bu = bu.astype(mx.uint32)
+    mr = meta_r.reshape(-1)
+    mf = meta_f.reshape(-1)
+    mlen = int(mr.shape[0])
+    assert mlen in (6, 8) and int(mf.shape[0]) == mlen
+    res = _coupled_walk_k(
+        inputs=[
+            bu, bonus_tok.reshape(-1), reject_tok.reshape(-1),
+            child_pt.reshape(-1), q_child.reshape(-1), u_acc.reshape(-1),
+            mr, mf, dr_pos.reshape(-1),
+        ],
+        template=[("WW", WW), ("META_LEN", mlen)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(WW,), (WW,), (1,), (1,), (1,), (1,), (1,), (1,), (mlen,), (mlen,), (1,), (1,)],
+        output_dtypes=[
+            mx.int32, mx.uint32, mx.int32, mx.int32, mx.uint32,
+            mx.int32, mx.int32, mx.int32, mx.int32, mx.int32, mx.int32, mx.int32,
+        ],
+    )
+    return res if mlen == 8 else res[:11]

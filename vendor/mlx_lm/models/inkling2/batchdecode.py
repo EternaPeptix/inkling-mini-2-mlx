@@ -218,6 +218,21 @@ def _b1_cache_ok(lc) -> bool:
     )
 
 
+def _std_sampler_params(sampler):
+    """Return `(temp, top_p, min_p)` if `sampler` matches standard `make_sampler` with GPU fast path, else None."""
+    key = getattr(sampler, "_sampler_key", None)
+    if (
+        isinstance(key, tuple)
+        and len(key) == 8
+        and key[0] > 0.0
+        and key[3] <= 1
+        and key[4] == 0
+        and key[5] == 0.0
+    ):
+        return float(key[0]), float(key[1]), float(key[2])
+    return None
+
+
 _cw_darr_cache: dict = {}
 _cw_tau_lut_cache: dict = {}
 _cw_tau_table_cache: dict = {}
@@ -2078,7 +2093,8 @@ class BatchDecoder:
             z_R, z_ref = self._pair_logits_softcap(h, h_ref)
             logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd)
         elif not is_greedy:
-            logits = self._project_logits_softcap(h)
+            tok = self._sample_verify_tokens(h.reshape(1, 2304), sampler).reshape(1).astype(mx.uint32)
+            return self._with_stage_deps(tok), tap_buf
         elif "head" in _FUSED:
             m = self.model
             lm = m.lm_head
@@ -2324,12 +2340,28 @@ class BatchDecoder:
         ret = tuple(o2[:head2]) if use_walk else o2[0]
         return ret, kv_news, conv_ws, tap_buf
 
-    def _sample_verify_tokens(self, h_out, sampler):
+    def _sample_verify_tokens(self, h_out, sampler, *, coupled=None):
         m = self.model
         lm = m.lm_head
         text = m.args.text
+        std = _std_sampler_params(sampler)
+        if coupled is not None and std is not None and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
+            q_ids, q_probs, child_toks = coupled
+            lg = RQ.qmv_rows(h_out, lm["weight"], lm["scales"], lm["biases"])
+            bonus, reject, child_pt, ovf = RH.softcap_coupled_verify_rows(
+                lg, text.final_logit_softcapping, text.unpadded_vocab_size,
+                q_ids, q_probs, child_toks, temp=std[0], top_p=std[1], min_p=std[2],
+            )
+            return bonus, reject, child_pt, ovf
         if "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
             lg = RQ.qmv_rows(h_out, lm["weight"], lm["scales"], lm["biases"])
+            if std is not None and 0.0 < std[1] < 1.0:
+                toks, ovf = RH.softcap_sample_rows(
+                    lg, text.final_logit_softcapping, text.unpadded_vocab_size,
+                    temp=std[0], top_p=std[1], min_p=std[2],
+                )
+                if int(mx.max(ovf).item()) == 0:
+                    return toks
         elif "head" in _PLAIN:
             lg = lm(h_out)
         else:
@@ -2344,7 +2376,7 @@ class BatchDecoder:
 
     def verify_w_gpu(
         self, tokens, *, meta_r, meta_f, depths_arr, conv_anc, tree_meta, max_depth, binfo, tau_cap,
-        tap_visits=None, par_arr=None, dr_pos=None, use_stage=False, w_act=None, sampler=None,
+        tap_visits=None, par_arr=None, dr_pos=None, use_stage=False, w_act=None, sampler=None, coupled=None,
     ):
         """Non-mutating causal W-token verify using GPU `meta_arr` and `tau_table`, without mid-async_eval."""
         assert self._b1_fast and self._kv_stacked
@@ -2391,12 +2423,23 @@ class BatchDecoder:
                 use_walk=compile_walk, use_stage=use_stage,
             )
             if return_h_out:
-                nt = self._sample_verify_tokens(ret, sampler)
-                if use_walk:
-                    from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
-                    ret = tuple(tree_walk_commit_meta_gpu(nt, tokens, par_arr, meta_r, meta_f, dr_pos, W, w_act=w_act))
+                if coupled is not None and use_walk:
+                    q_ids, q_probs, q_child, u_acc = coupled
+                    bonus, reject, child_pt, ovf = self._sample_verify_tokens(
+                        ret, sampler, coupled=(q_ids, q_probs, tokens[1:])
+                    )
+                    from mlx_lm.models.inkling2.rows.qmv4 import coupled_walk_commit_meta_gpu
+                    walk_t = coupled_walk_commit_meta_gpu(
+                        tokens, bonus, reject, child_pt, q_child, u_acc, meta_r, meta_f, dr_pos, W,
+                    )
+                    ret = (walk_t, ovf)
                 else:
-                    ret = nt
+                    nt = self._sample_verify_tokens(ret, sampler)
+                    if use_walk:
+                        from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
+                        ret = tuple(tree_walk_commit_meta_gpu(nt, tokens, par_arr, meta_r, meta_f, dr_pos, W, w_act=w_act))
+                    else:
+                        ret = nt
             return ret, kv_news, conv_ws, tap_buf
 
         chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
@@ -2458,12 +2501,23 @@ class BatchDecoder:
         conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
         ret = tuple(o_c[:head_c]) if compile_walk else o_c[0]
         if return_h_out:
-            nt = self._sample_verify_tokens(ret, sampler)
-            if use_walk:
-                from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
-                ret = tuple(tree_walk_commit_meta_gpu(nt, tokens, par_arr, meta_r, meta_f, dr_pos, W, w_act=w_act))
+            if coupled is not None and use_walk:
+                q_ids, q_probs, q_child, u_acc = coupled
+                bonus, reject, child_pt, ovf = self._sample_verify_tokens(
+                    ret, sampler, coupled=(q_ids, q_probs, tokens[1:])
+                )
+                from mlx_lm.models.inkling2.rows.qmv4 import coupled_walk_commit_meta_gpu
+                walk_t = coupled_walk_commit_meta_gpu(
+                    tokens, bonus, reject, child_pt, q_child, u_acc, meta_r, meta_f, dr_pos, W,
+                )
+                ret = (walk_t, ovf)
             else:
-                ret = nt
+                nt = self._sample_verify_tokens(ret, sampler)
+                if use_walk:
+                    from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
+                    ret = tuple(tree_walk_commit_meta_gpu(nt, tokens, par_arr, meta_r, meta_f, dr_pos, W, w_act=w_act))
+                else:
+                    ret = nt
         return ret, kv_news, conv_ws, tap_buf
 
     def _get_cw_compiled_loop(

@@ -528,6 +528,7 @@ class DFlash2Drafter:
         self._kv_dtype = mx.bfloat16
         self._fwd_compiled: dict = {}
         self._ctx_compiled: dict = {}
+        self._draft_cfg_cache: dict = {}
 
         w = mx.load(os.path.join(draft_dir, "model.safetensors"))
         self.fc = _quantize_if(w["fc.weight"], quant_bits)
@@ -861,6 +862,24 @@ class DFlash2Drafter:
             return RQ4.dflash2_pack_tree_dink_gpu(top_idx, sc0, sc16, anchor_tok, w_max, cost_arr, prior_cfg)
         return RQ4.dflash2_pack_chain_gpu(top_idx, sc0, sc16, anchor_tok, w_max)
 
+    def draft_and_pack_coupled_gpu(
+        self,
+        anchor_tok: mx.array,
+        w_max: int,
+        u_draft: mx.array,
+        draft_temp: float,
+        *,
+        pos_arr: mx.array | None = None,
+    ):
+        """Zero-sync DFlash2 forward + Leviathan coupled stochastic chain packer on GPU."""
+        w_max = max(2, min(self.block, int(w_max)))
+        top_idx, sc0, sc16 = self._forward_block_fused(anchor_tok, n_pos=w_max - 1, pos_arr=pos_arr)
+        inv_dt = 1.0 / max(float(draft_temp), 1e-6)
+        dcfg = self._draft_cfg_cache.get(inv_dt)
+        if dcfg is None:
+            dcfg = self._draft_cfg_cache[inv_dt] = mx.array([inv_dt], mx.float32)
+        return RQ4.dflash2_pack_coupled_chain_gpu(top_idx, sc0, sc16, anchor_tok, w_max, u_draft, dcfg)
+
     def _forward_block(self, anchor_tok: mx.array, n_pos: int = 7):
         if self._fused:
             return self._forward_block_fused(anchor_tok, n_pos=n_pos)
@@ -1081,7 +1100,7 @@ def dflash2_exact_generate_step(
 ):
     """Bit-exact causal-verify speculative decoding with Splash DFlash 2 drafter."""
     from mlx_lm.models.cache import make_prompt_cache
-    from mlx_lm.models.inkling2.batchdecode import BatchDecoder, _cw_ar_cache, build_tree_tables
+    from mlx_lm.models.inkling2.batchdecode import BatchDecoder, _cw_ar_cache, _std_sampler_params, build_tree_tables
     from mlx_lm.models.inkling2.mtp import _feats_from_dict, default_taps, feats_from_buf, parse_taps
 
     if draft_dir is None:
@@ -1284,8 +1303,20 @@ def dflash2_exact_generate_step(
                 dr._ensure_cap(dr.n + max_tokens + 32)
         tau_cap = off_cpu + max_tokens + 32
 
-        pa_tree = bool(use_tree or use_budget or not is_greedy)
         pa_depth = max(1, min(2, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
+        std_samp = None if is_greedy else _std_sampler_params(sampler)
+        use_coupled = (
+            use_pipe_ahead
+            and (std_samp is not None)
+            and os.environ.get("LOOPLING_DFLASH2_COUPLED_SAMPLE", "1") not in ("0", "", "false", "False")
+        )
+        if use_coupled:
+            _dt_env = os.environ.get("LOOPLING_DFLASH2_DRAFT_TEMP", "")
+            draft_temp = float(_dt_env) if _dt_env else min(std_samp[0], 0.25)
+            pa_tree = False
+        else:
+            draft_temp = 0.0
+            pa_tree = bool(use_tree or use_budget or not is_greedy)
         fscale = (12 + 12 * passes) / 24.0
         pa_costs_env = os.environ.get("LOOPLING_DFLASH2_PA_COSTS")
         if pa_costs_env:
@@ -1321,13 +1352,30 @@ def dflash2_exact_generate_step(
                 return pa_cost_map[6]
             return pa_cost_map[8]
 
+        def _draft_pa(anc_tok, w_val: int, p_arr):
+            if use_coupled:
+                u_d = mx.random.uniform(shape=(w_val - 1,), dtype=mx.float32)
+                return dr.draft_and_pack_coupled_gpu(anc_tok, w_val, u_d, draft_temp, pos_arr=p_arr)
+            return dr.draft_and_pack_gpu(
+                anc_tok, w_val, pos_arr=p_arr, use_tree=pa_tree, cost_arr=_pa_cost_for(w_val), prior_cfg=pa_prior_cfg
+            )
+
         def _launch_pa_cycle(packed, meta_r, meta_f, dr_pos, binfo, ring_may_wrap, launch_next_draft=True, next_w=None):
-            if pa_tree:
+            if use_coupled:
+                blk_c, par_c, dep_c, ca_c, tm_c, q_ids, q_probs, q_child = packed
+                wa_c = None
+                w_c = int(blk_c.shape[0])
+                u_acc = mx.random.uniform(shape=(w_c - 1,), dtype=mx.float32)
+                coupled_arg = (q_ids, q_probs, q_child, u_acc)
+            elif pa_tree:
                 blk_c, par_c, dep_c, ca_c, tm_c, wa_c = packed
+                w_c = int(blk_c.shape[0])
+                coupled_arg = None
             else:
                 blk_c, par_c, dep_c, ca_c, tm_c = packed
                 wa_c = None
-            w_c = int(blk_c.shape[0])
+                w_c = int(blk_c.shape[0])
+                coupled_arg = None
             walk_res, kv_news, conv_ws, tap_buf = dec.verify_w_gpu(
                 blk_c,
                 meta_r=meta_r,
@@ -1344,17 +1392,23 @@ def dflash2_exact_generate_step(
                 use_stage=False,
                 w_act=wa_c,
                 sampler=sampler,
+                coupled=coupled_arg,
             )
+            ovf_c = None
+            if use_coupled:
+                walk_res, ovf_c = walk_res
             (
                 path_pad, emitted, keep_arr, last_slot, anc_nxt,
                 slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
             ) = walk_res
-            rb = _snap_rb(slot_r_old, w_c, need_ring=ring_may_wrap) if cache_state is not None else None
+            rb = _snap_rb(slot_r_old, w_c, need_ring=ring_may_wrap) if (cache_state is not None or use_coupled) else None
             eval_a = [
                 emitted, keep_arr, path_pad, last_slot, anc_nxt,
                 slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
                 *kv_news,
             ]
+            if ovf_c is not None:
+                eval_a.append(ovf_c)
             if rb is not None and rb[2] is not None:
                 eval_a.append(rb[2])
             for cw in conv_ws:
@@ -1377,14 +1431,12 @@ def dflash2_exact_generate_step(
             eval_b.extend(dr.cv)
             if launch_next_draft:
                 wn = w_c if next_w is None else int(next_w)
-                packed_nxt = dr.draft_and_pack_gpu(
-                    anc_nxt, wn, pos_arr=dr_pos_nxt, use_tree=pa_tree, cost_arr=_pa_cost_for(wn), prior_cfg=pa_prior_cfg
-                )
+                packed_nxt = _draft_pa(anc_nxt, wn, dr_pos_nxt)
                 eval_b.extend(packed_nxt)
             else:
                 packed_nxt = None
             mx.async_eval(*eval_b)
-            return (emitted, keep_arr, anc_nxt, meta_r_nxt, meta_f_nxt, dr_pos_nxt, packed_nxt, w_c, rb)
+            return (emitted, keep_arr, anc_nxt, meta_r_nxt, meta_f_nxt, dr_pos_nxt, packed_nxt, w_c, rb, ovf_c)
 
         def _can_launch_pa(w_launch: int):
             hi_d = sum(item[7] for item in pa_queue)
@@ -1425,10 +1477,7 @@ def dflash2_exact_generate_step(
                             break
                         if qlen == 0:
                             if pa_packed is None or pa_packed_w != w_l:
-                                pa_packed = dr.draft_and_pack_gpu(
-                                    anchor, w_l, pos_arr=FD._wpos(dr.n), use_tree=pa_tree,
-                                    cost_arr=_pa_cost_for(w_l), prior_cfg=pa_prior_cfg,
-                                )
+                                pa_packed = _draft_pa(anchor, w_l, FD._wpos(dr.n))
                                 pa_packed_w = w_l
                             meta_r0, meta_f0 = dec.get_gpu_meta(staged=False)
                             dr_pos0 = FD._wpos(dr.n)
@@ -1461,8 +1510,33 @@ def dflash2_exact_generate_step(
                             )
 
                 if pa_queue:
-                    emitted_c, keep_arr_c, anc_nxt, _, _, _, p_nxt, w_done, rb_c = pa_queue.popleft()
-                    mx.eval(emitted_c, keep_arr_c)
+                    emitted_c, keep_arr_c, anc_nxt, _, _, _, p_nxt, w_done, rb_c, ovf_c = pa_queue.popleft()
+                    if ovf_c is not None:
+                        mx.eval(emitted_c, keep_arr_c, ovf_c)
+                        if int(mx.max(ovf_c).item()) != 0:
+                            for item in reversed(pa_queue):
+                                if item[8] is not None:
+                                    _restore_kv_slices(*item[8])
+                            pa_queue.clear()
+                            if rb_c is not None:
+                                _restore_kv_slices(*rb_c)
+                            pa_packed = None
+                            pa_packed_w = 0
+                            use_coupled = False
+                            pa_tree = True
+                            anchor, tok = ar_step(anchor, anchor_int)
+                            anchor_int = tok
+                            off_cpu = int(dec.caches[0][0][0].offset)
+                            if lookup is not None:
+                                lookup.append_one(tok)
+                            stats["cycles"] += 1
+                            stats["tokens"] += 1
+                            yielded_tokens.append(tok)
+                            yield tok, None, False
+                            n += 1
+                            continue
+                    else:
+                        mx.eval(emitted_c, keep_arr_c)
                     now_t = time.perf_counter()
                     cyc_ms = (now_t - pa_last_t) * 1000.0
                     stats["verify_ms"] += cyc_ms

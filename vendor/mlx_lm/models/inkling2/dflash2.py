@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import math
 import os
 import time
@@ -1066,11 +1067,17 @@ def dflash2_exact_generate_step(
     prefill_step_size: int = 2048,
     prompt_cache=None,
     draft_dir: str | None = None,
+    full_prompt: list[int] | None = None,
+    eos_token_ids=None,
+    checkpoint_callback=None,
+    segment_ends: list[tuple[int, str]] | None = None,
+    cache_state: dict | None = None,
+    prompt_progress_callback=None,
     **kw,
 ):
     """Bit-exact causal-verify speculative decoding with Splash DFlash 2 drafter."""
     from mlx_lm.models.cache import make_prompt_cache
-    from mlx_lm.models.inkling2.batchdecode import BatchDecoder, build_tree_tables
+    from mlx_lm.models.inkling2.batchdecode import BatchDecoder, _cw_ar_cache, build_tree_tables
     from mlx_lm.models.inkling2.mtp import _feats_from_dict, default_taps, feats_from_buf, parse_taps
 
     if draft_dir is None:
@@ -1090,16 +1097,32 @@ def dflash2_exact_generate_step(
 
     n_p = int(prompt.size)
     pos = 0
+    if prompt_progress_callback is not None:
+        prompt_progress_callback(0, n_p)
+    seg_idx = 0
+    seg_list = [s for s in (segment_ends or []) if 0 < s[0] < n_p]
     if n_p > 1:
         tm.tap_visits = tap_set
         while n_p - pos > 1:
             tm.tap_buf = {}
-            m = min(prefill_step_size, n_p - 1 - pos)
+            next_seg = seg_list[seg_idx][0] if seg_idx < len(seg_list) else (n_p - 1)
+            m = min(prefill_step_size, next_seg - pos)
             _ = model(prompt[pos : pos + m][None], cache=cache)
             f = feats_from_buf(tm, taps)
             dr.append_ctx(f)
             mx.eval([c.state for c in cache], dr.ck, dr.cv)
             pos += m
+            if prompt_progress_callback is not None:
+                prompt_progress_callback(pos, n_p)
+            hit_seg = None
+            if seg_idx < len(seg_list) and pos >= seg_list[seg_idx][0]:
+                hit_seg = seg_list[seg_idx][1]
+                seg_idx += 1
+            if checkpoint_callback is not None:
+                if hit_seg is not None:
+                    checkpoint_callback(pos, n_p, cache, seg_type=hit_seg)
+                else:
+                    checkpoint_callback(pos, n_p, cache)
             mx.clear_cache()
         tm.tap_visits = None
         tm.tap_buf = {}
@@ -1112,489 +1135,587 @@ def dflash2_exact_generate_step(
     f0 = _feats_from_dict(tap0, tap_keys)
     dr.append_ctx(f0)
     mx.eval(y, dr.ck, dr.cv, *dec.kv_eval_targets(), dec.conv)
-    y_tok = int(y.item())
-    stats["cycles"] += 1
-    stats["tokens"] += 1
-    yield y_tok, None, False
-    n = 1
-    if n >= max_tokens:
-        return
+    if prompt_progress_callback is not None:
+        prompt_progress_callback(n_p, n_p)
 
-    anchor = y
-    W_cfg = int(os.environ.get("LOOPLING_DFLASH2_W", "6"))
-    use_budget = os.environ.get("LOOPLING_DFLASH2_BUDGET", "1") not in ("0", "", "false", "False")
-    use_lookup = os.environ.get("LOOPLING_DFLASH2_LOOKUP", "1") not in ("0", "", "false", "False")
-    tree_env = os.environ.get("LOOPLING_DFLASH2_TREE", "")
-    use_tree = (tree_env not in ("0", "")) if tree_env else use_budget
-    tap_check = tap_set | {"F"}
-
-    budget = getattr(dr, "_budget", None) if use_budget else None
-    if use_budget and budget is None:
-        budget = dr._budget = VerifyBudget()
-    costs = getattr(dr, "_costs", None) if use_budget else None
-    if use_budget and costs is None:
-        costs = dr._costs = MoEStepCosts(dr.qbits)
-    elif costs is not None:
-        costs.ar_cooldown = 0
-        costs.low_streak = 0
-        costs.ar_backoff = 4
-        costs.ema_ratio = 1.15
-
-    lookup = None
-    if use_lookup:
-        lookup = LookupIndex()
-        p_list = prompt.tolist()
-        lookup.append(p_list)
-        lookup.append_one(y_tok)
-
-    deferred_feats: list[mx.array] = []
-
-    def flush_deferred() -> None:
-        if deferred_feats:
-            f_cat = deferred_feats[0] if len(deferred_feats) == 1 else mx.concatenate(deferred_feats, axis=1)
-            dr.append_ctx(f_cat)
-            deferred_feats.clear()
-            mx.async_eval(dr.ck, dr.cv)
-
-    def ar_step(cur_anchor: mx.array):
-        tar0 = time.perf_counter()
-        y_cur, tp = dec.step_with_taps(cur_anchor, tap_visits=tap_set)
-        f1 = _feats_from_dict(tp, tap_keys)
-        mx.eval(y_cur)
-        mx.async_eval(*dec.kv_eval_targets(), dec.conv, f1)
-        deferred_feats.append(f1)
-        if costs is not None:
-            costs.observe_ar((time.perf_counter() - tar0) * 1000.0)
-        return y_cur, int(y_cur.item())
-
-    prefetched_fwd = None
-    prefetched_npos = 0
-    prefetched_t0 = 0.0
-
-    use_pipe_ahead = (
-        os.environ.get("LOOPLING_DFLASH2_PIPE_AHEAD", "1") not in ("0", "", "false", "False")
-        and dr._fused
-        and W_cfg >= 2
-        and os.environ.get("LOOPLING_COMPILE_VERIFY", "1") not in ("0", "")
-        and not (tm.loopcd.enabled_for(passes) and tm.loopcd.mode != "hidden")
-    )
-    off_cpu = int(dec.caches[0][0][0].offset)
-    if use_pipe_ahead and max_tokens > 1:
-        if not dec.ensure_gpu_cap(max_tokens + 16):
-            use_pipe_ahead = False
-        else:
-            dr._ensure_cap(dr.n + max_tokens + 32)
-    tau_cap = off_cpu + max_tokens + 32
-
-    pa_tree = bool(use_tree or use_budget)
-    pa_depth = max(1, min(2, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
-    fscale = (12 + 12 * passes) / 24.0
-    pa_costs_env = os.environ.get("LOOPLING_DFLASH2_PA_COSTS")
-    if pa_costs_env:
-        _pa_c_ov = mx.array([float(x) for x in pa_costs_env.split(",")], mx.float32)
-        pa_cost_map = {4: _pa_c_ov, 6: _pa_c_ov, 8: _pa_c_ov}
-    else:
-        # Proven #85 empirical verify_w_gpu(W_max, w_act) + fused draft marginal cost curves on p3.
-        s = fscale / 2.0
-        _c_def = mx.array([c * s for c in (0.0, 9.6, 17.8, 18.7, 19.6, 20.5, 21.3, 22.1, 22.8)], mx.float32)
-        pa_cost_map = {4: _c_def, 6: _c_def, 8: _c_def}
-    pa_priors_env = os.environ.get("LOOPLING_DFLASH2_PA_PRIORS")
-    if pa_priors_env:
-        pa_prior_cfg = mx.array([float(x) for x in pa_priors_env.split(",")], mx.float32)
-    else:
-        pa_prior_cfg = mx.array([VerifyBudget.PRIOR_SLOPE, *VerifyBudget.PRIOR_INTERCEPTS], mx.float32)
-
-    pa_adapt = bool(use_budget) and os.environ.get("LOOPLING_DFLASH2_PA_ADAPT", "1") not in ("0", "", "false", "False")
-    pa_w_run = min(W_cfg, 6) if (pa_adapt and W_cfg > 6) else W_cfg
-    pa_ema_tpc = 3.0
-    pa_ema_ms = 21.5 * (fscale / 2.0)
-    pa_t_ar = 9.6 * (fscale / 2.0)
-    pa_low_streak = 0
-    pa_ar_burst = 0
-    pa_ar_backoff = 16
+    committed_tokens: list[int] = []
+    yielded_tokens: list[int] = []
     pa_queue: deque = deque()
-    pa_packed = None
-    pa_packed_w = 0
-    pa_last_t = time.perf_counter()
+    last_popped_rb = None
 
-    def _pa_cost_for(w_val: int) -> mx.array:
-        if w_val <= 4:
-            return pa_cost_map[4]
-        if w_val <= 6:
-            return pa_cost_map[6]
-        return pa_cost_map[8]
-
-    def _launch_pa_cycle(packed, meta_r, meta_f, dr_pos, binfo, ring_may_wrap, launch_next_draft=True, next_w=None):
-        if pa_tree:
-            blk_c, par_c, dep_c, ca_c, tm_c, wa_c = packed
+    def _read_cpu_kv():
+        if dec._ring_visits:
+            kv_r = dec.caches[0][dec._ring_visits[0]][0]
+            off_r, idx_r = int(kv_r.offset), int(kv_r._idx)
         else:
-            blk_c, par_c, dep_c, ca_c, tm_c = packed
-            wa_c = None
-        w_c = int(blk_c.shape[0])
-        walk_res, kv_news, conv_ws, tap_buf = dec.verify_w_gpu(
-            blk_c,
-            meta_r=meta_r,
-            meta_f=meta_f,
-            depths_arr=dep_c,
-            conv_anc=ca_c,
-            tree_meta=tm_c,
-            max_depth=w_c - 1,
-            binfo=binfo,
-            tau_cap=tau_cap,
-            tap_visits=tap_check,
-            par_arr=par_c,
-            dr_pos=dr_pos,
-            use_stage=False,
-            w_act=wa_c,
-        )
-        (
-            path_pad, emitted, keep_arr, last_slot, anc_nxt,
-            slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
-        ) = walk_res
-        eval_a = [
-            emitted, keep_arr, path_pad, last_slot, anc_nxt,
-            slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
-            *kv_news,
-        ]
-        for cw in conv_ws:
-            eval_a.extend(cw)
-        eval_a.extend(tap_buf.values())
-        mx.async_eval(*eval_a)
+            off_r, idx_r = 0, 0
+        off_f = int(dec.caches[0][dec._full_visits[0]][0].offset) if dec._full_visits else 0
+        return len(committed_tokens), off_r, idx_r, off_f
 
-        dec.commit_w_gpu(
-            kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, w_c,
-            ring_may_wrap=ring_may_wrap,
-        )
-        f_w = _feats_from_dict(tap_buf, tap_keys)
-        f_pad = f_w[:, path_pad]
-        dr.append_ctx_gpu(f_pad, dr_pos_old)
+    def _snap_rb(slot_r_expr, w_slots: int):
+        conv_bak = [list(cs) for cs in dec.conv]
+        pos_bak = ring_bak = None
+        if dec._kv_stacked and dec._kv_ring is not None and dec._ring_visits:
+            max_size_r = int(dec.caches[0][dec._ring_visits[0]][0].max_size)
+            ar = _cw_ar_cache.get(w_slots)
+            if ar is None:
+                ar = _cw_ar_cache[w_slots] = mx.arange(w_slots, dtype=mx.int32)
+            pos_bak = (slot_r_expr + ar) % max_size_r
+            ring_bak = dec._kv_ring[:, :, :, pos_bak, :]
+        return conv_bak, pos_bak, ring_bak
 
-        eval_b = [*dec.kv_eval_targets()]
-        for cs in dec.conv:
-            eval_b.extend(cs)
-        eval_b.extend(dr.ck)
-        eval_b.extend(dr.cv)
-        if launch_next_draft:
-            wn = w_c if next_w is None else int(next_w)
-            packed_nxt = dr.draft_and_pack_gpu(
-                anc_nxt, wn, pos_arr=dr_pos_nxt, use_tree=pa_tree, cost_arr=_pa_cost_for(wn), prior_cfg=pa_prior_cfg
-            )
-            eval_b.extend(packed_nxt)
+    def _restore_kv_slices(conv_bak, pos_bak, ring_bak):
+        if conv_bak is not None:
+            dec.conv = [list(cs) for cs in conv_bak]
+        if pos_bak is not None and ring_bak is not None and dec._kv_ring is not None:
+            dec._kv_ring[:, :, :, pos_bak, :] = ring_bak
+
+    def _sync_exact_cache():
+        if cache_state is None:
+            return
+        try:
+            for item in reversed(pa_queue):
+                rb = item[8]
+                if rb is not None:
+                    _restore_kv_slices(*rb)
+            pa_queue.clear()
+            if len(committed_tokens) > len(yielded_tokens) and last_popped_rb is not None:
+                cpu_pre, conv_bak, pos_bak, ring_bak = last_popped_rb
+                n_com, off_r, idx_r, off_f = cpu_pre
+                _restore_kv_slices(conv_bak, pos_bak, ring_bak)
+                for v in dec._ring_visits:
+                    kv = dec.caches[0][v][0]
+                    kv.offset = off_r
+                    kv._idx = idx_r
+                for v in dec._full_visits:
+                    dec.caches[0][v][0].offset = off_f
+                del committed_tokens[n_com:]
+            dec.flush()
+            mx.eval([c.state for c in cache])
+            tail = yielded_tokens[len(committed_tokens):]
+            if tail:
+                model(mx.array([tail], mx.int32), cache=cache)
+                mx.eval([c.state for c in cache])
+            cache_state["cached_tokens"] = list(yielded_tokens)
+        except Exception:
+            logging.exception("dflash2 _sync_exact_cache failed")
+
+    try:
+        y_tok = int(y.item())
+        stats["cycles"] += 1
+        stats["tokens"] += 1
+        yielded_tokens.append(y_tok)
+        yield y_tok, None, False
+        n = 1
+        if n >= max_tokens:
+            return
+
+        anchor = y
+        anchor_int = y_tok
+        W_cfg = int(os.environ.get("LOOPLING_DFLASH2_W", "6"))
+        use_budget = os.environ.get("LOOPLING_DFLASH2_BUDGET", "1") not in ("0", "", "false", "False")
+        use_lookup = os.environ.get("LOOPLING_DFLASH2_LOOKUP", "1") not in ("0", "", "false", "False")
+        tree_env = os.environ.get("LOOPLING_DFLASH2_TREE", "")
+        use_tree = (tree_env not in ("0", "")) if tree_env else use_budget
+        tap_check = tap_set | {"F"}
+
+        budget = getattr(dr, "_budget", None) if use_budget else None
+        if use_budget and budget is None:
+            budget = dr._budget = VerifyBudget()
+        costs = getattr(dr, "_costs", None) if use_budget else None
+        if use_budget and costs is None:
+            costs = dr._costs = MoEStepCosts(dr.qbits)
+        elif costs is not None:
+            costs.ar_cooldown = 0
+            costs.low_streak = 0
+            costs.ar_backoff = 4
+            costs.ema_ratio = 1.15
+
+        lookup = None
+        if use_lookup:
+            lookup = LookupIndex()
+            p_list = list(full_prompt) if full_prompt is not None else prompt.tolist()
+            lookup.append(p_list)
+            lookup.append_one(y_tok)
+
+        deferred_feats: list[mx.array] = []
+
+        def flush_deferred() -> None:
+            if deferred_feats:
+                f_cat = deferred_feats[0] if len(deferred_feats) == 1 else mx.concatenate(deferred_feats, axis=1)
+                dr.append_ctx(f_cat)
+                deferred_feats.clear()
+                mx.async_eval(dr.ck, dr.cv)
+
+        def ar_step(cur_anchor: mx.array, cur_anchor_int: int):
+            tar0 = time.perf_counter()
+            y_cur, tp = dec.step_with_taps(cur_anchor, tap_visits=tap_set)
+            committed_tokens.append(cur_anchor_int)
+            f1 = _feats_from_dict(tp, tap_keys)
+            mx.eval(y_cur)
+            mx.async_eval(*dec.kv_eval_targets(), dec.conv, f1)
+            deferred_feats.append(f1)
+            if costs is not None:
+                costs.observe_ar((time.perf_counter() - tar0) * 1000.0)
+            return y_cur, int(y_cur.item())
+
+        prefetched_fwd = None
+        prefetched_npos = 0
+        prefetched_t0 = 0.0
+
+        use_pipe_ahead = (
+            os.environ.get("LOOPLING_DFLASH2_PIPE_AHEAD", "1") not in ("0", "", "false", "False")
+            and dr._fused
+            and W_cfg >= 2
+            and os.environ.get("LOOPLING_COMPILE_VERIFY", "1") not in ("0", "")
+            and not (tm.loopcd.enabled_for(passes) and tm.loopcd.mode != "hidden")
+        )
+        off_cpu = int(dec.caches[0][0][0].offset)
+        if use_pipe_ahead and max_tokens > 1:
+            if not dec.ensure_gpu_cap(max_tokens + 16):
+                use_pipe_ahead = False
+            else:
+                dr._ensure_cap(dr.n + max_tokens + 32)
+        tau_cap = off_cpu + max_tokens + 32
+
+        pa_tree = bool(use_tree or use_budget)
+        pa_depth = max(1, min(2, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
+        fscale = (12 + 12 * passes) / 24.0
+        pa_costs_env = os.environ.get("LOOPLING_DFLASH2_PA_COSTS")
+        if pa_costs_env:
+            _pa_c_ov = mx.array([float(x) for x in pa_costs_env.split(",")], mx.float32)
+            pa_cost_map = {4: _pa_c_ov, 6: _pa_c_ov, 8: _pa_c_ov}
         else:
-            packed_nxt = None
-        mx.async_eval(*eval_b)
-        return (emitted, keep_arr, anc_nxt, meta_r_nxt, meta_f_nxt, dr_pos_nxt, packed_nxt, w_c)
+            # Proven #85 empirical verify_w_gpu(W_max, w_act) + fused draft marginal cost curves on p3.
+            s = fscale / 2.0
+            _c_def = mx.array([c * s for c in (0.0, 9.6, 17.8, 18.7, 19.6, 20.5, 21.3, 22.1, 22.8)], mx.float32)
+            pa_cost_map = {4: _c_def, 6: _c_def, 8: _c_def}
+        pa_priors_env = os.environ.get("LOOPLING_DFLASH2_PA_PRIORS")
+        if pa_priors_env:
+            pa_prior_cfg = mx.array([float(x) for x in pa_priors_env.split(",")], mx.float32)
+        else:
+            pa_prior_cfg = mx.array([VerifyBudget.PRIOR_SLOPE, *VerifyBudget.PRIOR_INTERCEPTS], mx.float32)
 
-    def _can_launch_pa(w_launch: int):
-        hi_d = sum(item[7] for item in pa_queue)
-        lo_d = len(pa_queue)
-        if n + hi_d + w_launch > max_tokens or not dec._kv_stacked or dr.ck[0] is None:
-            return False, None
-        ok_b, binfo = dec._cw_safe_bounds_range(off_cpu + lo_d, off_cpu + hi_d, w_launch - 1)
-        if not ok_b:
-            return False, None
-        cap_r, cap_f, max_size_r = binfo[4], binfo[5], binfo[6]
-        if (
-            off_cpu + hi_d + w_launch > cap_f
-            or (cap_r < max_size_r and off_cpu + hi_d + w_launch > cap_r)
-            or dr.n + hi_d + w_launch + dr.block > int(dr.ck[0].shape[2])
-        ):
-            return False, None
-        return True, binfo
+        pa_adapt = bool(use_budget) and os.environ.get("LOOPLING_DFLASH2_PA_ADAPT", "1") not in ("0", "", "false", "False")
+        pa_w_run = min(W_cfg, 6) if (pa_adapt and W_cfg > 6) else W_cfg
+        pa_ema_tpc = 3.0
+        pa_ema_ms = 21.5 * (fscale / 2.0)
+        pa_t_ar = 9.6 * (fscale / 2.0)
+        pa_low_streak = 0
+        pa_ar_burst = 0
+        pa_ar_backoff = 16
+        pa_packed = None
+        pa_packed_w = 0
+        pa_last_t = time.perf_counter()
 
-    while n < max_tokens:
-        if use_pipe_ahead:
-            l_len_pa = lookup.match_len if lookup is not None else 0
-            want_lookup_bypass = (
-                lookup is not None and _LOOKUP_BYPASS_MIN > 0 and l_len_pa >= _LOOKUP_BYPASS_MIN
+        def _pa_cost_for(w_val: int) -> mx.array:
+            if w_val <= 4:
+                return pa_cost_map[4]
+            if w_val <= 6:
+                return pa_cost_map[6]
+            return pa_cost_map[8]
+
+        def _launch_pa_cycle(packed, meta_r, meta_f, dr_pos, binfo, ring_may_wrap, launch_next_draft=True, next_w=None):
+            if pa_tree:
+                blk_c, par_c, dep_c, ca_c, tm_c, wa_c = packed
+            else:
+                blk_c, par_c, dep_c, ca_c, tm_c = packed
+                wa_c = None
+            w_c = int(blk_c.shape[0])
+            walk_res, kv_news, conv_ws, tap_buf = dec.verify_w_gpu(
+                blk_c,
+                meta_r=meta_r,
+                meta_f=meta_f,
+                depths_arr=dep_c,
+                conv_anc=ca_c,
+                tree_meta=tm_c,
+                max_depth=w_c - 1,
+                binfo=binfo,
+                tau_cap=tau_cap,
+                tap_visits=tap_check,
+                par_arr=par_c,
+                dr_pos=dr_pos,
+                use_stage=False,
+                w_act=wa_c,
             )
-            want_ar_burst = pa_ar_burst > 0 and not want_lookup_bypass
-            if not want_lookup_bypass and not want_ar_burst:
-                if deferred_feats:
-                    flush_deferred()
-                    if not dec._kv_stacked:
-                        dec.ensure_gpu_cap(max_tokens - n + 16)
-                        off_cpu = int(dec.caches[0][0][0].offset)
-                    dr._ensure_cap(dr.n + max_tokens - n + 32)
-                while len(pa_queue) < pa_depth:
-                    qlen = len(pa_queue)
-                    w_l = pa_w_run
-                    ok_pa, binfo_pa = _can_launch_pa(w_l)
-                    if not ok_pa:
-                        break
-                    if qlen == 0:
-                        if pa_packed is None or pa_packed_w != w_l:
-                            pa_packed = dr.draft_and_pack_gpu(
-                                anchor, w_l, pos_arr=FD._wpos(dr.n), use_tree=pa_tree,
-                                cost_arr=_pa_cost_for(w_l), prior_cfg=pa_prior_cfg,
-                            )
-                            pa_packed_w = w_l
-                        meta_r0, meta_f0 = dec.get_gpu_meta(staged=False)
-                        dr_pos0 = FD._wpos(dr.n)
-                        lnxt = (pa_depth >= 2) and (n + 2 * w_l <= max_tokens)
-                        pa_last_t = time.perf_counter()
-                        pa_queue.append(
-                            _launch_pa_cycle(
-                                pa_packed, meta_r0, meta_f0, dr_pos0, binfo_pa,
-                                ring_may_wrap=(off_cpu + w_l > binfo_pa[6]),
-                                launch_next_draft=lnxt,
-                                next_w=w_l,
-                            )
-                        )
-                        pa_packed = None
-                        pa_packed_w = 0
-                    else:
-                        prev = pa_queue[-1]
-                        p_nxt = prev[6]
-                        if p_nxt is None or int(p_nxt[0].shape[0]) != w_l:
+            (
+                path_pad, emitted, keep_arr, last_slot, anc_nxt,
+                slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
+            ) = walk_res
+            rb = _snap_rb(slot_r_old, w_c) if cache_state is not None else None
+            eval_a = [
+                emitted, keep_arr, path_pad, last_slot, anc_nxt,
+                slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
+                *kv_news,
+            ]
+            for cw in conv_ws:
+                eval_a.extend(cw)
+            eval_a.extend(tap_buf.values())
+            mx.async_eval(*eval_a)
+
+            dec.commit_w_gpu(
+                kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, w_c,
+                ring_may_wrap=ring_may_wrap,
+            )
+            f_w = _feats_from_dict(tap_buf, tap_keys)
+            f_pad = f_w[:, path_pad]
+            dr.append_ctx_gpu(f_pad, dr_pos_old)
+
+            eval_b = [*dec.kv_eval_targets()]
+            for cs in dec.conv:
+                eval_b.extend(cs)
+            if rb is not None and rb[2] is not None:
+                eval_b.append(rb[2])
+            eval_b.extend(dr.ck)
+            eval_b.extend(dr.cv)
+            if launch_next_draft:
+                wn = w_c if next_w is None else int(next_w)
+                packed_nxt = dr.draft_and_pack_gpu(
+                    anc_nxt, wn, pos_arr=dr_pos_nxt, use_tree=pa_tree, cost_arr=_pa_cost_for(wn), prior_cfg=pa_prior_cfg
+                )
+                eval_b.extend(packed_nxt)
+            else:
+                packed_nxt = None
+            mx.async_eval(*eval_b)
+            return (emitted, keep_arr, anc_nxt, meta_r_nxt, meta_f_nxt, dr_pos_nxt, packed_nxt, w_c, rb)
+
+        def _can_launch_pa(w_launch: int):
+            hi_d = sum(item[7] for item in pa_queue)
+            lo_d = len(pa_queue)
+            if n + hi_d + w_launch > max_tokens or not dec._kv_stacked or dr.ck[0] is None:
+                return False, None
+            ok_b, binfo = dec._cw_safe_bounds_range(off_cpu + lo_d, off_cpu + hi_d, w_launch - 1)
+            if not ok_b:
+                return False, None
+            cap_r, cap_f, max_size_r = binfo[4], binfo[5], binfo[6]
+            if (
+                off_cpu + hi_d + w_launch > cap_f
+                or (cap_r < max_size_r and off_cpu + hi_d + w_launch > cap_r)
+                or dr.n + hi_d + w_launch + dr.block > int(dr.ck[0].shape[2])
+            ):
+                return False, None
+            return True, binfo
+
+        while n < max_tokens:
+            if use_pipe_ahead:
+                l_len_pa = lookup.match_len if lookup is not None else 0
+                want_lookup_bypass = (
+                    lookup is not None and _LOOKUP_BYPASS_MIN > 0 and l_len_pa >= _LOOKUP_BYPASS_MIN
+                )
+                want_ar_burst = pa_ar_burst > 0 and not want_lookup_bypass
+                if not want_lookup_bypass and not want_ar_burst:
+                    if deferred_feats:
+                        flush_deferred()
+                        if not dec._kv_stacked:
+                            dec.ensure_gpu_cap(max_tokens - n + 16)
+                            off_cpu = int(dec.caches[0][0][0].offset)
+                        dr._ensure_cap(dr.n + max_tokens - n + 32)
+                    while len(pa_queue) < pa_depth:
+                        qlen = len(pa_queue)
+                        w_l = pa_w_run
+                        ok_pa, binfo_pa = _can_launch_pa(w_l)
+                        if not ok_pa:
                             break
-                        hi_d = sum(item[7] for item in pa_queue)
-                        lnxt = (n + hi_d + 2 * w_l <= max_tokens)
-                        pa_queue.append(
-                            _launch_pa_cycle(
-                                p_nxt, prev[3], prev[4], prev[5], binfo_pa,
-                                ring_may_wrap=(off_cpu + hi_d + w_l > binfo_pa[6]),
-                                launch_next_draft=lnxt,
-                                next_w=w_l,
+                        if qlen == 0:
+                            if pa_packed is None or pa_packed_w != w_l:
+                                pa_packed = dr.draft_and_pack_gpu(
+                                    anchor, w_l, pos_arr=FD._wpos(dr.n), use_tree=pa_tree,
+                                    cost_arr=_pa_cost_for(w_l), prior_cfg=pa_prior_cfg,
+                                )
+                                pa_packed_w = w_l
+                            meta_r0, meta_f0 = dec.get_gpu_meta(staged=False)
+                            dr_pos0 = FD._wpos(dr.n)
+                            lnxt = (pa_depth >= 2) and (n + 2 * w_l <= max_tokens)
+                            pa_last_t = time.perf_counter()
+                            pa_queue.append(
+                                _launch_pa_cycle(
+                                    pa_packed, meta_r0, meta_f0, dr_pos0, binfo_pa,
+                                    ring_may_wrap=(off_cpu + w_l > binfo_pa[6]),
+                                    launch_next_draft=lnxt,
+                                    next_w=w_l,
+                                )
                             )
-                        )
+                            pa_packed = None
+                            pa_packed_w = 0
+                        else:
+                            prev = pa_queue[-1]
+                            p_nxt = prev[6]
+                            if p_nxt is None or int(p_nxt[0].shape[0]) != w_l:
+                                break
+                            hi_d = sum(item[7] for item in pa_queue)
+                            lnxt = (n + hi_d + 2 * w_l <= max_tokens)
+                            pa_queue.append(
+                                _launch_pa_cycle(
+                                    p_nxt, prev[3], prev[4], prev[5], binfo_pa,
+                                    ring_may_wrap=(off_cpu + hi_d + w_l > binfo_pa[6]),
+                                    launch_next_draft=lnxt,
+                                    next_w=w_l,
+                                )
+                            )
 
-            if pa_queue:
-                emitted_c, keep_arr_c, anc_nxt, _, _, _, p_nxt, w_done = pa_queue.popleft()
-                mx.eval(emitted_c, keep_arr_c)
-                now_t = time.perf_counter()
-                cyc_ms = (now_t - pa_last_t) * 1000.0
-                stats["verify_ms"] += cyc_ms
-                pa_last_t = now_t
-                keep = int(keep_arr_c.item())
-                em = emitted_c.tolist()[:keep]
-                dec.sync_kv_offsets(keep, staged=False)
-                dr.n += keep
-                off_cpu += keep
-                stats["cycles"] += 1
-                stats["accepted"] += keep - 1
-                if lookup is not None:
-                    for tok_e in em:
-                        lookup.append_one(tok_e)
-                if pa_adapt:
-                    pa_ema_tpc = 0.72 * pa_ema_tpc + 0.28 * keep
-                    if 4.0 <= cyc_ms <= 60.0:
-                        pa_ema_ms = 0.75 * pa_ema_ms + 0.25 * cyc_ms
-                    # Keep W=6 as neural floor (proved 134.13 MEAN8 in #85); promote 6->8 only on high-tpc prompts.
-                    if W_cfg >= 8 and pa_w_run < 8 and pa_ema_tpc >= 4.4:
-                        pa_w_run = 8
-                    elif pa_w_run == 8 and pa_ema_tpc < 3.8:
-                        pa_w_run = 6
-                    # AR fallback only on genuinely low-acceptance prompts (e.g. P1) where spec trails AR.
-                    spec_rate = pa_ema_tpc / max(1.0, pa_ema_ms)
-                    ar_rate = 1.0 / max(1.0, pa_t_ar)
-                    if keep <= 2 and pa_ema_tpc < 2.05 and spec_rate < 0.92 * ar_rate:
-                        pa_low_streak += 1
-                        if pa_low_streak >= 4:
-                            pa_ar_burst = pa_ar_backoff
-                            pa_ar_backoff = min(32, pa_ar_backoff + 8)
+                if pa_queue:
+                    emitted_c, keep_arr_c, anc_nxt, _, _, _, p_nxt, w_done, rb_c = pa_queue.popleft()
+                    mx.eval(emitted_c, keep_arr_c)
+                    now_t = time.perf_counter()
+                    cyc_ms = (now_t - pa_last_t) * 1000.0
+                    stats["verify_ms"] += cyc_ms
+                    pa_last_t = now_t
+                    keep = int(keep_arr_c.item())
+                    em = emitted_c.tolist()[:keep]
+                    if cache_state is not None:
+                        last_popped_rb = (_read_cpu_kv(), *rb_c)
+                    committed_tokens.append(anchor_int)
+                    if keep > 1:
+                        committed_tokens.extend(em[: keep - 1])
+                    dec.sync_kv_offsets(keep, staged=False)
+                    dr.n += keep
+                    off_cpu += keep
+                    stats["cycles"] += 1
+                    stats["accepted"] += keep - 1
+                    if lookup is not None:
+                        for tok_e in em:
+                            lookup.append_one(tok_e)
+                    if pa_adapt:
+                        pa_ema_tpc = 0.72 * pa_ema_tpc + 0.28 * keep
+                        if 4.0 <= cyc_ms <= 60.0:
+                            pa_ema_ms = 0.75 * pa_ema_ms + 0.25 * cyc_ms
+                        # Keep W=6 as neural floor (proved 134.13 MEAN8 in #85); promote 6->8 only on high-tpc prompts.
+                        if W_cfg >= 8 and pa_w_run < 8 and pa_ema_tpc >= 4.4:
+                            pa_w_run = 8
+                        elif pa_w_run == 8 and pa_ema_tpc < 3.8:
+                            pa_w_run = 6
+                        # AR fallback only on genuinely low-acceptance prompts (e.g. P1) where spec trails AR.
+                        spec_rate = pa_ema_tpc / max(1.0, pa_ema_ms)
+                        ar_rate = 1.0 / max(1.0, pa_t_ar)
+                        if keep <= 2 and pa_ema_tpc < 2.05 and spec_rate < 0.92 * ar_rate:
+                            pa_low_streak += 1
+                            if pa_low_streak >= 4:
+                                pa_ar_burst = pa_ar_backoff
+                                pa_ar_backoff = min(32, pa_ar_backoff + 8)
+                                pa_low_streak = 0
+                        elif spec_rate >= 1.00 * ar_rate:
                             pa_low_streak = 0
-                    elif spec_rate >= 1.00 * ar_rate:
-                        pa_low_streak = 0
-                        if keep >= 3:
-                            pa_ar_backoff = 16
-                if not pa_queue:
-                    anchor = anc_nxt
-                    pa_packed = p_nxt
-                    pa_packed_w = int(p_nxt[0].shape[0]) if p_nxt is not None else 0
-                for j in range(keep):
+                            if keep >= 3:
+                                pa_ar_backoff = 16
+                    anchor_int = em[keep - 1]
+                    if not pa_queue:
+                        anchor = anc_nxt
+                        pa_packed = p_nxt
+                        pa_packed_w = int(p_nxt[0].shape[0]) if p_nxt is not None else 0
+                    for j in range(keep):
+                        stats["tokens"] += 1
+                        yielded_tokens.append(em[j])
+                        yield em[j], None, (j < keep - 1)
+                        n += 1
+                        if n >= max_tokens:
+                            break
+                    continue
+                pa_packed = None
+                pa_packed_w = 0
+                if want_ar_burst:
+                    pa_ar_burst -= 1
+                    tar0 = time.perf_counter()
+                    anchor, tok = ar_step(anchor, anchor_int)
+                    anchor_int = tok
+                    pa_t_ar = 0.75 * pa_t_ar + 0.25 * ((time.perf_counter() - tar0) * 1000.0)
+                    off_cpu = int(dec.caches[0][0][0].offset)
+                    if lookup is not None:
+                        lookup.append_one(tok)
+                    if pa_ar_burst == 0:
+                        flush_deferred()
+                        if not dec._kv_stacked:
+                            dec.ensure_gpu_cap(max_tokens - n + 16)
+                            off_cpu = int(dec.caches[0][0][0].offset)
+                        dr._ensure_cap(dr.n + max_tokens - n + 32)
+                        pa_ema_tpc = 2.6
+                        pa_w_run = min(6, W_cfg)
+                    stats["cycles"] += 1
                     stats["tokens"] += 1
-                    yield em[j], None, (j < keep - 1)
+                    yielded_tokens.append(tok)
+                    yield tok, None, False
                     n += 1
-                    if n >= max_tokens:
-                        break
-                continue
-            pa_packed = None
-            pa_packed_w = 0
-            if want_ar_burst:
-                pa_ar_burst -= 1
-                tar0 = time.perf_counter()
-                anchor, tok = ar_step(anchor)
-                pa_t_ar = 0.75 * pa_t_ar + 0.25 * ((time.perf_counter() - tar0) * 1000.0)
+                    continue
+
+            rem = max_tokens - n
+            w_cur = max(1, min(W_cfg, dr.block, rem))
+            l_len = lookup.match_len if lookup is not None else 0
+            l_props = lookup.proposals(w_cur - 1) if (lookup is not None and l_len >= LookupIndex.MIN_MATCH) else []
+
+            in_cooldown = costs is not None and costs.ar_cooldown > 0 and l_len < 4
+            if w_cur == 1 or in_cooldown:
+                prefetched_fwd = None
+                if costs is not None and costs.ar_cooldown > 0:
+                    costs.ar_cooldown -= 1
+                anchor, tok = ar_step(anchor, anchor_int)
+                anchor_int = tok
                 off_cpu = int(dec.caches[0][0][0].offset)
                 if lookup is not None:
                     lookup.append_one(tok)
-                if pa_ar_burst == 0:
-                    flush_deferred()
-                    if not dec._kv_stacked:
-                        dec.ensure_gpu_cap(max_tokens - n + 16)
-                        off_cpu = int(dec.caches[0][0][0].offset)
-                    dr._ensure_cap(dr.n + max_tokens - n + 32)
-                    pa_ema_tpc = 2.6
-                    pa_w_run = min(6, W_cfg)
                 stats["cycles"] += 1
                 stats["tokens"] += 1
+                yielded_tokens.append(tok)
                 yield tok, None, False
                 n += 1
                 continue
 
-        rem = max_tokens - n
-        w_cur = max(1, min(W_cfg, dr.block, rem))
-        l_len = lookup.match_len if lookup is not None else 0
-        l_props = lookup.proposals(w_cur - 1) if (lookup is not None and l_len >= LookupIndex.MIN_MATCH) else []
-
-        in_cooldown = costs is not None and costs.ar_cooldown > 0 and l_len < 4
-        if w_cur == 1 or in_cooldown:
+            did_lookup_bypass = bool(l_props and _LOOKUP_BYPASS_MIN > 0 and l_len >= _LOOKUP_BYPASS_MIN)
+            if not did_lookup_bypass:
+                flush_deferred()
+            pf = prefetched_fwd if (prefetched_fwd is not None and prefetched_npos == w_cur - 1) else None
+            td0 = prefetched_t0 if pf is not None else time.perf_counter()
             prefetched_fwd = None
-            if costs is not None and costs.ar_cooldown > 0:
-                costs.ar_cooldown -= 1
-            anchor, tok = ar_step(anchor)
-            off_cpu = int(dec.caches[0][0][0].offset)
-            if lookup is not None:
-                lookup.append_one(tok)
-            stats["cycles"] += 1
-            stats["tokens"] += 1
-            yield tok, None, False
-            n += 1
-            continue
+            if did_lookup_bypass:
+                anc_int = int(anchor.item())
+                toks_lp = [anc_int] + l_props[: w_cur - 1]
+                blk = mx.array(toks_lp, mx.int32)
+                parents = tuple(range(-1, len(toks_lp) - 1))
+                depths = tuple(range(len(toks_lp)))
+                raw_probs = [-1.0] * len(toks_lp)
+                td_ms = (time.perf_counter() - td0) * 1000.0
+            else:
+                if use_budget or use_tree or l_props:
+                    blk, parents, depths, raw_probs = dr.draft_hybrid_tree(
+                        anchor,
+                        w_max=w_cur,
+                        budget=budget,
+                        step_costs=costs,
+                        lookup_props=l_props,
+                        lookup_len=l_len,
+                        use_tree=use_tree,
+                        prefetched=pf,
+                    )
+                else:
+                    blk = dr.draft_chain(anchor, width=w_cur, prefetched=pf)
+                    parents = tuple(range(-1, w_cur - 1))
+                    depths = tuple(range(w_cur))
+                    raw_probs = [-1.0] * w_cur
+                td_ms = (time.perf_counter() - td0) * 1000.0
+                if costs is not None:
+                    costs.observe_draft(td_ms)
+            if blk is None:
+                stats["draft_ms"] += td_ms
+                if costs is not None:
+                    costs.ar_cooldown = max(costs.ar_cooldown, 3)
+                anchor, tok = ar_step(anchor, anchor_int)
+                anchor_int = tok
+                off_cpu = int(dec.caches[0][0][0].offset)
+                if lookup is not None:
+                    lookup.append_one(tok)
+                stats["cycles"] += 1
+                stats["tokens"] += 1
+                yielded_tokens.append(tok)
+                yield tok, None, False
+                n += 1
+                continue
+            stats["draft_ms"] += td_ms
 
-        did_lookup_bypass = bool(l_props and _LOOKUP_BYPASS_MIN > 0 and l_len >= _LOOKUP_BYPASS_MIN)
-        if not did_lookup_bypass:
-            flush_deferred()
-        pf = prefetched_fwd if (prefetched_fwd is not None and prefetched_npos == w_cur - 1) else None
-        td0 = prefetched_t0 if pf is not None else time.perf_counter()
-        prefetched_fwd = None
-        if did_lookup_bypass:
-            anc_int = int(anchor.item())
-            toks_lp = [anc_int] + l_props[: w_cur - 1]
-            blk = mx.array(toks_lp, mx.int32)
-            parents = tuple(range(-1, len(toks_lp) - 1))
-            depths = tuple(range(len(toks_lp)))
-            raw_probs = [-1.0] * len(toks_lp)
-            td_ms = (time.perf_counter() - td0) * 1000.0
-        else:
-            if use_budget or use_tree or l_props:
-                blk, parents, depths, raw_probs = dr.draft_hybrid_tree(
-                    anchor,
-                    w_max=w_cur,
-                    budget=budget,
-                    step_costs=costs,
-                    lookup_props=l_props,
-                    lookup_len=l_len,
-                    use_tree=use_tree,
-                    prefetched=pf,
+            w_act = len(parents)
+            is_tree = parents != tuple(range(-1, w_act - 1))
+            if is_tree:
+                _, ca, tm_tbl = build_tree_tables(parents, depths)
+            else:
+                ca = tm_tbl = None
+
+            tv0 = time.perf_counter()
+            if is_tree:
+                t, kv_news, conv_ws, tap_buf = dec.verify_w(
+                    blk, tap_visits=tap_check, parents=parents, depths=depths, conv_anc=ca, tree_meta=tm_tbl
                 )
             else:
-                blk = dr.draft_chain(anchor, width=w_cur, prefetched=pf)
-                parents = tuple(range(-1, w_cur - 1))
-                depths = tuple(range(w_cur))
-                raw_probs = [-1.0] * w_cur
-            td_ms = (time.perf_counter() - td0) * 1000.0
-            if costs is not None:
-                costs.observe_draft(td_ms)
-        if blk is None:
-            stats["draft_ms"] += td_ms
-            if costs is not None:
-                costs.ar_cooldown = max(costs.ar_cooldown, 3)
-            anchor, tok = ar_step(anchor)
-            off_cpu = int(dec.caches[0][0][0].offset)
-            if lookup is not None:
-                lookup.append_one(tok)
-            stats["cycles"] += 1
-            stats["tokens"] += 1
-            yield tok, None, False
-            n += 1
-            continue
-        stats["draft_ms"] += td_ms
+                t, kv_news, conv_ws, tap_buf = dec.verify_w(blk, tap_visits=tap_check)
+            mx.eval(t)
+            tv_ms = (time.perf_counter() - tv0) * 1000.0
 
-        w_act = len(parents)
-        is_tree = parents != tuple(range(-1, w_act - 1))
-        if is_tree:
-            _, ca, tm_tbl = build_tree_tables(parents, depths)
-        else:
-            ca = tm_tbl = None
+            tl = t.tolist()
+            bl = blk.tolist()
+            if budget is not None:
+                budget.observe(parents, depths, raw_probs, bl, tl)
 
-        tv0 = time.perf_counter()
-        if is_tree:
-            t, kv_news, conv_ws, tap_buf = dec.verify_w(
-                blk, tap_visits=tap_check, parents=parents, depths=depths, conv_anc=ca, tree_meta=tm_tbl
-            )
-        else:
-            t, kv_news, conv_ws, tap_buf = dec.verify_w(blk, tap_visits=tap_check)
-        mx.eval(t)
-        tv_ms = (time.perf_counter() - tv0) * 1000.0
+            children = [[] for _ in range(w_act)]
+            for s in range(1, w_act):
+                children[parents[s]].append((s, bl[s]))
 
-        tl = t.tolist()
-        bl = blk.tolist()
-        if budget is not None:
-            budget.observe(parents, depths, raw_probs, bl, tl)
-
-        children = [[] for _ in range(w_act)]
-        for s in range(1, w_act):
-            children[parents[s]].append((s, bl[s]))
-
-        path = [0]
-        cur_slot = 0
-        while True:
-            target_tok = tl[cur_slot]
-            matched = None
-            for c_slot, c_tok in children[cur_slot]:
-                if c_tok == target_tok:
-                    matched = c_slot
+            path = [0]
+            cur_slot = 0
+            while True:
+                target_tok = tl[cur_slot]
+                matched = None
+                for c_slot, c_tok in children[cur_slot]:
+                    if c_tok == target_tok:
+                        matched = c_slot
+                        break
+                if matched is None:
+                    bonus_tok = target_tok
                     break
-            if matched is None:
-                bonus_tok = target_tok
-                break
-            path.append(matched)
-            cur_slot = matched
+                path.append(matched)
+                cur_slot = matched
 
-        keep = len(path)
-        stats["cycles"] += 1
-        stats["accepted"] += keep - 1
+            keep = len(path)
+            stats["cycles"] += 1
+            stats["accepted"] += keep - 1
 
-        if lookup is not None:
-            for j in range(1, keep):
-                lookup.append_one(bl[path[j]])
-            lookup.append_one(bonus_tok)
+            if lookup is not None:
+                for j in range(1, keep):
+                    lookup.append_one(bl[path[j]])
+                lookup.append_one(bonus_tok)
 
-        tc_ms = (time.perf_counter() - tv0) * 1000.0
-        stats["verify_ms"] += tv_ms
-        if costs is not None:
-            costs.observe_verify(w_act, tc_ms, keep, td_ms)
+            tc_ms = (time.perf_counter() - tv0) * 1000.0
+            stats["verify_ms"] += tv_ms
+            if costs is not None:
+                costs.observe_verify(w_act, tc_ms, keep, td_ms)
 
-        if n + keep < max_tokens:
-            anchor_next = t[cur_slot : cur_slot + 1]
-            dec.commit_w(kv_news, conv_ws, keep, path=path)
-            off_cpu = int(dec.caches[0][0][0].offset)
-            f_w = _feats_from_dict(tap_buf, tap_keys)
-            f_keep = f_w[:, :keep] if path == list(range(keep)) else f_w[:, mx.array(path, mx.int32)]
-            anchor = anchor_next
+            if n + keep < max_tokens:
+                anchor_next = t[cur_slot : cur_slot + 1]
+                if cache_state is not None:
+                    slot_r0 = (
+                        (0 if int(dec.caches[0][dec._ring_visits[0]][0]._idx) == int(dec.caches[0][dec._ring_visits[0]][0].max_size) else int(dec.caches[0][dec._ring_visits[0]][0]._idx))
+                        if dec._kv_stacked and dec._ring_visits
+                        else 0
+                    )
+                    last_popped_rb = (_read_cpu_kv(), *_snap_rb(slot_r0, keep))
+                dec.commit_w(kv_news, conv_ws, keep, path=path)
+                committed_tokens.extend(bl[path[j]] for j in range(keep))
+                off_cpu = int(dec.caches[0][0][0].offset)
+                f_w = _feats_from_dict(tap_buf, tap_keys)
+                f_keep = f_w[:, :keep] if path == list(range(keep)) else f_w[:, mx.array(path, mx.int32)]
+                anchor = anchor_next
 
-            rem_next = max_tokens - (n + keep)
-            w_next = max(1, min(W_cfg, dr.block, rem_next))
-            l_next = lookup.match_len if lookup is not None else 0
-            byp_next = _LOOKUP_BYPASS_MIN > 0 and l_next >= _LOOKUP_BYPASS_MIN
-            if did_lookup_bypass and byp_next:
-                # Defer drafter KV update while continuing zero-draft lookup streak (-0.5ms/cycle on P8!).
-                deferred_feats.append(f_keep)
-                mx.async_eval(*dec.kv_eval_targets(), dec.conv, f_keep)
-            else:
-                if deferred_feats:
+                rem_next = max_tokens - (n + keep)
+                w_next = max(1, min(W_cfg, dr.block, rem_next))
+                l_next = lookup.match_len if lookup is not None else 0
+                byp_next = _LOOKUP_BYPASS_MIN > 0 and l_next >= _LOOKUP_BYPASS_MIN
+                if did_lookup_bypass and byp_next:
+                    # Defer drafter KV update while continuing zero-draft lookup streak (-0.5ms/cycle on P8!).
                     deferred_feats.append(f_keep)
-                    flush_deferred()
+                    mx.async_eval(*dec.kv_eval_targets(), dec.conv, f_keep)
                 else:
-                    dr.append_ctx(f_keep)
-                cd_next = costs is not None and costs.ar_cooldown > 0 and l_next < 4
-                if not use_pipe_ahead and w_next >= 2 and not cd_next and not byp_next:
-                    prefetched_t0 = time.perf_counter()
-                    prefetched_npos = w_next - 1
-                    prefetched_fwd = dr._forward_block(anchor, n_pos=prefetched_npos)
-                    mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv, *prefetched_fwd)
-                else:
-                    mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv)
+                    if deferred_feats:
+                        deferred_feats.append(f_keep)
+                        flush_deferred()
+                    else:
+                        dr.append_ctx(f_keep)
+                    cd_next = costs is not None and costs.ar_cooldown > 0 and l_next < 4
+                    if not use_pipe_ahead and w_next >= 2 and not cd_next and not byp_next:
+                        prefetched_t0 = time.perf_counter()
+                        prefetched_npos = w_next - 1
+                        prefetched_fwd = dr._forward_block(anchor, n_pos=prefetched_npos)
+                        mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv, *prefetched_fwd)
+                    else:
+                        mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv)
 
-        for j in range(1, keep):
-            stats["tokens"] += 1
-            yield bl[path[j]], None, True
-            n += 1
-            if n >= max_tokens:
-                break
-        if n < max_tokens:
-            stats["tokens"] += 1
-            yield bonus_tok, None, False
-            n += 1
+            anchor_int = bonus_tok
+            for j in range(1, keep):
+                tok_d = bl[path[j]]
+                stats["tokens"] += 1
+                yielded_tokens.append(tok_d)
+                yield tok_d, None, True
+                n += 1
+                if n >= max_tokens:
+                    break
+            if n < max_tokens:
+                stats["tokens"] += 1
+                yielded_tokens.append(bonus_tok)
+                yield bonus_tok, None, False
+                n += 1
+    finally:
+        _sync_exact_cache()

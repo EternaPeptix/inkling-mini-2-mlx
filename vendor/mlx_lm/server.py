@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import copy
 import gc
 import hashlib
 import io
@@ -45,7 +46,12 @@ from .generate import (
     TextStateMachine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 from .processors import load_image, load_processor
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
@@ -777,6 +783,19 @@ class ResponseGenerator:
             and self.cli_args.kv_bits is None
         )
 
+    def _can_use_mtp_single(self, args, request) -> bool:
+        return (
+            os.environ.get("LOOPLING_MTP") in ("1", "dflash2")
+            and args.sampling.temperature <= 0.0
+            and not args.logprobs
+            and (args.top_logprobs is None or args.top_logprobs <= 0)
+            and not _make_logits_processors(args)
+            and self.model_provider.draft_model is None
+            and not self._is_distributed
+            and self.cli_args.kv_bits is None
+            and not any(_image_parts(request.messages))
+        )
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -820,6 +839,29 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
+                if (
+                    len(batch_results) == 0
+                    and not unprocessed_requests
+                    and self.requests.empty()
+                    and self._can_use_mtp_single(args, request)
+                ):
+                    if batch_generator is not None and current_model != args.model:
+                        current_model = None
+                        current_tokenizer = None
+                        current_model_key = None
+                        current_text_sm = None
+                        batch_generator.close()
+                        batch_generator = None
+                    try:
+                        self.model_provider.load(
+                            args.model.model, args.model.adapter, args.model.draft
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+                    self._serve_single((rqueue, request, args), generation_stream)
+                    continue
+
                 # Requests with images are served sequentially.
                 batchable = self._is_batchable(args) and not any(
                     _image_parts(request.messages)
@@ -839,6 +881,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
+                    sys_end = len(segments[0]) if segment_types and segment_types[0] == "system" else 0
                     stop_sm = (
                         TextStateMachine.from_stop_words(args.stop_words)
                         if args.stop_words
@@ -894,6 +937,8 @@ class ResponseGenerator:
                         "top_logprobs": args.top_logprobs,
                         "prompt_cache_count": prompt_cache_count,
                         "last_ckpt": prompt_cache_count,
+                        "sys_end": sys_end,
+                        "last_sys_ckpt": None,
                         "gen_tokens": 0,
                     }
                     # just making sure we don't leave a reference around
@@ -982,11 +1027,19 @@ class ResponseGenerator:
                     if eos_ids:
                         caches = batch_generator.extract_cache(eos_ids)
                         for uid, (cache, cache_key) in caches.items():
+                            seg_type = batch_results[uid]["segment_types"].pop()
+                            if seg_type == "system" and batch_results[uid]["last_sys_ckpt"] is not None:
+                                self.prompt_cache.promote_cache_type(
+                                    self.model_provider.model_key,
+                                    batch_results[uid]["last_sys_ckpt"],
+                                    "system",
+                                )
+                                batch_results[uid]["last_sys_ckpt"] = None
                             self.prompt_cache.insert_cache(
                                 self.model_provider.model_key,
                                 cache_key[:],
                                 cache,
-                                cache_type=batch_results[uid]["segment_types"].pop(),
+                                cache_type=seg_type,
                             )
                             batch_results[uid]["last_ckpt"] = len(cache_key)
                         del caches
@@ -1004,13 +1057,20 @@ class ResponseGenerator:
                         if ckpt_ids:
                             ckpts = batch_generator.extract_cache(ckpt_ids)
                             for uid, (cache, cache_key) in ckpts.items():
+                                br = batch_results[uid]
+                                key_copy = cache_key[:]
+                                ctype = "checkpoint"
+                                if br["sys_end"] > 0 and len(key_copy) < br["sys_end"]:
+                                    br["last_sys_ckpt"] = key_copy
+                                    if br["sys_end"] - len(key_copy) <= ckpt_stride:
+                                        ctype = "system"
                                 self.prompt_cache.insert_cache(
                                     self.model_provider.model_key,
-                                    cache_key[:],
+                                    key_copy,
                                     cache,
-                                    cache_type="checkpoint",
+                                    cache_type=ctype,
                                 )
-                                batch_results[uid]["last_ckpt"] = len(cache_key)
+                                br["last_ckpt"] = len(key_copy)
                             del ckpts
 
                     uids_to_finish = []
@@ -1116,6 +1176,9 @@ class ResponseGenerator:
 
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
+        if batch_generator is not None:
+            batch_generator.close()
+            batch_generator = None
         self.model_provider.reset()
         del self.prompt_cache
         gc.collect()
@@ -1134,9 +1197,10 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state, vision = self._tokenize(
+            prompt, segments, segment_types, initial_state, vision = self._tokenize(
                 tokenizer, request, args
             )
+            sys_end = len(segments[0]) if segment_types and segment_types[0] == "system" else 0
             stop_sm = TextStateMachine.from_stop_words(args.stop_words)
             text_sm = TextStateMachine.from_tokenizer(tokenizer)
 
@@ -1167,6 +1231,15 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             rest = prompt[ctx.prompt_cache_count :]
+            if not rest and len(prompt) > 0:
+                if cache is not None and can_trim_prompt_cache(cache):
+                    trim_prompt_cache(cache, 1)
+                    ctx.prompt_cache_count -= 1
+                    rest = [prompt[-1]]
+                else:
+                    cache = None
+                    ctx.prompt_cache_count = 0
+                    rest = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
@@ -1183,9 +1256,85 @@ class ResponseGenerator:
                     # The prefill runs on another stream: compute the vision rows first.
                     mx.eval(input_embeddings)
 
+            ckpt_stride = int(os.environ.get("LOOPLING_PREFIX_CHECKPOINT", "2048"))
+            last_ckpt = ctx.prompt_cache_count
+            last_sys_ckpt = None
+
+            rem_segments = [s[:] for s in segments]
+            rem_types = segment_types[:]
+            N_trim = ctx.prompt_cache_count
+            while N_trim > 0 and rem_segments:
+                if N_trim >= len(rem_segments[0]):
+                    N_trim -= len(rem_segments.pop(0))
+                    rem_types.pop(0)
+                else:
+                    rem_segments[0] = rem_segments[0][N_trim:]
+                    break
+            segment_ends = []
+            acc = 0
+            for seg, stype in zip(rem_segments, rem_types):
+                if not seg:
+                    continue
+                acc += len(seg)
+                if acc < len(rest):
+                    segment_ends.append((acc, stype))
+                elif len(seg) > 1:
+                    segment_ends.append((len(rest) - 1, stype))
+
+            def _ckpt_cb(processed_in_rest: int, total_rest: int, cur_cache, seg_type: Optional[str] = None):
+                nonlocal last_ckpt, last_sys_ckpt
+                if vision is not None:
+                    return
+                cur_len = ctx.prompt_cache_count + processed_in_rest
+                if seg_type is not None:
+                    snap = copy.deepcopy(cur_cache)
+                    mx.eval([c.state for c in snap])
+                    key_slice = prompt[:cur_len]
+                    if seg_type == "system" and last_sys_ckpt is not None:
+                        self.prompt_cache.promote_cache_type(
+                            self.model_provider.model_key, last_sys_ckpt, "system"
+                        )
+                        last_sys_ckpt = None
+                    self.prompt_cache.insert_cache(
+                        self.model_provider.model_key, key_slice, snap, cache_type=seg_type
+                    )
+                    last_ckpt = cur_len
+                    return
+                if ckpt_stride > 0 and cur_len - last_ckpt >= ckpt_stride and (total_rest - processed_in_rest) >= 256:
+                    snap = copy.deepcopy(cur_cache)
+                    mx.eval([c.state for c in snap])
+                    key_slice = prompt[:cur_len]
+                    ctype = "checkpoint"
+                    if sys_end > 0 and cur_len < sys_end:
+                        last_sys_ckpt = key_slice
+                        if sys_end - cur_len <= ckpt_stride:
+                            ctype = "system"
+                    self.prompt_cache.insert_cache(
+                        self.model_provider.model_key, key_slice, snap, cache_type=ctype
+                    )
+                    last_ckpt = cur_len
+                if sys_end > 0 and cur_len >= sys_end and last_sys_ckpt is not None:
+                    self.prompt_cache.promote_cache_type(
+                        self.model_provider.model_key, last_sys_ckpt, "system"
+                    )
+                    last_sys_ckpt = None
+
+            use_df2_state = (
+                draft_model is None
+                and vision is None
+                and os.environ.get("LOOPLING_MTP") == "dflash2"
+            )
+            cache_state = {} if use_df2_state else None
+            extra_kw = {}
+            if use_df2_state:
+                extra_kw["full_prompt"] = prompt
+                extra_kw["checkpoint_callback"] = _ckpt_cb
+                extra_kw["segment_ends"] = segment_ends
+                extra_kw["cache_state"] = cache_state
+
             # Process the prompt and generate tokens
             stop_reader = stop_sm.reader()
-            for gen in stream_generate(
+            sg = stream_generate(
                 model=model,
                 stream=stream,
                 tokenizer=tokenizer,
@@ -1202,38 +1351,53 @@ class ResponseGenerator:
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
-            ):
-                text, finish_reason = _apply_stop_words(
-                    stop_reader, gen.text, finish_reason=gen.finish_reason
-                )
-
-                rqueue.put(
-                    Response(
-                        text,
-                        gen.token,
-                        _token_logprob(gen.logprobs, gen.token, args.logprobs),
-                        finish_reason,
-                        _format_top_logprobs(
-                            gen.logprobs, args.top_logprobs, tokenizer
-                        ),
+                **extra_kw,
+            )
+            try:
+                for gen in sg:
+                    text, finish_reason = _apply_stop_words(
+                        stop_reader, gen.text, finish_reason=gen.finish_reason
                     )
+
+                    rqueue.put(
+                        Response(
+                            text,
+                            gen.token,
+                            _token_logprob(gen.logprobs, gen.token, args.logprobs),
+                            finish_reason,
+                            _format_top_logprobs(
+                                gen.logprobs, args.top_logprobs, tokenizer
+                            ),
+                        )
+                    )
+                    cache_key.append(gen.token)
+
+                    if ctx._should_stop:
+                        if self._is_distributed:
+                            raise NotImplementedError()
+                        break
+
+                    if finish_reason is not None:
+                        break
+            finally:
+                if hasattr(sg, "close"):
+                    sg.close()
+
+            if last_sys_ckpt is not None:
+                self.prompt_cache.promote_cache_type(
+                    self.model_provider.model_key, last_sys_ckpt, "system"
                 )
-                cache_key.append(gen.token)
-
-                if ctx._should_stop:
-                    if self._is_distributed:
-                        raise NotImplementedError()
-                    break
-
-                if finish_reason is not None:
-                    break
-
-            rqueue.put(None)
+            if use_df2_state and "cached_tokens" in cache_state:
+                cache_key = prompt[:] + cache_state["cached_tokens"]
 
             # Save the KV cache again
             self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
+                self.model_provider.model_key, cache_key, cache, cache_type="assistant"
             )
+            if self.model_provider.cli_args.prompt_cache_bytes is not None:
+                self.prompt_cache.trim_to(n_bytes=self.model_provider.cli_args.prompt_cache_bytes)
+
+            rqueue.put(None)
 
         except Exception as e:
             rqueue.put(e)
@@ -1986,7 +2150,13 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    disk_dir = getattr(model_provider.cli_args, "persistent_cache", None) or os.environ.get("LOOPLING_PERSISTENT_CACHE", "")
+    disk_gb = float(os.environ.get("LOOPLING_PERSISTENT_CACHE_GB", "8"))
+    prompt_cache = LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        disk_dir=disk_dir or None,
+        disk_max_bytes=int(disk_gb * (1 << 30)),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -2124,6 +2294,12 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--persistent-cache",
+        type=str,
+        default=os.environ.get("LOOPLING_PERSISTENT_CACHE", ""),
+        help="Optional directory for persistent SSD prompt cache write-behind and reload.",
     )
     parser.add_argument(
         "--kv-bits",

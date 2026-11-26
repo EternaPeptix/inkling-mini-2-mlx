@@ -1835,14 +1835,40 @@ def _legacy_mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, pr
             mx.clear_cache()
 
 
-def mtp_generate_step(prompt, model, *, max_tokens=256, sampler=None, prefill_step_size=2048, prompt_cache=None, **kw):
+def mtp_generate_step(
+    prompt,
+    model,
+    *,
+    max_tokens=256,
+    sampler=None,
+    prefill_step_size=2048,
+    prompt_cache=None,
+    full_prompt=None,
+    eos_token_ids=None,
+    checkpoint_callback=None,
+    segment_ends=None,
+    cache_state=None,
+    prompt_progress_callback=None,
+    **kw,
+):
     """Greedy self-speculative decoding with the official drafter (or Splash DFlash2 when LOOPLING_MTP=dflash2). Yields (token, logprobs, from_draft)."""
     if os.environ.get("LOOPLING_MTP") == "dflash2":
         from mlx_lm.models.inkling2.dflash2 import dflash2_exact_generate_step
 
         return dflash2_exact_generate_step(
-            prompt, model, max_tokens=max_tokens, sampler=sampler,
-            prefill_step_size=prefill_step_size, prompt_cache=prompt_cache, **kw,
+            prompt,
+            model,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            prefill_step_size=prefill_step_size,
+            prompt_cache=prompt_cache,
+            full_prompt=full_prompt,
+            eos_token_ids=eos_token_ids,
+            checkpoint_callback=checkpoint_callback,
+            segment_ends=segment_ends,
+            cache_state=cache_state,
+            prompt_progress_callback=prompt_progress_callback,
+            **kw,
         )
     from mlx_lm.models.inkling2.batchdecode import BatchDecoder, _FUSED, _PLAIN
     from mlx_lm.models.inkling2 import fastdecode as FD, layers as L

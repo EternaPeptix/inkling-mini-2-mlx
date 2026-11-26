@@ -783,46 +783,63 @@ def stream_generate(
         from mlx_lm.models.inkling2.mtp import mtp_generate_step
 
         kwargs.pop("num_draft_tokens", None)
+        kwargs.setdefault("eos_token_ids", tokenizer.eos_token_ids)
         token_generator = mtp_generate_step(prompt, model, **kwargs)
         token_generator = (
             (token, logprobs, fd) for token, logprobs, fd in token_generator
         )
     elif _ss is not None:
         # LOOPLING_SELFSPEC=<draft_passes>:<k>: greedy self-speculative decoding
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
+        for _k in ("max_kv_size", "prompt_progress_callback", "full_prompt", "checkpoint_callback", "segment_ends", "cache_state"):
+            kwargs.pop(_k, None)
         token_generator = selfspec.selfspec_generate_step(
             prompt, model, _ss[0], _ss[1], stream, **kwargs
         )
     elif draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
+        for _k in ("num_draft_tokens", "full_prompt", "checkpoint_callback", "segment_ends", "cache_state"):
+            kwargs.pop(_k, None)
         token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
         )
     else:
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
+        for _k in ("max_kv_size", "prompt_progress_callback", "full_prompt", "checkpoint_callback", "segment_ends", "cache_state"):
+            kwargs.pop(_k, None)
         if kwargs.pop("input_embeddings", None) is not None:
             raise ValueError("Speculative decoding does not support input embeddings.")
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )
     with wired_limit(model, [stream]):
-        tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+        try:
+            tic = time.perf_counter()
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+                detokenizer.add_token(token)
+                if (n + 1) == max_tokens:
+                    break
 
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -833,22 +850,11 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
+        finally:
+            if hasattr(token_generator, "close"):
+                token_generator.close()
 
 
 def generate(

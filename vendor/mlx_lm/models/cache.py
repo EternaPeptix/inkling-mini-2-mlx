@@ -1,8 +1,14 @@
 # Copyright © 2023 Apple Inc.
 
 import copy
+import hashlib
+import json
+import logging
+import os
 from collections import deque
 from dataclasses import dataclass
+from queue import Empty as QueueEmpty, Full as QueueFull, Queue
+from threading import Thread
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -2256,11 +2262,21 @@ class PromptTrie:
 
 
 class LRUPromptCache:
+    _DISK_FORMAT = 1
+
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+
+    @dataclass
+    class _DiskCacheEntry:
+        path: str
+        nbytes: int
+        cache_type: str
+        model_key: Any
+        tokens: List[int]
 
     class CacheOrder:
         def __init__(self, ordering: Optional[List[str]] = None):
@@ -2309,6 +2325,8 @@ class LRUPromptCache:
         max_size: int = 10,
         max_bytes: int = 1 << 63,
         max_checkpoints: int = 32,
+        disk_dir: Optional[str] = None,
+        disk_max_bytes: int = 8 << 30,
     ):
         self.max_size = max_size
         self.max_bytes = max_bytes
@@ -2318,6 +2336,159 @@ class LRUPromptCache:
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
         self._has_trimmable = False
+        self.disk_dir = os.path.expanduser(disk_dir) if disk_dir else None
+        self.disk_max_bytes = int(disk_max_bytes)
+        self._disk_queue: Optional[Queue] = None
+        self._disk_thread: Optional[Thread] = None
+        if self.disk_dir:
+            self._init_disk_cache()
+
+    @staticmethod
+    def _disk_key_hash(model: Any, tokens: List[int]) -> str:
+        h = hashlib.sha256()
+        mk = json.dumps(list(model) if isinstance(model, tuple) else model, ensure_ascii=True)
+        h.update(mk.encode("utf-8"))
+        h.update(b":")
+        h.update(len(tokens).to_bytes(8, "little"))
+        for t in tokens:
+            h.update(int(t).to_bytes(4, "little", signed=True))
+        return h.hexdigest()[:32]
+
+    def _init_disk_cache(self):
+        os.makedirs(self.disk_dir, exist_ok=True)
+        loaded = []
+        for fn in os.listdir(self.disk_dir):
+            if not fn.endswith(".json"):
+                continue
+            jp = os.path.join(self.disk_dir, fn)
+            try:
+                with open(jp, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("format") != self._DISK_FORMAT:
+                    continue
+                sf = os.path.join(self.disk_dir, meta["file"])
+                if not os.path.isfile(sf):
+                    continue
+                mk = tuple(meta["model_key"]) if meta.get("model_is_tuple") else meta["model_key"]
+                toks = [int(t) for t in meta["tokens"]]
+                ctype = meta.get("cache_type", "assistant")
+                nbytes = int(meta.get("nbytes", os.path.getsize(sf)))
+                loaded.append((os.path.getmtime(sf), mk, toks, sf, nbytes, ctype))
+            except Exception:
+                continue
+        for _, mk, toks, sf, nbytes, ctype in sorted(loaded, key=lambda x: x[0]):
+            self._trie.add(mk, toks, LRUPromptCache._DiskCacheEntry(sf, nbytes, ctype, mk, toks))
+        self._disk_queue = Queue(maxsize=32)
+        self._disk_thread = Thread(target=self._disk_worker, daemon=True)
+        self._disk_thread.start()
+
+    def _prune_disk(self):
+        if not self.disk_dir or self.disk_max_bytes <= 0:
+            return
+        files = []
+        total = 0
+        for fn in os.listdir(self.disk_dir):
+            if fn.endswith(".safetensors"):
+                p = os.path.join(self.disk_dir, fn)
+                try:
+                    st = os.stat(p)
+                    files.append((st.st_mtime, st.st_size, p))
+                    total += st.st_size
+                except OSError:
+                    pass
+        if total <= self.disk_max_bytes:
+            return
+        files.sort()
+        for _, sz, sf_path in files:
+            if total <= self.disk_max_bytes:
+                break
+            try:
+                os.remove(sf_path)
+            except OSError:
+                pass
+            jp = sf_path[: -len(".safetensors")] + ".json"
+            try:
+                if os.path.exists(jp):
+                    os.remove(jp)
+            except OSError:
+                pass
+            total -= sz
+
+    def _disk_worker(self):
+        while True:
+            item = self._disk_queue.get()
+            try:
+                if item is None:
+                    return
+                model, tokens, cache_snap, cache_type = item
+                h = self._disk_key_hash(model, tokens)
+                sf_name = f"{h}.safetensors"
+                sf_path = os.path.join(self.disk_dir, sf_name)
+                jp_path = os.path.join(self.disk_dir, f"{h}.json")
+                if os.path.exists(sf_path) and os.path.exists(jp_path):
+                    continue
+                tmp_sf = os.path.join(self.disk_dir, f".{h}.{os.getpid()}.tmp.safetensors")
+                tmp_jp = os.path.join(self.disk_dir, f".{h}.{os.getpid()}.tmp.json")
+                save_prompt_cache(tmp_sf, cache_snap, {"cache_type": cache_type})
+                os.replace(tmp_sf, sf_path)
+                meta = {
+                    "format": self._DISK_FORMAT,
+                    "model_key": list(model) if isinstance(model, tuple) else model,
+                    "model_is_tuple": isinstance(model, tuple),
+                    "tokens": [int(t) for t in tokens],
+                    "cache_type": cache_type,
+                    "nbytes": sum(c.nbytes for c in cache_snap),
+                    "file": sf_name,
+                }
+                with open(tmp_jp, "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
+                os.replace(tmp_jp, jp_path)
+                self._prune_disk()
+            except Exception as e:
+                logging.warning(f"Persistent prompt cache write failed: {e}")
+            finally:
+                self._disk_queue.task_done()
+
+    def _enqueue_disk(self, model: Any, tokens: List[int], prompt_cache: List[Any], cache_type: str):
+        if self._disk_queue is None or cache_type not in ("system", "user", "assistant") or len(tokens) < 512:
+            return
+        try:
+            states = [c.state for c in prompt_cache]
+            mx.eval(states)
+            snap = [type(c).from_state(s) for c, s in zip(prompt_cache, states)]
+            self._disk_queue.put_nowait((model, tokens[:], snap, cache_type))
+        except QueueFull:
+            pass
+        except Exception as e:
+            logging.warning(f"Persistent prompt cache enqueue failed: {e}")
+
+    def flush_disk(self):
+        if self._disk_queue is not None:
+            self._disk_queue.join()
+
+    def _materialize_entry(self, model: Any, tokens: List[int], entry: Any):
+        if not isinstance(entry, LRUPromptCache._DiskCacheEntry):
+            return entry
+        try:
+            cache = load_prompt_cache(entry.path)
+        except Exception as e:
+            logging.warning(f"Persistent prompt cache load failed for {entry.path}: {e}")
+            try:
+                self._trie.pop(model, tokens)
+            except KeyError:
+                pass
+            return None
+        ram_entry = LRUPromptCache.CacheEntry(cache, sum(c.nbytes for c in cache), entry.cache_type)
+        if ram_entry.cache_type not in self._n_bytes_by_type:
+            ram_entry.cache_type = "assistant"
+        self._trie.add(model, tokens, ram_entry)
+        self._n_bytes += ram_entry.nbytes
+        self._n_bytes_by_type[ram_entry.cache_type] += ram_entry.nbytes
+        self._lru.push(model, tokens, ram_entry.cache_type)
+        if can_trim_prompt_cache(cache):
+            self._has_trimmable = True
+        self._enforce_ram_limits()
+        return ram_entry
 
     def __len__(self):
         return len(self._lru)
@@ -2329,13 +2500,14 @@ class LRUPromptCache:
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens, find_longer=self._has_trimmable)
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            cache_entry = self._materialize_entry(result.model, result.exact, self._trie.get(result.model, result.exact))
+            if cache_entry is not None:
+                return copy.deepcopy(cache_entry.prompt_cache), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            cache_entry = self._materialize_entry(result.model, result.longer, self._trie.get(result.model, result.longer))
+            if cache_entry is not None and can_trim_prompt_cache(cache_entry.prompt_cache):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
@@ -2343,16 +2515,46 @@ class LRUPromptCache:
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            cache_entry = self._materialize_entry(result.model, result.shorter, self._trie.get(result.model, result.shorter))
+            if cache_entry is not None:
+                return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
 
     def _evict_entry(self, *, skip_checkpoint: bool = False):
         model, tokens = self._lru.pop(skip_checkpoint=skip_checkpoint)
         entry = self._trie.pop(model, tokens)
-        self._n_bytes -= entry.nbytes
+        if isinstance(entry, LRUPromptCache.CacheEntry):
+            self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+
+    def _enforce_ram_limits(self):
+        while self._lru.count_type("checkpoint") > self.max_checkpoints:
+            self._evict_entry(skip_checkpoint=False)
+        while self._lru.count_non_checkpoint() > self.max_size:
+            self._evict_entry(skip_checkpoint=True)
+        while self._n_bytes > self.max_bytes and len(self._lru) > 0:
+            self._evict_entry(skip_checkpoint=False)
+
+    def promote_cache_type(self, model: Any, tokens: List[int], cache_type: str = "system") -> bool:
+        if cache_type not in self._n_bytes_by_type:
+            return False
+        try:
+            entry = self._trie.get(model, tokens)
+        except KeyError:
+            return False
+        if isinstance(entry, LRUPromptCache._DiskCacheEntry):
+            entry.cache_type = cache_type
+            return True
+        if entry.cache_type == cache_type:
+            return True
+        self._lru.remove(model, tokens)
         self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        entry.cache_type = cache_type
+        self._n_bytes_by_type[cache_type] += entry.nbytes
+        self._lru.push(model, tokens, cache_type)
+        self._enqueue_disk(model, tokens, entry.prompt_cache, cache_type)
+        return True
 
     def insert_cache(
         self,
@@ -2373,7 +2575,7 @@ class LRUPromptCache:
         self._n_bytes += entry.nbytes
         self._n_bytes_by_type[cache_type] += entry.nbytes
         prev = self._trie.add(model, tokens, entry)
-        if prev is not None:
+        if isinstance(prev, LRUPromptCache.CacheEntry):
             self._n_bytes -= prev.nbytes
             self._n_bytes_by_type[prev.cache_type] -= prev.nbytes
             self._lru.remove(model, tokens)
@@ -2384,17 +2586,13 @@ class LRUPromptCache:
         if can_trim_prompt_cache(prompt_cache):
             self._has_trimmable = True
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
-                self._n_bytes -= entry.nbytes
-                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-                self._lru.remove(model, tokens[:prefix_len])
+                if isinstance(entry, LRUPromptCache.CacheEntry):
+                    self._n_bytes -= entry.nbytes
+                    self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+                    self._lru.remove(model, tokens[:prefix_len])
 
-        # Enforce slot caps separately for checkpoints and conversation entries
-        while self._lru.count_type("checkpoint") > self.max_checkpoints:
-            self._evict_entry(skip_checkpoint=False)
-        while self._lru.count_non_checkpoint() > self.max_size:
-            self._evict_entry(skip_checkpoint=True)
-        while self._n_bytes > self.max_bytes and len(self._lru) > 0:
-            self._evict_entry(skip_checkpoint=False)
+        self._enforce_ram_limits()
+        self._enqueue_disk(model, tokens, prompt_cache, cache_type)
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None

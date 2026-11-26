@@ -1131,7 +1131,7 @@ def dflash2_exact_generate_step(
     if not dec._b1_fast:
         raise RuntimeError("dflash2_exact_generate_step requires BatchDecoder._b1_fast")
 
-    y, tap0 = dec.step_with_taps(prompt[pos:], tap_visits=tap_set)
+    y, tap0 = dec.step_with_taps(prompt[pos:], tap_visits=tap_set, sampler=sampler)
     f0 = _feats_from_dict(tap0, tap_keys)
     dr.append_ctx(f0)
     mx.eval(y, dr.ck, dr.cv, *dec.kv_eval_targets(), dec.conv)
@@ -1152,10 +1152,10 @@ def dflash2_exact_generate_step(
         off_f = int(dec.caches[0][dec._full_visits[0]][0].offset) if dec._full_visits else 0
         return len(committed_tokens), off_r, idx_r, off_f
 
-    def _snap_rb(slot_r_expr, w_slots: int):
+    def _snap_rb(slot_r_expr, w_slots: int, need_ring: bool = True):
         conv_bak = [list(cs) for cs in dec.conv]
         pos_bak = ring_bak = None
-        if dec._kv_stacked and dec._kv_ring is not None and dec._ring_visits:
+        if need_ring and dec._kv_stacked and dec._kv_ring is not None and dec._ring_visits:
             max_size_r = int(dec.caches[0][dec._ring_visits[0]][0].max_size)
             ar = _cw_ar_cache.get(w_slots)
             if ar is None:
@@ -1247,9 +1247,11 @@ def dflash2_exact_generate_step(
                 deferred_feats.clear()
                 mx.async_eval(dr.ck, dr.cv)
 
+        is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
+
         def ar_step(cur_anchor: mx.array, cur_anchor_int: int):
             tar0 = time.perf_counter()
-            y_cur, tp = dec.step_with_taps(cur_anchor, tap_visits=tap_set)
+            y_cur, tp = dec.step_with_taps(cur_anchor, tap_visits=tap_set, sampler=sampler)
             committed_tokens.append(cur_anchor_int)
             f1 = _feats_from_dict(tp, tap_keys)
             mx.eval(y_cur)
@@ -1278,7 +1280,7 @@ def dflash2_exact_generate_step(
                 dr._ensure_cap(dr.n + max_tokens + 32)
         tau_cap = off_cpu + max_tokens + 32
 
-        pa_tree = bool(use_tree or use_budget)
+        pa_tree = bool(use_tree or use_budget or not is_greedy)
         pa_depth = max(1, min(2, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
         fscale = (12 + 12 * passes) / 24.0
         pa_costs_env = os.environ.get("LOOPLING_DFLASH2_PA_COSTS")
@@ -1337,17 +1339,20 @@ def dflash2_exact_generate_step(
                 dr_pos=dr_pos,
                 use_stage=False,
                 w_act=wa_c,
+                sampler=sampler,
             )
             (
                 path_pad, emitted, keep_arr, last_slot, anc_nxt,
                 slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
             ) = walk_res
-            rb = _snap_rb(slot_r_old, w_c) if cache_state is not None else None
+            rb = _snap_rb(slot_r_old, w_c, need_ring=ring_may_wrap) if cache_state is not None else None
             eval_a = [
                 emitted, keep_arr, path_pad, last_slot, anc_nxt,
                 slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
                 *kv_news,
             ]
+            if rb is not None and rb[2] is not None:
+                eval_a.append(rb[2])
             for cw in conv_ws:
                 eval_a.extend(cw)
             eval_a.extend(tap_buf.values())
@@ -1364,8 +1369,6 @@ def dflash2_exact_generate_step(
             eval_b = [*dec.kv_eval_targets()]
             for cs in dec.conv:
                 eval_b.extend(cs)
-            if rb is not None and rb[2] is not None:
-                eval_b.append(rb[2])
             eval_b.extend(dr.ck)
             eval_b.extend(dr.cv)
             if launch_next_draft:
@@ -1619,10 +1622,11 @@ def dflash2_exact_generate_step(
             tv0 = time.perf_counter()
             if is_tree:
                 t, kv_news, conv_ws, tap_buf = dec.verify_w(
-                    blk, tap_visits=tap_check, parents=parents, depths=depths, conv_anc=ca, tree_meta=tm_tbl
+                    blk, tap_visits=tap_check, parents=parents, depths=depths, conv_anc=ca, tree_meta=tm_tbl,
+                    sampler=sampler,
                 )
             else:
-                t, kv_news, conv_ws, tap_buf = dec.verify_w(blk, tap_visits=tap_check)
+                t, kv_news, conv_ws, tap_buf = dec.verify_w(blk, tap_visits=tap_check, sampler=sampler)
             mx.eval(t)
             tv_ms = (time.perf_counter() - tv0) * 1000.0
 
@@ -1667,12 +1671,19 @@ def dflash2_exact_generate_step(
             if n + keep < max_tokens:
                 anchor_next = t[cur_slot : cur_slot + 1]
                 if cache_state is not None:
-                    slot_r0 = (
-                        (0 if int(dec.caches[0][dec._ring_visits[0]][0]._idx) == int(dec.caches[0][dec._ring_visits[0]][0].max_size) else int(dec.caches[0][dec._ring_visits[0]][0]._idx))
-                        if dec._kv_stacked and dec._ring_visits
-                        else 0
-                    )
-                    last_popped_rb = (_read_cpu_kv(), *_snap_rb(slot_r0, keep))
+                    has_ring = bool(dec._kv_stacked and dec._ring_visits)
+                    if has_ring:
+                        kv_r0 = dec.caches[0][dec._ring_visits[0]][0]
+                        max_size_r = int(kv_r0.max_size)
+                        slot_r0 = 0 if int(kv_r0._idx) == max_size_r else int(kv_r0._idx)
+                        need_ring = (off_cpu + keep) > max_size_r
+                    else:
+                        slot_r0 = 0
+                        need_ring = False
+                    rb_np = _snap_rb(slot_r0, keep, need_ring=need_ring)
+                    if rb_np[2] is not None:
+                        mx.async_eval(rb_np[2])
+                    last_popped_rb = (_read_cpu_kv(), *rb_np)
                 dec.commit_w(kv_news, conv_ws, keep, path=path)
                 committed_tokens.extend(bl[path[j]] for j in range(keep))
                 off_cpu = int(dec.caches[0][0][0].offset)

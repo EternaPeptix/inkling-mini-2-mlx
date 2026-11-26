@@ -55,12 +55,12 @@ def make_cli_args(model_path: str, persistent_cache: str = ""):
     )
 
 
-def make_gen_args(max_tokens: int, stop_words=None):
+def make_gen_args(max_tokens: int, stop_words=None, temperature: float = 0.0, top_p: float = 1.0, seed=None):
     return GenerationArguments(
         model=ModelDescription(model="default_model", draft=None, adapter=None),
         sampling=SamplingArguments(
-            temperature=0.0,
-            top_p=1.0,
+            temperature=temperature,
+            top_p=top_p,
             top_k=0,
             min_p=0.0,
             xtc_probability=0.0,
@@ -80,14 +80,14 @@ def make_gen_args(max_tokens: int, stop_words=None):
         num_draft_tokens=3,
         logprobs=False,
         top_logprobs=0,
-        seed=None,
+        seed=seed,
         chat_template_kwargs=None,
     )
 
 
-def run_chat(rg: ResponseGenerator, messages, max_tokens: int, stop_words=None):
+def run_chat(rg: ResponseGenerator, messages, max_tokens: int, stop_words=None, temperature: float = 0.0, top_p: float = 1.0, seed=None):
     req = CompletionRequest(request_type="chat", prompt="", messages=messages, tools=None, role_mapping=None)
-    args = make_gen_args(max_tokens=max_tokens, stop_words=stop_words)
+    args = make_gen_args(max_tokens=max_tokens, stop_words=stop_words, temperature=temperature, top_p=top_p, seed=seed)
     t0 = time.perf_counter()
     t_first = None
     tokens = []
@@ -237,6 +237,31 @@ def main():
             sys.exit(1)
         if df4["cached_toks"] <= 0:
             print(f"FAIL: expected system-head cache hit on DF2 T4 (cached_toks > 0), got {df4['cached_toks']}", file=sys.stderr)
+            sys.exit(1)
+
+        # 4. Lossless non-greedy (temp=0.6, top_p=0.95) exact seed-0 + multi-turn DFlash2 check
+        print("\n=== Running Lossless Non-Greedy DFlash2 (temp=0.6, top_p=0.95) ===")
+        seed_msgs = [{"role": "user", "content": "Explain why binary search is O(log n) in one paragraph."}]
+        rg.prompt_cache = LRUPromptCache(max_size=16, max_bytes=16 << 30)
+        os.environ["LOOPLING_MTP"] = "0"
+        ng_ar0 = run_chat(rg, seed_msgs, max_tokens=8, temperature=0.6, top_p=0.95, seed=42)
+        rg.prompt_cache = LRUPromptCache(max_size=16, max_bytes=16 << 30)
+        os.environ["LOOPLING_MTP"] = "dflash2"
+        ng_df0 = run_chat(rg, seed_msgs, max_tokens=8, temperature=0.6, top_p=0.95, seed=42)
+        print(f"Seed=42 tok0 match: ar={ng_ar0['tokens'][0]} df2={ng_df0['tokens'][0]}")
+        if ng_ar0["tokens"][0] != ng_df0["tokens"][0]:
+            print(f"FAIL: temp=0.6 seed=42 tok0 mismatch: {ng_ar0['tokens'][0]} vs {ng_df0['tokens'][0]}", file=sys.stderr)
+            sys.exit(1)
+
+        ng_cache = LRUPromptCache(max_size=16, max_bytes=16 << 30)
+        rg.prompt_cache = ng_cache
+        ng_msgs1 = [{"role": "user", "content": "Write a Python function that parses an ISO-8601 duration like P3DT4H12M into total seconds."}]
+        ng_t1 = run_chat(rg, ng_msgs1, max_tokens=128, temperature=0.6, top_p=0.95)
+        ng_msgs2 = ng_msgs1 + [{"role": "assistant", "content": ng_t1["text"]}, {"role": "user", "content": "Now add unit tests."}]
+        ng_t2 = run_chat(rg, ng_msgs2, max_tokens=96, temperature=0.6, top_p=0.95)
+        print(f"DF2 temp=0.6 T1: tok={len(ng_t1['tokens'])} tps={ng_t1['tps']:.2f} | T2: tok={len(ng_t2['tokens'])} tps={ng_t2['tps']:.2f} cached={ng_t2['cached_toks']}/{ng_t2['prompt_toks']}")
+        if ng_t2["cached_toks"] <= 0:
+            print(f"FAIL: expected temp=0.6 T2 cache hit > 0, got {ng_t2['cached_toks']}", file=sys.stderr)
             sys.exit(1)
     finally:
         rg.stop_and_join()

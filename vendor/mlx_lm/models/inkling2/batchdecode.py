@@ -2067,15 +2067,18 @@ class BatchDecoder:
             self._pending_stage_deps = ()
         return h_out, h_ref_out
 
-    def step_with_taps(self, tokens, *, tap_visits=None):
+    def step_with_taps(self, tokens, *, tap_visits=None, sampler=None):
         assert self._b1_fast
         tap_set = set(tap_visits) if tap_visits is not None else set()
         tap_buf = {}
         h, h_ref = self._b1_hidden_pair(tokens, tap_set=tap_set, tap_buf=tap_buf)
         self._flush_b1_pending()
+        is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
         if h_ref is not None:
             z_R, z_ref = self._pair_logits_softcap(h, h_ref)
             logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd)
+        elif not is_greedy:
+            logits = self._project_logits_softcap(h)
         elif "head" in _FUSED:
             m = self.model
             lm = m.lm_head
@@ -2098,8 +2101,9 @@ class BatchDecoder:
             return self._with_stage_deps(RH.softcap_argmax_rows(logits, text.final_logit_softcapping, text.unpadded_vocab_size)), tap_buf
         else:
             logits = self._project_logits_softcap(h)
-        lp = logits - mx.logsumexp(logits, keepdims=True)
-        return self._with_stage_deps(mx.argmax(lp, axis=-1)), tap_buf
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        tok = mx.argmax(lp, axis=-1) if is_greedy else sampler(lp).reshape(1).astype(mx.uint32)
+        return self._with_stage_deps(tok), tap_buf
 
     @staticmethod
     def _regime_key(s_min: int, s_max: int):
@@ -2158,11 +2162,12 @@ class BatchDecoder:
     def _get_cw_compiled(
         self, W, max_depth, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, tap_tuple,
         use_tau_table=False, tau_size=0, use_walk=False, fuse_k1=None, use_stage=False, use_dyn=False,
+        return_h_out=False,
     ):
         if fuse_k1 is None:
             fuse_k1 = (not use_dyn) and (os.environ.get("LOOPLING_FUSE_COMB_K1", "0") not in ("0", ""))
         md_key = None if use_tau_table else max_depth
-        key = (W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple, use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn)
+        key = (W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple, use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, return_h_out)
         ent = self._cw_compiled.get(key)
         if ent is not None:
             return ent
@@ -2248,6 +2253,8 @@ class BatchDecoder:
                             )["q_in"]
                         if has_F:
                             taps_out.append(h_out)
+                        if return_h_out:
+                            return [h_out] + kvns + cws + taps_out
                         lm = m.lm_head
                         text = m.args.text
                         if use_walk and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
@@ -2317,9 +2324,27 @@ class BatchDecoder:
         ret = tuple(o2[:head2]) if use_walk else o2[0]
         return ret, kv_news, conv_ws, tap_buf
 
+    def _sample_verify_tokens(self, h_out, sampler):
+        m = self.model
+        lm = m.lm_head
+        text = m.args.text
+        if "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
+            lg = RQ.qmv_rows(h_out, lm["weight"], lm["scales"], lm["biases"])
+        elif "head" in _PLAIN:
+            lg = lm(h_out)
+        else:
+            with _RowsMode():
+                lg = lm(h_out)
+        lg = lg[:, : text.unpadded_vocab_size].astype(mx.float32)
+        softcap = float(text.final_logit_softcapping)
+        if softcap > 0.0:
+            lg = mx.tanh(lg / softcap) * softcap
+        lp = lg - mx.logsumexp(lg, axis=-1, keepdims=True)
+        return sampler(lp).astype(mx.uint32)
+
     def verify_w_gpu(
         self, tokens, *, meta_r, meta_f, depths_arr, conv_anc, tree_meta, max_depth, binfo, tau_cap,
-        tap_visits=None, par_arr=None, dr_pos=None, use_stage=False, w_act=None,
+        tap_visits=None, par_arr=None, dr_pos=None, use_stage=False, w_act=None, sampler=None,
     ):
         """Non-mutating causal W-token verify using GPU `meta_arr` and `tau_table`, without mid-async_eval."""
         assert self._b1_fast and self._kv_stacked
@@ -2330,6 +2355,9 @@ class BatchDecoder:
         W = int(tokens.shape[0])
         assert 2 <= W <= 8
         use_walk = par_arr is not None and dr_pos is not None
+        is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
+        compile_walk = use_walk and is_greedy
+        return_h_out = not is_greedy
         use_dyn = w_act is not None
         r_key, f_key, s_b_r, s_b_f, cap_r, cap_f, _ = binfo
         tap_set = set(tap_visits) if tap_visits is not None else set()
@@ -2348,7 +2376,8 @@ class BatchDecoder:
         if num_passes == 1 and self.nv == 24:
             (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
                 W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-                use_tau_table=True, tau_size=tau_size, use_walk=use_walk, use_stage=use_stage, use_dyn=use_dyn,
+                use_tau_table=True, tau_size=tau_size, use_walk=compile_walk, use_stage=use_stage, use_dyn=use_dyn,
+                return_h_out=return_h_out,
             )
             ttbl0 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs0]
             ttbl1 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs1]
@@ -2356,15 +2385,24 @@ class BatchDecoder:
 
             o0 = fn0(tokens, [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl0, wa_in, [], *conv_flat[:24])
             o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl1, wa_in, [], *conv_flat[24:56])
-            o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl2, wa_in, [tokens, par_arr, dr_pos] if use_walk else [], *conv_flat[56:])
-            return self._unpack_cw_outputs(
+            o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl2, wa_in, [tokens, par_arr, dr_pos] if compile_walk else [], *conv_flat[56:])
+            ret, kv_news, conv_ws, tap_buf = self._unpack_cw_outputs(
                 o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None,
-                use_walk=use_walk, use_stage=use_stage,
+                use_walk=compile_walk, use_stage=use_stage,
             )
+            if return_h_out:
+                nt = self._sample_verify_tokens(ret, sampler)
+                if use_walk:
+                    from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
+                    ret = tuple(tree_walk_commit_meta_gpu(nt, tokens, par_arr, meta_r, meta_f, dr_pos, W, w_act=w_act))
+                else:
+                    ret = nt
+            return ret, kv_news, conv_ws, tap_buf
 
         chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
             W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-            use_tau_table=True, tau_size=tau_size, use_walk=use_walk, use_stage=use_stage, use_dyn=use_dyn,
+            use_tau_table=True, tau_size=tau_size, use_walk=compile_walk, use_stage=use_stage, use_dyn=use_dyn,
+            return_h_out=return_h_out,
         )
         outs_all = []
         fn0, v0, v1, nbs_pre, fvs0, tks0 = chunks[0]
@@ -2400,11 +2438,11 @@ class BatchDecoder:
         ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in cfvs]
         h_aux = ref_o[0] if cd_on else []
         bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
-        head_c = (12 if use_stage else 11) if use_walk else 1
+        head_c = (12 if use_stage else 11) if compile_walk else 1
         o_c = fn_c(
             o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
             self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
-            depths_arr, meta_r, meta_f, ttbl, wa_in, [tokens, par_arr, dr_pos] if use_walk else [],
+            depths_arr, meta_r, meta_f, ttbl, wa_in, [tokens, par_arr, dr_pos] if compile_walk else [],
             *conv_flat[4 * cv0 : 4 * cv1],
         )
         outs_all.append((o_c, cv1 - cv0, head_c, ctks))
@@ -2418,12 +2456,20 @@ class BatchDecoder:
                 for k, arr in zip(tksi, out_i[head_i + nvi + ncw :]):
                     tap_buf[k] = arr
         conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
-        ret = tuple(o_c[:head_c]) if use_walk else o_c[0]
+        ret = tuple(o_c[:head_c]) if compile_walk else o_c[0]
+        if return_h_out:
+            nt = self._sample_verify_tokens(ret, sampler)
+            if use_walk:
+                from mlx_lm.models.inkling2.rows.qmv4 import tree_walk_commit_meta_gpu
+                ret = tuple(tree_walk_commit_meta_gpu(nt, tokens, par_arr, meta_r, meta_f, dr_pos, W, w_act=w_act))
+            else:
+                ret = nt
         return ret, kv_news, conv_ws, tap_buf
 
     def _get_cw_compiled_loop(
         self, W, max_depth, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, tap_tuple,
         use_tau_table=False, tau_size=0, use_walk=False, fuse_k1=None, use_stage=False, use_dyn=False,
+        return_h_out=False,
     ):
         if fuse_k1 is None:
             fuse_k1 = (not use_dyn) and (os.environ.get("LOOPLING_FUSE_COMB_K1", "0") not in ("0", ""))
@@ -2439,7 +2485,7 @@ class BatchDecoder:
         md_key = None if use_tau_table else max_depth
         key = (
             "loop", W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple,
-            use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, num_passes, cd_key,
+            use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, num_passes, cd_key, return_h_out,
         )
         ent = self._cw_compiled.get(key)
         if ent is not None:
@@ -2555,6 +2601,8 @@ class BatchDecoder:
                             )["q_in"]
                         if has_F:
                             taps_out.append(h_out)
+                        if return_h_out:
+                            return [h_out] + kvns + cws + taps_out
                         lm = m.lm_head
                         text = m.args.text
                         if use_walk and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
@@ -2604,7 +2652,7 @@ class BatchDecoder:
 
     def verify_w(
         self, tokens, *, tap_visits=None, parents=None, depths=None, depths_arr=None, max_depth=None,
-        conv_anc=None, tree_meta=None,
+        conv_anc=None, tree_meta=None, sampler=None,
     ):
         """Bit-exact causal W-token/tree verify (W in 2..8) without mutating caches or conv state."""
         assert self._b1_fast
@@ -2618,6 +2666,8 @@ class BatchDecoder:
             self.flush_kv_stage()
         W = int(tokens.shape[0])
         assert 2 <= W <= 8
+        is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
+        return_h_out = not is_greedy
         if conv_anc is None or tree_meta is None or (depths is None and depths_arr is None):
             if parents is None:
                 parents = tuple(range(-1, W - 1))
@@ -2650,6 +2700,7 @@ class BatchDecoder:
                 if num_passes == 1 and self.nv == 24:
                     (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
                         W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
+                        return_h_out=return_h_out,
                     )
                     tluts0 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
                     tluts1 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs1]
@@ -2660,10 +2711,14 @@ class BatchDecoder:
                     o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts1, [], [], *conv_flat[24:56])
                     mx.async_eval(o1[0])
                     o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts2, [], [], *conv_flat[56:])
-                    return self._unpack_cw_outputs(o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None)
+                    ret, kv_news, conv_ws, tap_buf = self._unpack_cw_outputs(o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None)
+                    if return_h_out:
+                        ret = self._sample_verify_tokens(ret, sampler)
+                    return ret, kv_news, conv_ws, tap_buf
 
                 chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
                     W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
+                    return_h_out=return_h_out,
                 )
                 outs_all = []
                 # Prelude
@@ -2720,7 +2775,10 @@ class BatchDecoder:
                         for k, arr in zip(tksi, out_i[head + nvi + ncw :]):
                             tap_buf[k] = arr
                 conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
-                return o_c[0], kv_news, conv_ws, tap_buf
+                ret = o_c[0]
+                if return_h_out:
+                    ret = self._sample_verify_tokens(ret, sampler)
+                return ret, kv_news, conv_ws, tap_buf
 
         if depths is None:
             depths = tuple(depths_arr.tolist())
@@ -2786,7 +2844,9 @@ class BatchDecoder:
         m = self.model
         lm = m.lm_head
         text = m.args.text
-        if "head" in _FUSED and "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
+        if not is_greedy:
+            next_toks = self._sample_verify_tokens(h_out, sampler)
+        elif "head" in _FUSED and "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
             next_toks = RQ.qmv_softcap_argmax_rows(
                 h_out, lm["weight"], lm["scales"], lm["biases"],
                 text.final_logit_softcapping, text.unpadded_vocab_size,

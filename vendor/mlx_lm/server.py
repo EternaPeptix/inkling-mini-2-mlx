@@ -784,9 +784,16 @@ class ResponseGenerator:
         )
 
     def _can_use_mtp_single(self, args, request) -> bool:
+        mtp = os.environ.get("LOOPLING_MTP")
+        if mtp not in ("1", "dflash2"):
+            return False
+        temp_ok = (
+            args.sampling.temperature >= 0.0 and args.sampling.xtc_probability <= 0.0
+            if mtp == "dflash2"
+            else args.sampling.temperature <= 0.0
+        )
         return (
-            os.environ.get("LOOPLING_MTP") in ("1", "dflash2")
-            and args.sampling.temperature <= 0.0
+            temp_ok
             and not args.logprobs
             and (args.top_logprobs is None or args.top_logprobs <= 0)
             and not _make_logits_processors(args)

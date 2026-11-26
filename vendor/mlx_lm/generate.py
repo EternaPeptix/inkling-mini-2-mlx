@@ -73,7 +73,7 @@ def _is_inkling2_model(model: nn.Module) -> bool:
 
 
 def _inkling2_bd_caches_ok(model: nn.Module, caches: List[List[Any]]) -> bool:
-    if not _SERVER_BATCHDECODE or not (1 <= len(caches) <= 8) or not _is_inkling2_model(model):
+    if not _SERVER_BATCHDECODE or not (1 <= len(caches) <= 32) or not _is_inkling2_model(model):
         return False
     from .models.inkling2 import layers as _L
     from .models.inkling2.batchdecode import BatchDecoder, _batch_cache_ok, _b1_cache_ok
@@ -1637,7 +1637,7 @@ class GenerationBatch:
 
         if (
             _SERVER_BATCHDECODE
-            and 1 <= len(self.uids) <= 8
+            and 1 <= len(self.uids) <= 32
             and _is_inkling2_model(self.model)
             and self.prompt_cache
             and not any(c.empty() for c in self.prompt_cache)
@@ -1702,7 +1702,7 @@ class GenerationBatch:
             or batch._bd is not None
             or (
                 _SERVER_BATCHDECODE
-                and 1 <= len(self.uids) + len(batch.uids) <= 8
+                and 1 <= len(self.uids) + len(batch.uids) <= 32
                 and _is_inkling2_model(self.model)
             )
         ):

@@ -824,7 +824,7 @@ class BatchDecoder:
         self._batch_fast = (
             not self._b1_fast
             and os.environ.get("LOOPLING_BATCH_FAST", "1") not in ("0", "")
-            and 2 <= self.C <= 8
+            and 2 <= self.C <= 32
             and self.kv is None
             and {"pre", "k1", "post"}.issubset(_FUSED)
             and not _PLAIN

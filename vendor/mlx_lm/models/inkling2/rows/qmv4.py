@@ -5,7 +5,7 @@ import mlx.core as mx
 
 from .glue import flit
 
-MAX_B = 16
+MAX_B = 32
 _GS = 64
 _BITS = 4
 

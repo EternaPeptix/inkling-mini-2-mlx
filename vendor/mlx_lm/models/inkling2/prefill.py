@@ -7,7 +7,7 @@ import numpy as np
 
 from mlx_lm.models.inkling2.rows.gather import mlx_header as _fpq_mlx_header
 from mlx_lm.models.inkling2.rows.glue import GLUE_HEADER
-from mlx_lm.models.inkling2.rows.moe import _DOT_BF16
+from mlx_lm.models.inkling2.rows.moe import _DOT_BF16, _FP_LUT_HEADER
 from mlx_lm.models.inkling2.rows.proj import _maybe_bf16_w
 
 _FAST = os.environ.get("LOOPLING_FAST_PREFILL", "1") not in ("0", "")
@@ -34,6 +34,8 @@ _D = 2304
 _TG_RMS = 576
 _DUMMY_F32 = mx.zeros((256,), mx.float32)  # >= 512 B ensures Metal device address space
 _DUMMY_BF16 = mx.zeros((256,), mx.bfloat16)
+_DUMMY_U8 = mx.zeros((512,), mx.uint8)
+_DUMMY_I32 = mx.zeros((128,), mx.int32)
 _S5_LIT = repr(float(np.float32(math.sqrt(5.0)))) + "f"
 _S9_LIT = repr(float(np.float32(math.sqrt(9.0)))) + "f"
 
@@ -376,7 +378,7 @@ _MOE_GMM_SRC = r"""
         const device uint8_t* sp = s_ptr + (k / GS);
         if constexpr (BITS == 4) {
             if constexpr (WPT == 8) {
-                const float sc = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
+                const float sc = gmm_dequant_scale<GS>(sp[0]) * inv_sc_fold;
                 const uint v0 = ((const device uint*)wp)[0];
                 ushort4 u0 = ushort4(v0, v0 >> 4, v0 >> 8, v0 >> 12);
                 half4 h0 = as_type<half4>((u0 & ushort4(7)) << 9);
@@ -388,7 +390,7 @@ _MOE_GMM_SRC = r"""
                 uint2 b2 = as_type<uint2>(bfloat4(float4(h1) * sc));
                 wd4[0] = uint4(a2.x, a2.y, b2.x, b2.y);
             } else if constexpr (WPT == 16) {
-                const float sc = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
+                const float sc = gmm_dequant_scale<GS>(sp[0]) * inv_sc_fold;
                 const uint2 raw = ((const device uint2*)wp)[0];
                 const uint vs[2] = {raw.x, raw.y};
                 #pragma clang loop unroll(full)
@@ -405,8 +407,8 @@ _MOE_GMM_SRC = r"""
                     wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
                 }
             } else {
-                const float sc0 = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
-                const float sc1 = float(dequantize_scale<bfloat16_t, GS>(sp[1])) * inv_sc_fold;
+                const float sc0 = gmm_dequant_scale<GS>(sp[0]) * inv_sc_fold;
+                const float sc1 = gmm_dequant_scale<GS>(sp[1]) * inv_sc_fold;
                 const uint4 raw = ((const device uint4*)wp)[0];
                 const uint vs[4] = {raw.x, raw.y, raw.z, raw.w};
                 #pragma clang loop unroll(full)
@@ -557,7 +559,15 @@ _MOE_GMM_SRC = r"""
 def _k_moe_gmm():
     k = _kernels.get("pf_moe_gmm")
     if k is None:
-        hdr = "#include <metal_simdgroup_matrix>\n" + _fpq_mlx_header() + "\n" + GLUE_HEADER
+        sc_hdr = (
+            _FP_LUT_HEADER
+            + "\ntemplate <int GS> inline float gmm_dequant_scale(uint8_t s) {\n"
+            + "  if constexpr (GS == 16) return FP8_E4M3_LUT[s];\n"
+            + "  else return float(dequantize_scale<bfloat16_t, GS>(s));\n}\n"
+            if _FP_LUT_HEADER
+            else "template <int GS> inline float gmm_dequant_scale(uint8_t s) { return float(dequantize_scale<bfloat16_t, GS>(s)); }\n"
+        )
+        hdr = "#include <metal_simdgroup_matrix>\n" + _fpq_mlx_header() + "\n" + sc_hdr + "\n" + GLUE_HEADER
         k = _kernels["pf_moe_gmm"] = mx.fast.metal_kernel(
             name="pf_moe_gmm",
             input_names=["x", "lhs_idx", "exp_off", "tile_meta", "w", "scales", "gsc", "caps"],
@@ -1207,7 +1217,7 @@ _MOE_SHORT_QMV_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u32_fp4_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                     }
                 } else {
@@ -1222,7 +1232,7 @@ _MOE_SHORT_QMV_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                     }
                 }
@@ -1233,7 +1243,7 @@ _MOE_SHORT_QMV_SRC = r"""
                 for (int r = 0; r < ROWS; r++) {
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                 }
             }
@@ -1251,7 +1261,7 @@ _MOE_SHORT_QMV_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_vals<BITS, 8>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
                     }
                 } else {
@@ -1261,7 +1271,7 @@ _MOE_SHORT_QMV_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                     }
                 }
@@ -1310,7 +1320,7 @@ _MOE_SHORT_QMV_SRC = r"""
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[8];
                             dequant_u32_fp4_8(wr[r], wv);
-                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            U sv = moe_dequant_scale<GS>(sr[r]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
@@ -1328,7 +1338,7 @@ _MOE_SHORT_QMV_SRC = r"""
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[8];
                             dequant_u2_fp8_8(wr[r], wv);
-                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            U sv = moe_dequant_scale<GS>(sr[r]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
@@ -1345,7 +1355,7 @@ _MOE_SHORT_QMV_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
                             if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
@@ -1368,7 +1378,7 @@ _MOE_SHORT_QMV_SRC = r"""
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[8];
                             dequant_vals<BITS, 8>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
@@ -1384,7 +1394,7 @@ _MOE_SHORT_QMV_SRC = r"""
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
@@ -1591,7 +1601,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u32_fp4_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                     }
                 } else {
@@ -1606,7 +1616,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                     }
                 }
@@ -1617,7 +1627,7 @@ _MOE_SHORT_TILED_SRC = r"""
                 for (int r = 0; r < ROWS; r++) {
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                 }
             }
@@ -1635,7 +1645,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_vals<BITS, 8>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
                     }
                 } else {
@@ -1645,7 +1655,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                     }
                 }
@@ -1692,7 +1702,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u32_fp4_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
                             if (t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
@@ -1710,7 +1720,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
                             if (t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
@@ -1727,7 +1737,7 @@ _MOE_SHORT_TILED_SRC = r"""
                 for (int r = 0; r < ROWS; r++) {
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     #pragma unroll
                     for (int t = 0; t < TMAX; t++) {
                         if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
@@ -1750,7 +1760,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_vals<BITS, 8>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
                             if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
@@ -1766,7 +1776,7 @@ _MOE_SHORT_TILED_SRC = r"""
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
                             if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
@@ -1836,7 +1846,7 @@ def moe_short_forward(
     gsc_dn = dn.global_scale.astype(mx.float32) if hgs_dn else _DUMMY_F32
     N_dn, K_dn = dn.output_dims, dn.input_dims
 
-    if _PF_MOE_SHORT_TILED and B * L >= 16:
+    if _PF_MOE_SHORT_TILED and B * L >= 8:
         nsg = 8 if (N_gu % 32 == 0 and N_dn % 32 == 0) else 4
         tmax = 3 if B * L <= 48 else 4
         max_tiles = min(P, P // tmax + E)
@@ -1949,10 +1959,8 @@ def moe_gmm_forward(
         bm, bn, bk, wm, wn = (8, 32, 32, 1, 1)
     elif B * L < 1024:
         bm, bn, bk, wm, wn = (16, 32, 32, 1, 1)
-    elif B * L < 3072:
-        bm, bn, bk, wm, wn = (32, 64, 32, 1, 2)
     else:
-        bm, bn, bk, wm, wn = (32, 32, 32, 1, 1)
+        bm, bn, bk, wm, wn = (32, 64, 32, 1, 2)
     tg = wm * wn * 32
     max_tiles = P // bm + E
 
@@ -2144,7 +2152,12 @@ _SC4_RES_SRC = f"""
         w3[k] = float(cp[3]);
     }}
     auto tap4 = [&](int p) -> float4 {{
-        if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]));
+        if (p >= 0) {{
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+            }}
+            return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]));
+        }}
         int sidx = 3 + p;
         if (!HAS_CS) return float4(0.0f);
         float4 csf = ((const device float4*)(cs + ((size_t)b * 3 + sidx) * DD + c))[0];
@@ -2158,44 +2171,69 @@ _SC4_RES_SRC = f"""
         if (t >= LL) break;
         size_t off = ((size_t)b * LL + t) * DD + c;
         float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(x + off))[0]));
+        float4 xw = x3;
+        if constexpr (HAS_MASK) {{
+            if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+        }}
         float4 acc = float4(0.0f);
         acc = fma(w0, s0, acc);
         acc = fma(w1, s1, acc);
         acc = fma(w2, s2, acc);
-        acc = fma(w3, x3, acc);
+        acc = fma(w3, xw, acc);
         float4 conv = float4(bfloat4(acc));
         float4 y = float4(bfloat4((conv + x3) / {_S5_LIT}));
         float4 rv = ((const device float4*)(res + off))[0];
         ((device uint2*)(out + off))[0] = as_type<uint2>(bfloat4(rv + y));
         s0 = s1;
         s1 = s2;
-        s2 = x3;
+        s2 = xw;
     }}
     if (t0 == 0) {{
+        int end = int(LL);
+        if constexpr (HAS_LENS) {{
+            end = clamp(clens[b], 0, int(LL));
+        }}
         for (int r = 0; r < 3; r++) {{
-            int p = int(LL) - 3 + r;
-            float4 v = (p >= 0)
-                ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]))
-                : (HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f));
+            int p = end - 3 + r;
+            float4 v;
+            if (p >= 0) {{
+                bool ok = true;
+                if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                v = ok ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0])) : float4(0.0f);
+            }} else {{
+                v = HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f);
+            }}
             ((device float4*)(ncs + ((size_t)b * 3 + r) * DD + c))[0] = v;
         }}
     }}
 """
 
-
 def short_conv_residual(
-    x: mx.array, conv_state: mx.array | None, weight: mx.array, residual: mx.array
+    x: mx.array,
+    conv_state: mx.array | None,
+    weight: mx.array,
+    residual: mx.array,
+    *,
+    conv_mask: mx.array | None = None,
+    conv_lengths: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Fused post_mlp_convolution + (residual + conv.f32).bf16 -> (out bf16, new_cs (B,3,C) f32)."""
     B, L, C = x.shape
     has_cs = int(conv_state is not None)
+    has_mask = int(conv_mask is not None)
+    has_lens = int(conv_lengths is not None)
     cs_in = conv_state if conv_state is not None else _DUMMY_F32
+    cm_in = conv_mask.astype(mx.uint8) if has_mask else _DUMMY_U8
+    cl_in = conv_lengths.astype(mx.int32) if has_lens else _DUMMY_I32
     tt = 16
     ntiles = (L + tt - 1) // tt
-    k = _k("pf_short_conv_res4", ("x", "cs", "cw", "res"), ("out", "ncs"), _SC4_RES_SRC)
+    k = _k("pf_short_conv_res4", ("x", "cs", "cw", "res", "cmask", "clens"), ("out", "ncs"), _SC4_RES_SRC)
     return k(
-        inputs=[x, cs_in, weight, residual],
-        template=[("DD", C), ("LL", L), ("HAS_CS", has_cs), ("TT", tt)],
+        inputs=[x, cs_in, weight, residual, cm_in, cl_in],
+        template=[
+            ("DD", C), ("LL", L), ("HAS_CS", has_cs), ("TT", tt),
+            ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
+        ],
         grid=(((C // 4 + 255) // 256) * 256, B * ntiles, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(B, L, C), (B, 3, C)],
@@ -2223,7 +2261,12 @@ _SC_ATTN_POST_SRC = f"""
         w3[k] = float(cp[3]);
     }}
     auto tap4 = [&](int p) -> float4 {{
-        if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]));
+        if (p >= 0) {{
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+            }}
+            return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]));
+        }}
         int sidx = 3 + p;
         if (!HAS_CS) return float4(0.0f);
         float4 csf = ((const device float4*)(cs + ((size_t)b * 3 + sidx) * DD + c))[0];
@@ -2234,11 +2277,15 @@ _SC_ATTN_POST_SRC = f"""
     float4 s2 = tap4(int(t) - 1);
     size_t off = (size_t)tok * DD + c;
     float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(x + off))[0]));
+    float4 xw = x3;
+    if constexpr (HAS_MASK) {{
+        if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+    }}
     float4 acc = float4(0.0f);
     acc = fma(w0, s0, acc);
     acc = fma(w1, s1, acc);
     acc = fma(w2, s2, acc);
-    acc = fma(w3, x3, acc);
+    acc = fma(w3, xw, acc);
     float4 conv = float4(bfloat4(acc));
     float4 y = float4(bfloat4((conv + x3) / {_S5_LIT}));
     float4 rv = ADD_RES ? (float4(as_type<bfloat4>(((const device uint2*)(bres + off))[0])) + y) : y;
@@ -2258,11 +2305,20 @@ _SC_ATTN_POST_SRC = f"""
     ((device float4*)(norm_out + off))[0] = rv * inv;
 
     if (t == 0) {{
+        int end = int(LL);
+        if constexpr (HAS_LENS) {{
+            end = clamp(clens[b], 0, int(LL));
+        }}
         for (int r = 0; r < 3; r++) {{
-            int p = int(LL) - 3 + r;
-            float4 v = (p >= 0)
-                ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]))
-                : (HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f));
+            int p = end - 3 + r;
+            float4 v;
+            if (p >= 0) {{
+                bool ok = true;
+                if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                v = ok ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0])) : float4(0.0f);
+            }} else {{
+                v = HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f);
+            }}
             ((device float4*)(ncs + ((size_t)b * 3 + r) * DD + c))[0] = v;
         }}
     }}
@@ -2274,18 +2330,33 @@ def short_conv_attn_post(
     conv_state: mx.array | None,
     weight: mx.array,
     block_residual: mx.array | None,
+    *,
+    conv_mask: mx.array | None = None,
+    conv_lengths: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Fused post_attention_convolution + residual (if block_residual is not None) + unweighted_rms_norm -> (residual f32, normed_states f32, new_cs f32)."""
     B, L, C = x.shape
     assert C == _D
     has_cs = int(conv_state is not None)
     add_res = int(block_residual is not None)
+    has_mask = int(conv_mask is not None)
+    has_lens = int(conv_lengths is not None)
     cs_in = conv_state if conv_state is not None else _DUMMY_F32
     br_in = block_residual if block_residual is not None else _DUMMY_BF16
-    k = _k("pf_sc_attn_post", ("x", "cs", "cw", "bres"), ("res_out", "norm_out", "ncs"), _SC_ATTN_POST_SRC)
+    cm_in = conv_mask.astype(mx.uint8) if has_mask else _DUMMY_U8
+    cl_in = conv_lengths.astype(mx.int32) if has_lens else _DUMMY_I32
+    k = _k(
+        "pf_sc_attn_post",
+        ("x", "cs", "cw", "bres", "cmask", "clens"),
+        ("res_out", "norm_out", "ncs"),
+        _SC_ATTN_POST_SRC,
+    )
     return k(
-        inputs=[x, cs_in, weight, br_in],
-        template=[("DD", C), ("LL", L), ("HAS_CS", has_cs), ("ADD_RES", add_res)],
+        inputs=[x, cs_in, weight, br_in, cm_in, cl_in],
+        template=[
+            ("DD", C), ("LL", L), ("HAS_CS", has_cs), ("ADD_RES", add_res),
+            ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
+        ],
         grid=(B * L * _TG_RMS, 1, 1),
         threadgroup=(_TG_RMS, 1, 1),
         output_shapes=[(B, L, C), (B, L, C), (B, 3, C)],
@@ -2509,7 +2580,12 @@ _SWA_QKV_CONV_CLIP_SRC = f"""
             w0[j] = float(cp[0]); w1[j] = float(cp[1]); w2[j] = float(cp[2]); w3[j] = float(cp[3]);
         }}
         auto tap4 = [&](int p) -> float4 {{
-            if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(k + ((size_t)b * LL + p) * DD + c))[0]));
+            if (p >= 0) {{
+                if constexpr (HAS_MASK) {{
+                    if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+                }}
+                return float4(as_type<bfloat4>(((const device uint2*)(k + ((size_t)b * LL + p) * DD + c))[0]));
+            }}
             if (!HAS_KCS) return float4(0.0f);
             float4 csf = ((const device float4*)(kcs + ((size_t)b * 3 + (3 + p)) * DD + c))[0];
             return float4(bfloat4(csf));
@@ -2523,25 +2599,38 @@ _SWA_QKV_CONV_CLIP_SRC = f"""
             if (t >= uint(LL)) break;
             size_t koff = ((size_t)b * LL + t) * DD + c;
             float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(k + koff))[0]));
+            float4 xw = x3;
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+            }}
             float4 acc = float4(0.0f);
             acc = fma(w0, s0, acc);
             acc = fma(w1, s1, acc);
             acc = fma(w2, s2, acc);
-            acc = fma(w3, x3, acc);
+            acc = fma(w3, xw, acc);
             float4 conv = float4(bfloat4(acc));
             bfloat4 ybf = bfloat4((conv + x3) / {_S5_LIT});
             float sv[4] = {{float(ybf.x), float(ybf.y), float(ybf.z), float(ybf.w)}};
             glue_l2_clip_lane128(sv, thr_k);
             bfloat4 ov = bfloat4(bfloat16_t(sv[0]), bfloat16_t(sv[1]), bfloat16_t(sv[2]), bfloat16_t(sv[3]));
             ((device uint2*)(k_out + koff))[0] = as_type<uint2>(ov);
-            s0 = s1; s1 = s2; s2 = x3;
+            s0 = s1; s1 = s2; s2 = xw;
         }}
         if (t0 == 0) {{
+            int end = int(LL);
+            if constexpr (HAS_LENS) {{
+                end = clamp(clens[b], 0, int(LL));
+            }}
             for (int r = 0; r < 3; r++) {{
-                int p = int(LL) - 3 + r;
-                float4 fv = (p >= 0)
-                    ? float4(as_type<bfloat4>(((const device uint2*)(k + ((size_t)b * LL + p) * DD + c))[0]))
-                    : (HAS_KCS ? ((const device float4*)(kcs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f));
+                int p = end - 3 + r;
+                float4 fv;
+                if (p >= 0) {{
+                    bool ok = true;
+                    if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                    fv = ok ? float4(as_type<bfloat4>(((const device uint2*)(k + ((size_t)b * LL + p) * DD + c))[0])) : float4(0.0f);
+                }} else {{
+                    fv = HAS_KCS ? ((const device float4*)(kcs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f);
+                }}
                 ((device float4*)(nkcs + ((size_t)b * 3 + r) * DD + c))[0] = fv;
             }}
         }}
@@ -2555,7 +2644,12 @@ _SWA_QKV_CONV_CLIP_SRC = f"""
             w0[j] = float(cp[0]); w1[j] = float(cp[1]); w2[j] = float(cp[2]); w3[j] = float(cp[3]);
         }}
         auto tap4 = [&](int p) -> float4 {{
-            if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(v + ((size_t)b * LL + p) * DD + c))[0]));
+            if (p >= 0) {{
+                if constexpr (HAS_MASK) {{
+                    if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+                }}
+                return float4(as_type<bfloat4>(((const device uint2*)(v + ((size_t)b * LL + p) * DD + c))[0]));
+            }}
             if (!HAS_VCS) return float4(0.0f);
             float4 csf = ((const device float4*)(vcs + ((size_t)b * 3 + (3 + p)) * DD + c))[0];
             return float4(bfloat4(csf));
@@ -2569,11 +2663,15 @@ _SWA_QKV_CONV_CLIP_SRC = f"""
             if (t >= uint(LL)) break;
             size_t voff = ((size_t)b * LL + t) * DD + c;
             float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(v + voff))[0]));
+            float4 xw = x3;
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+            }}
             float4 acc = float4(0.0f);
             acc = fma(w0, s0, acc);
             acc = fma(w1, s1, acc);
             acc = fma(w2, s2, acc);
-            acc = fma(w3, x3, acc);
+            acc = fma(w3, xw, acc);
             float4 conv = float4(bfloat4(acc));
             bfloat4 ybf = bfloat4((conv + x3) / {_S5_LIT});
             float sv[4] = {{float(ybf.x), float(ybf.y), float(ybf.z), float(ybf.w)}};
@@ -2590,14 +2688,23 @@ _SWA_QKV_CONV_CLIP_SRC = f"""
                 glue_rms_apply_nw<bfloat16_t>(sv[2], inv),
                 glue_rms_apply_nw<bfloat16_t>(sv[3], inv));
             ((device uint2*)(v_out + voff))[0] = as_type<uint2>(ov);
-            s0 = s1; s1 = s2; s2 = x3;
+            s0 = s1; s1 = s2; s2 = xw;
         }}
         if (t0 == 0) {{
+            int end = int(LL);
+            if constexpr (HAS_LENS) {{
+                end = clamp(clens[b], 0, int(LL));
+            }}
             for (int r = 0; r < 3; r++) {{
-                int p = int(LL) - 3 + r;
-                float4 fv = (p >= 0)
-                    ? float4(as_type<bfloat4>(((const device uint2*)(v + ((size_t)b * LL + p) * DD + c))[0]))
-                    : (HAS_VCS ? ((const device float4*)(vcs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f));
+                int p = end - 3 + r;
+                float4 fv;
+                if (p >= 0) {{
+                    bool ok = true;
+                    if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                    fv = ok ? float4(as_type<bfloat4>(((const device uint2*)(v + ((size_t)b * LL + p) * DD + c))[0])) : float4(0.0f);
+                }} else {{
+                    fv = HAS_VCS ? ((const device float4*)(vcs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f);
+                }}
                 ((device float4*)(nvcs + ((size_t)b * 3 + r) * DD + c))[0] = fv;
             }}
         }}
@@ -2660,6 +2767,8 @@ def swa_qkv_conv_clip(
     r: mx.array | None = None,
     r_scale: mx.array | None = None,
     thr_r: float = 8.0,
+    conv_mask: mx.array | None = None,
+    conv_lengths: mx.array | None = None,
 ):
     """1-launch SlidingAttention fusion: q_l2_clip + (k_sconv->k_l2_clip) + (v_sconv->v_rms_norm) [+ rel_l2_clip]."""
     B, L, _ = q.shape
@@ -2667,10 +2776,14 @@ def swa_qkv_conv_clip(
     has_kcs = int(k_cs is not None)
     has_vcs = int(v_cs is not None)
     has_rel = int(r is not None)
+    has_mask = int(conv_mask is not None)
+    has_lens = int(conv_lengths is not None)
     kcs_in = k_cs if k_cs is not None else _DUMMY_F32
     vcs_in = v_cs if v_cs is not None else _DUMMY_F32
     r_in = r if has_rel else _DUMMY_BF16
     rs_in = r_scale if has_rel else _DUMMY_BF16
+    cm_in = conv_mask.astype(mx.uint8) if has_mask else _DUMMY_U8
+    cl_in = conv_lengths.astype(mx.int32) if has_lens else _DUMMY_I32
     pkey = ("qkv_cr4", thr_q, thr_k, eps, thr_r)
     params = _PARAMS_CACHE.get(pkey)
     if params is None:
@@ -2680,15 +2793,16 @@ def swa_qkv_conv_clip(
     ntg_x = (num_heads + 2 * num_kv_heads + (1 if has_rel else 0) + 7) // 8
     k_fn = _k(
         "pf_swa_qkv_cc_r",
-        ("q", "k", "v", "q_scale", "kcw", "vcw", "kcs", "vcs", "params", "r", "r_scale"),
+        ("q", "k", "v", "q_scale", "kcw", "vcw", "kcs", "vcs", "params", "r", "r_scale", "cmask", "clens"),
         ("q_out", "k_out", "v_out", "nkcs", "nvcs", "r_out"),
         _SWA_QKV_CONV_CLIP_SRC,
     )
     qo, ko, vo, nkcs, nvcs, ro = k_fn(
-        inputs=[q, k, v, q_scale, k_cw, v_cw, kcs_in, vcs_in, params, r_in, rs_in],
+        inputs=[q, k, v, q_scale, k_cw, v_cw, kcs_in, vcs_in, params, r_in, rs_in, cm_in, cl_in],
         template=[
             ("HQ", num_heads), ("HKV", num_kv_heads), ("LL", L),
             ("TT", tt), ("HAS_KCS", has_kcs), ("HAS_VCS", has_vcs), ("HAS_REL", has_rel),
+            ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
         grid=(ntg_x * 256, B * ntiles, 1),
         threadgroup=(256, 1, 1),
@@ -2996,7 +3110,12 @@ _SC_ATTN_DA_SRC = f"""
                 w0[k] = float(cp[0]); w1[k] = float(cp[1]); w2[k] = float(cp[2]); w3[k] = float(cp[3]);
             }}
             auto tap4 = [&](int p) -> float4 {{
-                if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * D + c))[0]));
+                if (p >= 0) {{
+                    if constexpr (HAS_MASK) {{
+                        if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+                    }}
+                    return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * D + c))[0]));
+                }}
                 int sidx = 3 + p;
                 if (!HAS_CS) return float4(0.0f);
                 return float4(bfloat4(((const device float4*)(cs + ((size_t)b * 3 + sidx) * D + c))[0]));
@@ -3004,18 +3123,31 @@ _SC_ATTN_DA_SRC = f"""
             float4 s0 = tap4(int(t) - 3), s1 = tap4(int(t) - 2), s2 = tap4(int(t) - 1);
             size_t off = (size_t)row * D + c;
             float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(x + off))[0]));
+            float4 xw = x3;
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+            }}
             float4 acc = float4(0.0f);
-            acc = fma(w0, s0, acc); acc = fma(w1, s1, acc); acc = fma(w2, s2, acc); acc = fma(w3, x3, acc);
+            acc = fma(w0, s0, acc); acc = fma(w1, s1, acc); acc = fma(w2, s2, acc); acc = fma(w3, xw, acc);
             float4 conv = float4(bfloat4(acc));
             float4 y = float4(bfloat4((conv + x3) / {_S5_LIT}));
             float4 rv = ADD_RES ? (float4(as_type<bfloat4>(((const device uint2*)(bres + off))[0])) + y) : y;
             ((device float4*)(res_out + off))[0] = rv;
             if (t == 0) {{
+                int end = int(LL);
+                if constexpr (HAS_LENS) {{
+                    end = clamp(clens[b], 0, int(LL));
+                }}
                 for (int r = 0; r < 3; r++) {{
-                    int p = int(LL) - 3 + r;
-                    float4 v = (p >= 0)
-                        ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * D + c))[0]))
-                        : (HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * D + c))[0] : float4(0.0f));
+                    int p = end - 3 + r;
+                    float4 v;
+                    if (p >= 0) {{
+                        bool ok = true;
+                        if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                        v = ok ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * D + c))[0])) : float4(0.0f);
+                    }} else {{
+                        v = HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * D + c))[0] : float4(0.0f);
+                    }}
                     ((device float4*)(ncs + ((size_t)b * 3 + r) * D + c))[0] = v;
                 }}
             }}
@@ -3163,6 +3295,9 @@ def short_conv_attn_depth_attn(
     blocks: mx.array,
     query: mx.array,
     ln=None,
+    *,
+    conv_mask: mx.array | None = None,
+    conv_lengths: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Fused post_attn_conv + residual + unw_rms + mlp_input [+ post_attn_ln when ln is not None] (TG=288)."""
     B, L, D = x.shape
@@ -3170,24 +3305,29 @@ def short_conv_attn_depth_attn(
     has_cs = int(conv_state is not None)
     add_res = int(block_residual is not None)
     do_rms = int(ln is not None)
+    has_mask = int(conv_mask is not None)
+    has_lens = int(conv_lengths is not None)
     cs_in = conv_state if conv_state is not None else _DUMMY_F32
     br_in = block_residual if block_residual is not None else _DUMMY_BF16
     nw_in = ln.weight if ln is not None else _DUMMY_BF16
     eps_in = _get_eps(ln.eps) if ln is not None else _DUMMY_F32
+    cm_in = conv_mask.astype(mx.uint8) if has_mask else _DUMMY_U8
+    cl_in = conv_lengths.astype(mx.int32) if has_lens else _DUMMY_I32
     sc = _PARAMS_CACHE.get(("da_sc", D))
     if sc is None:
         sc = _PARAMS_CACHE[("da_sc", D)] = mx.array([D ** -0.5], dtype=mx.float32)
     k = _k(
         "pf_sc_attn_da",
-        ("x", "cs", "cw", "bres", "blocks", "queries", "scale", "nw", "eps"),
+        ("x", "cs", "cw", "bres", "blocks", "queries", "scale", "nw", "eps", "cmask", "clens"),
         ("res_out", "ncs", "out_bf16", "out_f32"),
         _SC_ATTN_DA_SRC,
     )
     res_out, ncs, out_bf16, out_f32 = k(
-        inputs=[x, cs_in, weight, br_in, blocks, query.reshape(-1), sc, nw_in, eps_in],
+        inputs=[x, cs_in, weight, br_in, blocks, query.reshape(-1), sc, nw_in, eps_in, cm_in, cl_in],
         template=[
             ("K", blocks.shape[0]), ("D", D), ("LL", L),
             ("HAS_CS", has_cs), ("ADD_RES", add_res), ("DO_RMS", do_rms),
+            ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
         grid=(B * L * 288, 1, 1),
         threadgroup=(288, 1, 1),
@@ -3351,11 +3491,61 @@ _UC4_SRC = r"""
 """
 
 
+_UC8_SRC = r"""
+    GL_NOFMA
+    uint d8 = thread_position_in_threadgroup.x;
+    uint tok = threadgroup_position_in_grid.y;
+    threadgroup uint inv_s[8];
+    threadgroup float wts_s[8];
+    if (d8 < 8u) {
+        inv_s[d8] = inv[tok * 8u + d8];
+        wts_s[d8] = wts[tok * 8u + d8];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint d = d8 * 8u;
+    if (d >= DD) return;
+    float e0[8], e1[8], e2[8], e3[8], e4[8], e5[8], e6[8], e7[8];
+    float ww[8];
+    #pragma unroll
+    for (uint e = 0; e < 8u; e++) {
+        uint4 raw = ((const device uint4*)(dn + (size_t)inv_s[e] * DD + d))[0];
+        bfloat4 d0 = as_type<bfloat4>(raw.xy);
+        bfloat4 d1 = as_type<bfloat4>(raw.zw);
+        e0[e] = float(d0.x); e1[e] = float(d0.y); e2[e] = float(d0.z); e3[e] = float(d0.w);
+        e4[e] = float(d1.x); e5[e] = float(d1.y); e6[e] = float(d1.z); e7[e] = float(d1.w);
+        ww[e] = wts_s[e];
+    }
+    bfloat4 r0(
+        bfloat16_t(glue_moe_combine8(e0, ww)),
+        bfloat16_t(glue_moe_combine8(e1, ww)),
+        bfloat16_t(glue_moe_combine8(e2, ww)),
+        bfloat16_t(glue_moe_combine8(e3, ww)));
+    bfloat4 r1(
+        bfloat16_t(glue_moe_combine8(e4, ww)),
+        bfloat16_t(glue_moe_combine8(e5, ww)),
+        bfloat16_t(glue_moe_combine8(e6, ww)),
+        bfloat16_t(glue_moe_combine8(e7, ww)));
+    uint2 u0 = as_type<uint2>(r0), u1 = as_type<uint2>(r1);
+    ((device uint4*)(out + (size_t)tok * DD + d))[0] = uint4(u0.x, u0.y, u1.x, u1.y);
+"""
+
+
 def unsort_combine(dn_sorted: mx.array, inv_order: mx.array, routing_weights: mx.array) -> mx.array:
     """Fuse _scatter_unsort + (es.f32 * wts[...,None]).sum(-2).astype(bf16) for K=8."""
     B, L, E = routing_weights.shape
     D = dn_sorted.shape[-1]
     assert E == 8 and dn_sorted.dtype == mx.bfloat16
+    if D % 8 == 0 and (D // 8) % 32 == 0 and D // 8 <= 1024:
+        tg = D // 8
+        k = _k("pf_unsort_combine8", ("dn", "inv", "wts"), ("out",), _UC8_SRC)
+        return k(
+            inputs=[dn_sorted, inv_order.astype(mx.uint32), routing_weights.astype(mx.float32)],
+            template=[("DD", D)],
+            grid=(tg, B * L, 1),
+            threadgroup=(tg, 1, 1),
+            output_shapes=[(B, L, D)],
+            output_dtypes=[mx.bfloat16],
+        )[0]
     if D % 4 == 0:
         k = _k("pf_unsort_combine4", ("dn", "inv", "wts"), ("out",), _UC4_SRC)
         return k(
@@ -3387,7 +3577,12 @@ _SC_SRC = f"""
     float x3 = float(x[(size_t)tok * DD + c]);
     auto tap = [&](int idx) -> float {{
         int p = int(t) - idx;
-        if (p >= 0) return float(x[(size_t)(b * LL + p) * DD + c]);
+        if (p >= 0) {{
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + p]) return 0.0f;
+            }}
+            return float(x[(size_t)(b * LL + p) * DD + c]);
+        }}
         int sidx = 3 + p;
         return HAS_CS ? float(bfloat16_t(cs[((size_t)b * 3 + sidx) * DD + c])) : 0.0f;
     }};
@@ -3395,15 +3590,25 @@ _SC_SRC = f"""
     acc = fma(float(cw[c * 4 + 0]), tap(3), acc);
     acc = fma(float(cw[c * 4 + 1]), tap(2), acc);
     acc = fma(float(cw[c * 4 + 2]), tap(1), acc);
-    acc = fma(float(cw[c * 4 + 3]), x3, acc);
+    acc = fma(float(cw[c * 4 + 3]), tap(0), acc);
     float conv = float(bfloat16_t(acc));
     out[(size_t)tok * DD + c] = bfloat16_t((conv + x3) / {_S5_LIT});
     if (t == 0) {{
+        int end = int(LL);
+        if constexpr (HAS_LENS) {{
+            end = clamp(clens[b], 0, int(LL));
+        }}
         for (int r = 0; r < 3; r++) {{
-            int p = int(LL) - 3 + r;
-            ncs[((size_t)b * 3 + r) * DD + c] = (p >= 0)
-                ? float(x[(size_t)(b * LL + p) * DD + c])
-                : (HAS_CS ? cs[((size_t)b * 3 + (3 + p)) * DD + c] : 0.0f);
+            int p = end - 3 + r;
+            float v;
+            if (p >= 0) {{
+                bool ok = true;
+                if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                v = ok ? float(x[(size_t)(b * LL + p) * DD + c]) : 0.0f;
+            }} else {{
+                v = HAS_CS ? cs[((size_t)b * 3 + (3 + p)) * DD + c] : 0.0f;
+            }}
+            ncs[((size_t)b * 3 + r) * DD + c] = v;
         }}
     }}
 """
@@ -3425,7 +3630,12 @@ _SC4_SRC = f"""
         w3[k] = float(cp[3]);
     }}
     auto tap4 = [&](int p) -> float4 {{
-        if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]));
+        if (p >= 0) {{
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+            }}
+            return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]));
+        }}
         int sidx = 3 + p;
         if (!HAS_CS) return float4(0.0f);
         float4 csf = ((const device float4*)(cs + ((size_t)b * 3 + sidx) * DD + c))[0];
@@ -3438,50 +3648,80 @@ _SC4_SRC = f"""
         uint t = t0 + tk;
         if (t >= LL) break;
         float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + t) * DD + c))[0]));
+        float4 xw = x3;
+        if constexpr (HAS_MASK) {{
+            if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+        }}
         float4 acc = float4(0.0f);
         acc = fma(w0, s0, acc);
         acc = fma(w1, s1, acc);
         acc = fma(w2, s2, acc);
-        acc = fma(w3, x3, acc);
+        acc = fma(w3, xw, acc);
         float4 conv = float4(bfloat4(acc));
         ((device uint2*)(out + ((size_t)b * LL + t) * DD + c))[0] = as_type<uint2>(bfloat4((conv + x3) / {_S5_LIT}));
         s0 = s1;
         s1 = s2;
-        s2 = x3;
+        s2 = xw;
     }}
     if (t0 == 0) {{
+        int end = int(LL);
+        if constexpr (HAS_LENS) {{
+            end = clamp(clens[b], 0, int(LL));
+        }}
         for (int r = 0; r < 3; r++) {{
-            int p = int(LL) - 3 + r;
-            float4 v = (p >= 0)
-                ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0]))
-                : (HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f));
+            int p = end - 3 + r;
+            float4 v;
+            if (p >= 0) {{
+                bool ok = true;
+                if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                v = ok ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * DD + c))[0])) : float4(0.0f);
+            }} else {{
+                v = HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * DD + c))[0] : float4(0.0f);
+            }}
             ((device float4*)(ncs + ((size_t)b * 3 + r) * DD + c))[0] = v;
         }}
     }}
 """
 
 
-def short_conv(x: mx.array, conv_state: mx.array | None, weight: mx.array) -> tuple[mx.array, mx.array]:
+def short_conv(
+    x: mx.array,
+    conv_state: mx.array | None,
+    weight: mx.array,
+    *,
+    conv_mask: mx.array | None = None,
+    conv_lengths: mx.array | None = None,
+) -> tuple[mx.array, mx.array]:
     """K=4 causal depthwise conv + residual/sqrt(5) -> (out bf16, new_cs (B,3,C) f32)."""
     B, L, C = x.shape
     has_cs = int(conv_state is not None)
+    has_mask = int(conv_mask is not None)
+    has_lens = int(conv_lengths is not None)
     cs_in = conv_state if conv_state is not None else _DUMMY_F32
+    cm_in = conv_mask.astype(mx.uint8) if has_mask else _DUMMY_U8
+    cl_in = conv_lengths.astype(mx.int32) if has_lens else _DUMMY_I32
     if C % 4 == 0 and L >= 16:
         tt = 16
         ntiles = (L + tt - 1) // tt
-        k = _k("pf_short_conv4", ("x", "cs", "cw"), ("out", "ncs"), _SC4_SRC)
+        k = _k("pf_short_conv4", ("x", "cs", "cw", "cmask", "clens"), ("out", "ncs"), _SC4_SRC)
         return k(
-            inputs=[x, cs_in, weight],
-            template=[("DD", C), ("LL", L), ("HAS_CS", has_cs), ("TT", tt)],
+            inputs=[x, cs_in, weight, cm_in, cl_in],
+            template=[
+                ("DD", C), ("LL", L), ("HAS_CS", has_cs), ("TT", tt),
+                ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
+            ],
             grid=(((C // 4 + 255) // 256) * 256, B * ntiles, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(B, L, C), (B, 3, C)],
             output_dtypes=[mx.bfloat16, mx.float32],
         )
-    k = _k("pf_short_conv", ("x", "cs", "cw"), ("out", "ncs"), _SC_SRC)
+    k = _k("pf_short_conv", ("x", "cs", "cw", "cmask", "clens"), ("out", "ncs"), _SC_SRC)
     return k(
-        inputs=[x, cs_in, weight],
-        template=[("DD", C), ("LL", L), ("HAS_CS", has_cs)],
+        inputs=[x, cs_in, weight, cm_in, cl_in],
+        template=[
+            ("DD", C), ("LL", L), ("HAS_CS", has_cs),
+            ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
+        ],
         grid=(((C + 255) // 256) * 256, B * L, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(B, L, C), (B, 3, C)],
@@ -3500,7 +3740,12 @@ _DSC_SRC = f"""
     float x0 = float(x[(size_t)tok * CC + c]);
     auto tap = [&](int lag) -> float {{
         int p = int(t) - lag;
-        if (p >= 0) return float(x[(size_t)(b * LL + p) * CC + c]);
+        if (p >= 0) {{
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + p]) return 0.0f;
+            }}
+            return float(x[(size_t)(b * LL + p) * CC + c]);
+        }}
         int sidx = 3 + p;
         return HAS_CS ? cs[((size_t)b * 3 + sidx) * CC + c] : 0.0f;
     }};
@@ -3511,11 +3756,21 @@ _DSC_SRC = f"""
     float s = ((p0 + p1) + p2) + p3;
     out[(size_t)tok * CC + c] = bfloat16_t((s + x0) / {_S9_LIT});
     if (t == 0) {{
+        int end = int(LL);
+        if constexpr (HAS_LENS) {{
+            end = clamp(clens[b], 0, int(LL));
+        }}
         for (int r = 0; r < 3; r++) {{
-            int p = int(LL) - 3 + r;
-            ncs[((size_t)b * 3 + r) * CC + c] = (p >= 0)
-                ? float(x[(size_t)(b * LL + p) * CC + c])
-                : (HAS_CS ? cs[((size_t)b * 3 + (3 + p)) * CC + c] : 0.0f);
+            int p = end - 3 + r;
+            float v;
+            if (p >= 0) {{
+                bool ok = true;
+                if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                v = ok ? float(x[(size_t)(b * LL + p) * CC + c]) : 0.0f;
+            }} else {{
+                v = HAS_CS ? cs[((size_t)b * 3 + (3 + p)) * CC + c] : 0.0f;
+            }}
+            ncs[((size_t)b * 3 + r) * CC + c] = v;
         }}
     }}
 """
@@ -3534,7 +3789,12 @@ _DSC4_SRC = f"""
     float4 sw2 = float4(as_type<bfloat4>(((const device uint2*)(sw + 2 * CC + c))[0]));
     float4 sw3 = float4(as_type<bfloat4>(((const device uint2*)(sw + 3 * CC + c))[0]));
     auto tap4 = [&](int p) -> float4 {{
-        if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * CC + c))[0]));
+        if (p >= 0) {{
+            if constexpr (HAS_MASK) {{
+                if (!cmask[(size_t)b * LL + p]) return float4(0.0f);
+            }}
+            return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * CC + c))[0]));
+        }}
         int sidx = 3 + p;
         return HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + sidx) * CC + c))[0] : float4(0.0f);
     }};
@@ -3546,8 +3806,12 @@ _DSC4_SRC = f"""
         if (t >= LL) break;
         size_t tok = (size_t)b * LL + t;
         float4 x0 = float4(as_type<bfloat4>(((const device uint2*)(x + tok * CC + c))[0]));
+        float4 xw = x0;
+        if constexpr (HAS_MASK) {{
+            if (!cmask[(size_t)b * LL + t]) xw = float4(0.0f);
+        }}
         bfloat4 dw4 = as_type<bfloat4>(((const device uint2*)(dw + (tok * HH + h) * 4))[0]);
-        float4 p0 = x0 * (sw0 + float(dw4.x));
+        float4 p0 = xw * (sw0 + float(dw4.x));
         float4 p1 = s1 * (sw1 + float(dw4.y));
         float4 p2 = s2 * (sw2 + float(dw4.z));
         float4 p3 = s3 * (sw3 + float(dw4.w));
@@ -3555,14 +3819,23 @@ _DSC4_SRC = f"""
         ((device uint2*)(out + tok * CC + c))[0] = as_type<uint2>(bfloat4((s + x0) / {_S9_LIT}));
         s3 = s2;
         s2 = s1;
-        s1 = x0;
+        s1 = xw;
     }}
     if (t0 == 0) {{
+        int end = int(LL);
+        if constexpr (HAS_LENS) {{
+            end = clamp(clens[b], 0, int(LL));
+        }}
         for (int r = 0; r < 3; r++) {{
-            int p = int(LL) - 3 + r;
-            float4 v = (p >= 0)
-                ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * CC + c))[0]))
-                : (HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * CC + c))[0] : float4(0.0f));
+            int p = end - 3 + r;
+            float4 v;
+            if (p >= 0) {{
+                bool ok = true;
+                if constexpr (HAS_MASK) ok = (cmask[(size_t)b * LL + p] != 0);
+                v = ok ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * CC + c))[0])) : float4(0.0f);
+            }} else {{
+                v = HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * CC + c))[0] : float4(0.0f);
+            }}
             ((device float4*)(ncs + ((size_t)b * 3 + r) * CC + c))[0] = v;
         }}
     }}
@@ -3570,29 +3843,46 @@ _DSC4_SRC = f"""
 
 
 def dyn_short_conv(
-    x: mx.array, dyn_weights: mx.array, static_weight: mx.array, conv_state: mx.array | None, num_heads: int
+    x: mx.array,
+    dyn_weights: mx.array,
+    static_weight: mx.array,
+    conv_state: mx.array | None,
+    num_heads: int,
+    *,
+    conv_mask: mx.array | None = None,
+    conv_lengths: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """K=4 dynamic short conv + residual/sqrt(9) -> (out bf16, new_cs (B,3,C) f32)."""
     B, L, C = x.shape
     hd = C // num_heads
     has_cs = int(conv_state is not None)
+    has_mask = int(conv_mask is not None)
+    has_lens = int(conv_lengths is not None)
     cs_in = conv_state if conv_state is not None else _DUMMY_F32
+    cm_in = conv_mask.astype(mx.uint8) if has_mask else _DUMMY_U8
+    cl_in = conv_lengths.astype(mx.int32) if has_lens else _DUMMY_I32
     if C % 4 == 0 and hd % 4 == 0 and L >= 16:
         tt = 16
         ntiles = (L + tt - 1) // tt
-        k = _k("pf_dyn_short_conv4", ("x", "dw", "sw", "cs"), ("out", "ncs"), _DSC4_SRC)
+        k = _k("pf_dyn_short_conv4", ("x", "dw", "sw", "cs", "cmask", "clens"), ("out", "ncs"), _DSC4_SRC)
         return k(
-            inputs=[x, dyn_weights, static_weight, cs_in],
-            template=[("CC", C), ("LL", L), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs), ("TT", tt)],
+            inputs=[x, dyn_weights, static_weight, cs_in, cm_in, cl_in],
+            template=[
+                ("CC", C), ("LL", L), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs), ("TT", tt),
+                ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
+            ],
             grid=(((C // 4 + 255) // 256) * 256, B * ntiles, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(B, L, C), (B, 3, C)],
             output_dtypes=[mx.bfloat16, mx.float32],
         )
-    k = _k("pf_dyn_short_conv", ("x", "dw", "sw", "cs"), ("out", "ncs"), _DSC_SRC)
+    k = _k("pf_dyn_short_conv", ("x", "dw", "sw", "cs", "cmask", "clens"), ("out", "ncs"), _DSC_SRC)
     return k(
-        inputs=[x, dyn_weights, static_weight, cs_in],
-        template=[("CC", C), ("LL", L), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs)],
+        inputs=[x, dyn_weights, static_weight, cs_in, cm_in, cl_in],
+        template=[
+            ("CC", C), ("LL", L), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs),
+            ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
+        ],
         grid=(((C + 255) // 256) * 256, B * L, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(B, L, C), (B, 3, C)],
@@ -4161,6 +4451,20 @@ _MGIN_DOWN_QKV_SRC = r"""
 """
 
 
+_MGIN_DOWN_S_SRC = _MGIN_DOWN_QKV_SRC.replace(
+    "    const uint g = threadgroup_position_in_grid.y;\n"
+    "    const device bfloat16_t* w = (g == 0 ? w0 : (g == 1 ? w1 : w2));\n"
+    "    device float* out_p = (g == 0 ? o0 : (g == 1 ? o1 : o2));\n"
+    "    auto h_row = [&](uint mr) { return (SHARED_H ? size_t(mr) : size_t(mr) * 3 + g) * DD; };\n"
+    "    auto msg_row = [&](uint mr) { return (size_t(mr) * 4 + g) * DD; };",
+    "    const device bfloat16_t* w = w0;\n"
+    "    device float* out_p = o0;\n"
+    "    auto h_row = [&](uint mr) { return size_t(mr) * DD; };\n"
+    "    auto msg_row = [&](uint mr) { return (size_t(mr) * 4 + SLOT) * DD; };",
+)
+assert _MGIN_DOWN_S_SRC != _MGIN_DOWN_QKV_SRC
+
+
 def _fg_mix_src(is_qkv: bool, w_bf16: bool = False) -> str:
     wt = "bfloat16_t" if w_bf16 else "float"
     if is_qkv:
@@ -4278,17 +4582,33 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
             output_dtypes=[mx.bfloat16, mx.float32],
         )
         return out
-    k_in = _k("pf_mgin_s", ("h", "msg"), ("out",), _MGIN_SINGLE_SRC)
-    g_in = k_in(
-        inputs=[h, msg],
-        template=[("DD", D), ("TG", _TG_RMS), ("MSTRIDE", 4), ("SLOT", slot)],
-        grid=(N * _TG_RMS, 1, 1),
-        threadgroup=(_TG_RMS, 1, 1),
-        output_shapes=[(B, L, 2 * D)],
-        output_dtypes=[mx.bfloat16],
-    )[0]
     if _PF_FG_MIX and N >= 256:
-        st = gate_mod.down_proj(g_in).astype(mx.float32)
+        spk = (
+            _MGIN_DOWN_SPK.get(N)
+            if (_PF_MGIN_DOWN and N >= 8192 and gate_mod.down_proj.weight.shape == (64, 2 * D))
+            else None
+        )
+        if spk is not None:
+            k_md = _k_mma("pf_mgin_down_s", ("h", "msg", "w0"), ("o0",), _MGIN_DOWN_S_SRC)
+            st = k_md(
+                inputs=[h, msg, gate_mod.down_proj.weight],
+                template=[("DD", D), ("NN", N), ("SPK", spk), ("SLOT", slot)],
+                grid=(128 * ((N + 31) // 32), 1, 1),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(B, L, 64)],
+                output_dtypes=[mx.float32],
+            )[0]
+        else:
+            k_in = _k("pf_mgin_s", ("h", "msg"), ("out",), _MGIN_SINGLE_SRC)
+            g_in = k_in(
+                inputs=[h, msg],
+                template=[("DD", D), ("TG", _TG_RMS), ("MSTRIDE", 4), ("SLOT", slot)],
+                grid=(N * _TG_RMS, 1, 1),
+                threadgroup=(_TG_RMS, 1, 1),
+                output_shapes=[(B, L, 2 * D)],
+                output_dtypes=[mx.bfloat16],
+            )[0]
+            st = gate_mod.down_proj(g_in).astype(mx.float32)
         wf = _maybe_bf16_w(gate_mod.forget_gate_proj.weight)
         wm = _maybe_bf16_w(gate_mod.message_gate_proj.weight)
         use_bf16 = wf is not None and wm is not None
@@ -4313,6 +4633,15 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
             output_dtypes=[mx.float32],
         )[0]
         return rms_norm_f32_bf16(mixed, ln)
+    k_in = _k("pf_mgin_s", ("h", "msg"), ("out",), _MGIN_SINGLE_SRC)
+    g_in = k_in(
+        inputs=[h, msg],
+        template=[("DD", D), ("TG", _TG_RMS), ("MSTRIDE", 4), ("SLOT", slot)],
+        grid=(N * _TG_RMS, 1, 1),
+        threadgroup=(_TG_RMS, 1, 1),
+        output_shapes=[(B, L, 2 * D)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
     fl, ml = _gate_logits(gate_mod, g_in)
     k_mn = _k("pf_mn_s", ("fl", "ml", "h", "msg", "nw", "eps"), ("out",), _MIXNORM_SINGLE_SRC)
     return k_mn(

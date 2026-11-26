@@ -23,14 +23,40 @@ ap.add_argument("--out", default="")
 ap.add_argument("--ctx", type=int, default=0, help="prepend N synthetic filler tokens to every prompt (long-context runs)")
 a = ap.parse_args()
 
-PROMPTS = ["Write a Python function that parses an ISO-8601 duration like P3DT4H12M into total seconds, with tests.",
-           "Write a short story, about 300 words, about a lighthouse keeper who receives a letter from the future.",
-           "Prove that the sum of the first n odd numbers is n^2, then compute the sum of the odd numbers below 1000.",
-           "Explain how a B-tree insertion works, step by step, with an example of a node split.",
-           "Write a bash script that finds the ten largest files under a directory and prints their sizes in MB.",
-           "Summarize the causes of the French Revolution in five bullet points, then give one counterargument.",
-           "Implement binary search in Rust and explain the off-by-one pitfalls.",
-           "Describe the water cycle to a ten-year-old, then list three common misconceptions."]
+PROMPTS = [
+    "Write a Python function that parses an ISO-8601 duration like P3DT4H12M into total seconds, with tests.",
+    "Write a short story, about 300 words, about a lighthouse keeper who receives a letter from the future.",
+    "Prove that the sum of the first n odd numbers is n^2, then compute the sum of the odd numbers below 1000.",
+    "Explain how a B-tree insertion works, step by step, with an example of a node split.",
+    "Write a bash script that finds the ten largest files under a directory and prints their sizes in MB.",
+    "Summarize the causes of the French Revolution in five bullet points, then give one counterargument.",
+    "Implement binary search in Rust and explain the off-by-one pitfalls.",
+    "Describe the water cycle to a ten-year-old, then list three common misconceptions.",
+    "Explain the difference between TCP and UDP with three real-world protocol examples for each.",
+    "Write a SQL query using a window function to find the top three earners in each department.",
+    "Derive the closed-form formula for the geometric series and evaluate it for r = 1/3.",
+    "Outline a five-day itinerary for a first-time visitor to Kyoto focused on food and architecture.",
+    "Explain how garbage collection works in Go, focusing on the tri-color mark-and-sweep algorithm.",
+    "Write a concise C function to reverse a singly linked list in place and analyze its complexity.",
+    "Compare photosynthesis and cellular respiration in terms of inputs, outputs, and organelles.",
+    "Explain why floating-point addition is not associative with a concrete IEEE-754 example.",
+    "Draft a polite email declining a job offer while keeping the door open for future collaboration.",
+    "Describe how RSA public-key encryption generates keys, encrypts, and decrypts a small message.",
+    "List six practical tips for debugging memory leaks in a long-running Python web service.",
+    "Explain the economic concept of comparative advantage using a two-country, two-good numerical table.",
+    "Write a regex that validates IPv4 addresses without leading zeros and explain each group.",
+    "Summarize how CRISPR-Cas9 edits DNA and name two current technical limitations.",
+    "Explain the CAP theorem and classify PostgreSQL, Cassandra, and ZooKeeper with caveats.",
+    "Write a short dialogue between two astronomers debating whether to investigate an anomalous radio signal.",
+    "Solve the recurrence T(n) = 2T(n/2) + n log n using the Master Theorem or recursion tree.",
+    "Describe how a turbocharger differs from a supercharger and the trade-offs in engine design.",
+    "Write a TypeScript generic LRU cache with O(1) get and put operations.",
+    "Explain how vaccines train adaptive immunity, distinguishing B cells, T cells, and memory cells.",
+    "Give a step-by-step guide to normalizing a messy CSV dataset with pandas before modeling.",
+    "Explain the Byzantine Generals Problem and why 3f + 1 nodes are needed under synchrony.",
+    "Write a haiku sequence of four poems tracing the four seasons in a mountain valley.",
+    "Compare quicksort, mergesort, and heapsort on worst-case time, space, stability, and cache locality.",
+]
 from mlx_lm.models.inkling2.batchdecode import BatchDecoder
 
 greedy = lambda lp: mx.argmax(lp, axis=-1)

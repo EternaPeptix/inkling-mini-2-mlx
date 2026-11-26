@@ -139,20 +139,53 @@ def _build(dtype, B, G, Ns, K, cfg):
         return _KERNELS[key]
     bm, bn, sm, sn, tm, tn = cfg
     blockM = bm * sm * tm
-    tg_floats = B * bn * (blockM + tm) if bn > 1 else 1
-    lines = [
-        "threadgroup float tgp_mem[%d];" % tg_floats,
-        "const uint t = threadgroup_position_in_grid.x;",
-    ]
-    start = 0
-    for g, N in enumerate(Ns):
-        nt = (N + blockM - 1) // blockM
-        lines.append(
-            "if (t < %d) { gemv_rows_run<T, %d, %d, %d, %d, %d, %d, %d>(w%d, x%d, o%d, %d, %d, tgp_mem, t - %d, "
-            "simdgroup_index_in_threadgroup, thread_index_in_simdgroup); return; }"
-            % (start + nt, B, bm, bn, sm, sn, tm, tn, g, g, g, K, N, start)
-        )
-        start += nt
+    rb = min(B, 8)
+    nslab = (B + rb - 1) // rb
+    tg_floats = rb * bn * (blockM + tm) if bn > 1 else 1
+    ntg_per_slab = sum((N + blockM - 1) // blockM for N in Ns)
+    if nslab == 1:
+        lines = [
+            "threadgroup float tgp_mem[%d];" % tg_floats,
+            "const uint t = threadgroup_position_in_grid.x;",
+        ]
+        start = 0
+        for g, N in enumerate(Ns):
+            nt = (N + blockM - 1) // blockM
+            lines.append(
+                "if (t < %d) { gemv_rows_run<T, %d, %d, %d, %d, %d, %d, %d>(w%d, x%d, o%d, %d, %d, tgp_mem, t - %d, "
+                "simdgroup_index_in_threadgroup, thread_index_in_simdgroup); return; }"
+                % (start + nt, B, bm, bn, sm, sn, tm, tn, g, g, g, K, N, start)
+            )
+            start += nt
+    else:
+        q, rem = divmod(B, rb)
+        lines = [
+            "threadgroup float tgp_mem[%d];" % tg_floats,
+            "const uint t_raw = threadgroup_position_in_grid.x;",
+            "const uint slab = t_raw / %du;" % ntg_per_slab,
+            "const uint t = t_raw %% %du;" % ntg_per_slab,
+            "const size_t b0 = size_t(slab) * %du;" % rb,
+        ]
+        start = 0
+        for g, N in enumerate(Ns):
+            nt = (N + blockM - 1) // blockM
+            if rem == 0:
+                lines.append(
+                    "if (t < %d) { gemv_rows_run<T, %d, %d, %d, %d, %d, %d, %d>(w%d, x%d + b0 * %d, o%d + b0 * %d, %d, %d, tgp_mem, t - %d, "
+                    "simdgroup_index_in_threadgroup, thread_index_in_simdgroup); return; }"
+                    % (start + nt, rb, bm, bn, sm, sn, tm, tn, g, g, K, g, N, K, N, start)
+                )
+            else:
+                lines.append(
+                    "if (t < %d) { if (slab < %du) gemv_rows_run<T, %d, %d, %d, %d, %d, %d, %d>(w%d, x%d + b0 * %d, o%d + b0 * %d, %d, %d, tgp_mem, t - %d, "
+                    "simdgroup_index_in_threadgroup, thread_index_in_simdgroup); else gemv_rows_run<T, %d, %d, %d, %d, %d, %d, %d>(w%d, x%d + b0 * %d, o%d + b0 * %d, %d, %d, tgp_mem, t - %d, "
+                    "simdgroup_index_in_threadgroup, thread_index_in_simdgroup); return; }"
+                    % (
+                        start + nt, q, rb, bm, bn, sm, sn, tm, tn, g, g, K, g, N, K, N, start,
+                        rem, bm, bn, sm, sn, tm, tn, g, g, K, g, N, K, N, start,
+                    )
+                )
+            start += nt
     kern = mx.fast.metal_kernel(
         name="e4_gemv_rows_%s_b%d_g%d_k%d_%s" % (str(dtype).split(".")[-1], B, G, K, "_".join(map(str, Ns + list(cfg)))),
         input_names=["w%d" % g for g in range(G)] + ["x%d" % g for g in range(G)],
@@ -160,7 +193,7 @@ def _build(dtype, B, G, Ns, K, cfg):
         header=_HEADER,
         source="\n".join(lines),
     )
-    _KERNELS[key] = (kern, start)
+    _KERNELS[key] = (kern, nslab * ntg_per_slab)
     return _KERNELS[key]
 
 

@@ -1434,6 +1434,180 @@ def qkv_mid_rel_msg_b1(layer, r1, msg, cs0, cs1, rel_w, *, tau=None):
     return _run_qkv_mid_rel_b1(layer, cs0, cs1, rel_w, mixed=mixed, part=part, tau=tau)
 
 
+_OPROJ_GSX_SRC = r"""
+  constexpr int block_size = 256;
+  constexpr bool FULL = (B % RB) == 0;
+  uint ty = threadgroup_position_in_grid.y;
+  uint b0 = threadgroup_position_in_grid.x * RB;
+  uint simd_gid = simdgroup_index_in_threadgroup;
+  uint simd_lid = thread_index_in_simdgroup;
+  const int nb = FULL ? RB : min(RB, B - int(b0));
+  const int out_row = int(ty) * (NSG * RPS) + int(simd_gid) * RPS;
+  bool active = true;
+  int last_row = RPS - 1;
+  if (PR) {
+    if (out_row >= N) active = false;
+    else last_row = min(last_row, N - 1 - out_row);
+  }
+  const int in_vec_size_w = K;
+  const int in_vec_size_g = K / 64;
+  const device uint8_t* ws = (const device uint8_t*)w + size_t(active ? out_row : 0) * in_vec_size_w + simd_lid * 8;
+  const device bfloat16_t* sc_p = scales + size_t(active ? out_row : 0) * in_vec_size_g + (simd_lid >> 3);
+  const device bfloat16_t* bi_p = biases + size_t(active ? out_row : 0) * in_vec_size_g + (simd_lid >> 3);
+  const device bfloat16_t* ap = a + size_t(b0) * K + simd_lid * 8;
+  const device bfloat16_t* gp = g + size_t(b0) * K + simd_lid * 8;
+  device bfloat16_t* yp = y + size_t(b0) * N + out_row;
+
+  thread float result[RB][RPS];
+  for (int b = 0; b < RB; b++)
+    for (int r = 0; r < RPS; r++) result[b][r] = 0.0f;
+
+  threadgroup uint4 sx_bf[(DBUF ? 2 : 1) * RB * 32];
+  threadgroup float sm_f[(DBUF ? 2 : 1) * RB * 32];
+
+  for (int k = 0; k < K; k += block_size) {
+    const uint buf = DBUF ? (uint(k >> 8) & 1u) : 0u;
+    threadgroup uint4* sx = sx_bf + buf * (RB * 32u);
+    threadgroup float* sm = sm_f + buf * (RB * 32u);
+    for (int b = int(simd_gid); b < nb; b += NSG) {
+      uint4 apk = ((const device uint4*)(ap + size_t(b) * K))[0];
+      uint4 gpk = ((const device uint4*)(gp + size_t(b) * K))[0];
+      bfloat4 a0 = as_type<bfloat4>(apk.xy), a1 = as_type<bfloat4>(apk.zw);
+      bfloat4 g0 = as_type<bfloat4>(gpk.xy), g1 = as_type<bfloat4>(gpk.zw);
+      bfloat4 v0 = bfloat4(
+          bfloat16_t(glue_gate(float(a0.x), float(g0.x))),
+          bfloat16_t(glue_gate(float(a0.y), float(g0.y))),
+          bfloat16_t(glue_gate(float(a0.z), float(g0.z))),
+          bfloat16_t(glue_gate(float(a0.w), float(g0.w))));
+      bfloat4 v1 = bfloat4(
+          bfloat16_t(glue_gate(float(a1.x), float(g1.x))),
+          bfloat16_t(glue_gate(float(a1.y), float(g1.y))),
+          bfloat16_t(glue_gate(float(a1.z), float(g1.z))),
+          bfloat16_t(glue_gate(float(a1.w), float(g1.w))));
+      uint2 u0 = as_type<uint2>(v0), u1 = as_type<uint2>(v1);
+      sx[b * 32u + simd_lid] = uint4(u0.x, u0.y, u1.x, u1.y);
+      float s = 0.0f;
+      s += float(v0.x); s += float(v0.y); s += float(v0.z); s += float(v0.w);
+      s += float(v1.x); s += float(v1.y); s += float(v1.z); s += float(v1.w);
+      sm[b * 32u + simd_lid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active) {
+      if constexpr (PACKW) {
+        thread uint2 wr_r[RPS];
+        thread bfloat16_t sc_bf[RPS], bi_bf[RPS];
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < RPS; r++) {
+          int src = PR ? min(r, last_row) : r;
+          wr_r[r] = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+          sc_bf[r] = sc_p[size_t(src) * in_vec_size_g];
+          bi_bf[r] = bi_p[size_t(src) * in_vec_size_g];
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < RB; b++) {
+          if (FULL || b < nb) {
+            uint4 xpk = sx[b * 32u + simd_lid];
+            bfloat4 xv0 = as_type<bfloat4>(xpk.xy), xv1 = as_type<bfloat4>(xpk.zw);
+            float x0 = float(xv0.x), x1 = float(xv0.y), x2 = float(xv0.z), x3 = float(xv0.w);
+            float x4 = float(xv1.x), x5 = float(xv1.y), x6 = float(xv1.z), x7 = float(xv1.w);
+            float smb = sm[b * 32u + simd_lid];
+            _Pragma("clang loop unroll(full)")
+            for (int r = 0; r < RPS; r++) {
+              float4 w0 = float4(as_type<uchar4>(wr_r[r].x));
+              float4 w1 = float4(as_type<uchar4>(wr_r[r].y));
+              float acc = 0.0f;
+              acc += x0 * w0.x; acc += x1 * w0.y; acc += x2 * w0.z; acc += x3 * w0.w;
+              acc += x4 * w1.x; acc += x5 * w1.y; acc += x6 * w1.z; acc += x7 * w1.w;
+              result[b][r] += float(sc_bf[r]) * acc + smb * float(bi_bf[r]);
+            }
+          }
+        }
+      } else {
+        thread half4 w0[RPS], w1[RPS];
+        thread float sc[RPS], bi[RPS];
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < RPS; r++) {
+          int src = PR ? min(r, last_row) : r;
+          uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
+          w0[r] = half4(as_type<uchar4>(wr.x));
+          w1[r] = half4(as_type<uchar4>(wr.y));
+          sc[r] = float(sc_p[size_t(src) * in_vec_size_g]);
+          bi[r] = float(bi_p[size_t(src) * in_vec_size_g]);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < RB; b++) {
+          if (FULL || b < nb) {
+            uint4 xpk = sx[b * 32u + simd_lid];
+            bfloat4 xv0 = as_type<bfloat4>(xpk.xy), xv1 = as_type<bfloat4>(xpk.zw);
+            float x0 = float(xv0.x), x1 = float(xv0.y), x2 = float(xv0.z), x3 = float(xv0.w);
+            float x4 = float(xv1.x), x5 = float(xv1.y), x6 = float(xv1.z), x7 = float(xv1.w);
+            float smb = sm[b * 32u + simd_lid];
+            _Pragma("clang loop unroll(full)")
+            for (int r = 0; r < RPS; r++) {
+              float acc = 0.0f;
+              acc += x0 * float(w0[r].x); acc += x1 * float(w0[r].y); acc += x2 * float(w0[r].z); acc += x3 * float(w0[r].w);
+              acc += x4 * float(w1[r].x); acc += x5 * float(w1[r].y); acc += x6 * float(w1[r].z); acc += x7 * float(w1[r].w);
+              result[b][r] += sc[r] * acc + smb * bi[r];
+            }
+          }
+        }
+      }
+    }
+    if constexpr (!DBUF) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ws += block_size;
+    sc_p += 4;
+    bi_p += 4;
+    ap += block_size;
+    gp += block_size;
+  }
+  if (!active) return;
+  _Pragma("clang loop unroll(full)")
+  for (int b = 0; b < RB; b++) {
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < RPS; r++) {
+      float rr = simd_sum(result[b][r]);
+      if (simd_lid == 0 && r <= last_row && (FULL || b < nb)) {
+        yp[size_t(b) * N + r] = static_cast<bfloat16_t>(rr);
+      }
+    }
+  }
+"""
+
+_oproj_gsx_k = None
+
+
+def _get_oproj_gsx():
+    global _oproj_gsx_k
+    if _oproj_gsx_k is None:
+        _oproj_gsx_k = mx.fast.metal_kernel(
+            name="f3_oproj_gate_sx",
+            input_names=["a", "g", "w", "scales", "biases"],
+            output_names=["y"],
+            header=GLUE_HEADER,
+            source=_OPROJ_GSX_SRC,
+            ensure_row_contiguous=True,
+        )
+    return _oproj_gsx_k
+
+
+def _oproj_gsx_cfg(B):
+    if B == 1:
+        return 4, 2, 1, 0, 1
+    if B == 2:
+        return 4, 4, 2, 0, 1
+    if B == 3:
+        return 4, 4, 3, 0, 1
+    if B == 4:
+        return 4, 2, 4, 1, 1
+    if B <= 8:
+        return 4, 4, B, 1, 1
+    if B % 4 == 0 and B % 8 != 0:
+        return 4, 4, 4, 0, 1
+    return 4, 4, 8, 1, 0
+
+
 def oproj_rows(attn_out, gate, w, scales, biases):
     """K9. attn_out (B,3072) or (B,1,24,128) bf16, gate (B,3072) bf16 -> (B,2304) bf16;
     row b == o_proj(bf16(f32(attn_out[b]) * sigmoid(f32(gate[b])))) at M=1."""
@@ -1443,7 +1617,34 @@ def oproj_rows(attn_out, gate, w, scales, biases):
         raise ValueError("attn_out and gate must be bf16 with B*K elements")
     a2 = attn_out.reshape(B, K)
     g2 = gate.reshape(B, K)
-    return _launch_q([a2], [(w, scales, biases)], gate=g2).reshape(B, w.shape[0])
+    N = w.shape[0]
+    if (
+        os.environ.get("LOOPLING_OPROJ_GSX", "1") not in ("0", "", "false", "False")
+        and not os.environ.get("LOOPLING_QMV_CFG")
+        and 1 <= B <= MAX_B
+        and K % _qmv._K_ALIGN == 0
+        and K not in (64, 128)
+        and w.shape[1] * 4 == K
+        and scales.shape == (N, K // 64)
+        and biases.shape == (N, K // 64)
+        and scales.dtype == mx.bfloat16
+        and biases.dtype == mx.bfloat16
+    ):
+        rps, nsg, rb, packw, dbuf = _oproj_gsx_cfg(B)
+        tiles = (N + rps * nsg - 1) // (rps * nsg)
+        pr = (N % (rps * nsg)) != 0
+        return _get_oproj_gsx()(
+            inputs=[a2, g2, w, scales, biases],
+            template=[
+                ("B", B), ("K", K), ("N", N), ("PR", pr),
+                ("RPS", rps), ("NSG", nsg), ("RB", rb), ("PACKW", packw), ("DBUF", dbuf),
+            ],
+            grid=(((B + rb - 1) // rb) * 32, nsg * tiles, 1),
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(B, N)],
+            output_dtypes=_OUT_DT_BF,
+        )[0]
+    return _launch_q([a2], [(w, scales, biases)], gate=g2).reshape(B, N)
 
 
 # =============================================================================================== K2 (gemv rows)
@@ -1460,7 +1661,7 @@ for _old, _new in [
 _k2 = {}
 
 
-def _gd_tm1_src(G, B):
+def _gd_tm1_src(G, B, RB):
     wsel = "\n".join(
         ("%s (g == %d) wr = w%d;" % ("if" if g == 0 else "else if", g, g)) if g < G - 1 else ("else wr = w%d;" % g)
         for g in range(G)
@@ -1469,7 +1670,9 @@ def _gd_tm1_src(G, B):
         wsel = "const device bfloat16_t* wr = w0;"
     else:
         wsel = "const device bfloat16_t* wr;\n    " + wsel
-    if B <= 4:
+    full = (B % RB) == 0
+    b_guard = "" if full else "if (b < nb) "
+    if RB <= 4:
         k_loop = f"""    bfloat4 wv[4];
     wv[0] = as_type<bfloat4>(((const device uint2*)(wr + 0))[0]);
     wv[1] = as_type<bfloat4>(((const device uint2*)(wr + 1024))[0]);
@@ -1479,13 +1682,15 @@ def _gd_tm1_src(G, B):
     for (int it = 0; it < 4; it++) {{
       const int off = it * 1024;
       const float4 wvf = float4(wv[it].x, wv[it].y, wv[it].z, wv[it].w);
-      for (int b = 0; b < {B}; b++) {{
-        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
-        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
-        result[b] += wvf.x * static_cast<float>(xv.x);
-        result[b] += wvf.y * static_cast<float>(xv.y);
-        result[b] += wvf.z * static_cast<float>(xv.z);
-        result[b] += wvf.w * static_cast<float>(xv.w);
+      for (int b = 0; b < {RB}; b++) {{
+        {b_guard}{{
+          const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+          bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+          result[b] += wvf.x * static_cast<float>(xv.x);
+          result[b] += wvf.y * static_cast<float>(xv.y);
+          result[b] += wvf.z * static_cast<float>(xv.z);
+          result[b] += wvf.w * static_cast<float>(xv.w);
+        }}
       }}
     }}"""
     else:
@@ -1493,15 +1698,22 @@ def _gd_tm1_src(G, B):
       const int off = it * 1024;
       bfloat4 wvt = as_type<bfloat4>(((const device uint2*)(wr + off))[0]);
       const float4 wvf = float4(wvt.x, wvt.y, wvt.z, wvt.w);
-      for (int b = 0; b < {B}; b++) {{
-        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
-        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
-        result[b] += wvf.x * static_cast<float>(xv.x);
-        result[b] += wvf.y * static_cast<float>(xv.y);
-        result[b] += wvf.z * static_cast<float>(xv.z);
-        result[b] += wvf.w * static_cast<float>(xv.w);
+      for (int b = 0; b < {RB}; b++) {{
+        {b_guard}{{
+          const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+          bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+          result[b] += wvf.x * static_cast<float>(xv.x);
+          result[b] += wvf.y * static_cast<float>(xv.y);
+          result[b] += wvf.z * static_cast<float>(xv.z);
+          result[b] += wvf.w * static_cast<float>(xv.w);
+        }}
       }}
     }}"""
+    b0_decl = (
+        "    const int b0 = 0;\n    const int nb = %d; (void)nb;" % RB
+        if B == RB
+        else f"    const int b0 = (int)threadgroup_position_in_grid.z * {RB};\n    const int nb = {'%d' % RB if full else f'min({RB}, {B} - b0)'}; (void)nb;"
+    )
     return f"""
     const int t = (int)threadgroup_position_in_grid.x;
     const int g = t / 64;
@@ -1509,40 +1721,45 @@ def _gd_tm1_src(G, B):
     const int sgN = (int)simdgroup_index_in_threadgroup;
     const int thrN = (int)thread_index_in_simdgroup;
     const int bn0 = (sgN * 32 + thrN) * 4;
+{b0_decl}
     {wsel}
     wr += (size_t)row * 4608 + bn0;
-    const device bfloat16_t* xb0 = x + (size_t)g * 4608 + bn0;
     const size_t xbs = (size_t){G} * 4608;
-    float result[{B}];
-    for (int b = 0; b < {B}; b++) result[b] = 0.0f;
+    const device bfloat16_t* xb0 = x + (size_t)b0 * xbs + (size_t)g * 4608 + bn0;
+    float result[{RB}];
+    for (int b = 0; b < {RB}; b++) result[b] = 0.0f;
 {k_loop}
     if (bn0 + 4096 < 4608) {{
       const int off = 4096;
       const device bfloat16_t* wp = wr + off;
       bfloat4 wvt = as_type<bfloat4>(((const device uint2*)wp)[0]);
       const float4 wvf = float4(wvt.x, wvt.y, wvt.z, wvt.w);
-      for (int b = 0; b < {B}; b++) {{
-        const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
-        bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
-        result[b] += wvf.x * static_cast<float>(xv.x);
-        result[b] += wvf.y * static_cast<float>(xv.y);
-        result[b] += wvf.z * static_cast<float>(xv.z);
-        result[b] += wvf.w * static_cast<float>(xv.w);
+      for (int b = 0; b < {RB}; b++) {{
+        {b_guard}{{
+          const device bfloat16_t* xp = xb0 + (size_t)b * xbs + off;
+          bfloat4 xv = as_type<bfloat4>(((const device uint2*)xp)[0]);
+          result[b] += wvf.x * static_cast<float>(xv.x);
+          result[b] += wvf.y * static_cast<float>(xv.y);
+          result[b] += wvf.z * static_cast<float>(xv.z);
+          result[b] += wvf.w * static_cast<float>(xv.w);
+        }}
       }}
     }}
-    for (int b = 0; b < {B}; b++) {{
+    for (int b = 0; b < {RB}; b++) {{
       for (ushort sn = 16; sn >= 1; sn >>= 1) result[b] += simd_shuffle_down(result[b], sn);
     }}
-    threadgroup float tgp[{B} * 8];
+    threadgroup float tgp[{RB} * 8];
     if (thrN == 0) {{
-      for (int b = 0; b < {B}; b++) tgp[b * 8 + sgN] = result[b];
+      for (int b = 0; b < {RB}; b++) tgp[b * 8 + sgN] = result[b];
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sgN == 0 && thrN == 0) {{
-      for (int b = 0; b < {B}; b++) {{
-        float s = result[b];
-        for (int k = 1; k < 8; k++) s += tgp[b * 8 + k];
-        o[((size_t)b * {G} + g) * 64 + row] = static_cast<bfloat16_t>(s);
+      for (int b = 0; b < {RB}; b++) {{
+        {b_guard}{{
+          float s = result[b];
+          for (int k = 1; k < 8; k++) s += tgp[b * 8 + k];
+          o[((size_t)(b0 + b) * {G} + g) * 64 + row] = static_cast<bfloat16_t>(s);
+        }}
       }}
     }}
 """
@@ -1553,23 +1770,25 @@ def gate_down_rows(x, ws):
     -> (B,G,64) bf16, == (x[b,g] @ ws[g].T) at M=1 for every (b,g); one launch."""
     B, G, K = x.shape
     if x.dtype != mx.bfloat16 or len(ws) != G or not 1 <= B <= MAX_B:
-        raise ValueError("x must be (B,G,K) bf16 with one weight per gate, B 1..16")
+        raise ValueError(f"x must be (B,G,K) bf16 with one weight per gate, B 1..{MAX_B}")
     N = ws[0].shape[0]
     for w in ws:
         if w.shape != (N, K) or w.dtype != mx.bfloat16:
             raise ValueError("weights must all be (N,K) bf16")
-    if _GD_TM1 and N == 64 and K == 4608 and B <= 16:
-        key = ("tm1", B, G, N, K)
+    if _GD_TM1 and N == 64 and K == 4608 and B <= MAX_B:
+        ov_rb = os.environ.get("LOOPLING_GD_RB")
+        rb = min(int(ov_rb), B) if ov_rb else min(B, 8)
+        key = ("tm1", B, rb, G, N, K)
         ent = _k2.get(key)
         if ent is None:
             kern = mx.fast.metal_kernel(
-                name="f3_gate_down_tm1_b%d_g%d" % (B, G),
+                name="f3_gate_down_tm1_b%d_rb%d_g%d" % (B, rb, G),
                 input_names=["x"] + ["w%d" % g for g in range(G)],
                 output_names=["o"],
-                source=_gd_tm1_src(G, B),
+                source=_gd_tm1_src(G, B, rb),
                 ensure_row_contiguous=True,
             )
-            ent = _k2[key] = (kern, (G * 64 * 32, 8, 1), (32, 8, 1), [(B, G, N)])
+            ent = _k2[key] = (kern, (G * 64 * 32, 8, (B + rb - 1) // rb), (32, 8, 1), [(B, G, N)])
         kern, grid, tg, out_shp = ent
         return kern(
             inputs=[x] + list(ws),
@@ -1965,7 +2184,7 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
     B, G, R = down.shape
     D = wf[0].shape[0]
     if D != 2304 or R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G or msg.shape[0] != B:
-        raise ValueError("gate_mix_part_rows requires D=2304, R=64, down bf16, B in 1..16")
+        raise ValueError(f"gate_mix_part_rows requires D=2304, R=64, down bf16, B in 1..{MAX_B}")
     uniq, smap, w_ins, use_bf16, wt = _prepare_mix_inputs(ss, msg, wf, wm, D)
     nsg = 8
     nt = 36  # 2304 / 64 = 36 half-SG tiles (108 TGs for G=3 -> all 80 M3 Ultra cores busy, 1 pass!)

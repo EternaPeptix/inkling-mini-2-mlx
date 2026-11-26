@@ -176,12 +176,72 @@ def _router_from_mixed_tm1_src(B, eps_lit):
 """
 
 
+def _router_tm1_chunk_src(RB=8):
+    return f"""
+    const int row = (int)threadgroup_position_in_grid.x;
+    const int b0 = (int)threadgroup_position_in_grid.z * {RB};
+    const int nb = min({RB}, BB - b0);
+    const int sgN = (int)simdgroup_index_in_threadgroup;
+    const int thrN = (int)thread_index_in_simdgroup;
+    const int bn0 = (sgN * 32 + thrN) * 4;
+    const device float* wr = w + (size_t)row * 2304;
+    float result[{RB}];
+    for (int b = 0; b < {RB}; b++) result[b] = 0.0f;
+    float4 wv0 = ((const device float4*)(wr + bn0))[0];
+    float4 wv1 = ((const device float4*)(wr + 1024 + bn0))[0];
+    for (int b = 0; b < {RB}; b++) {{
+      if (b < nb) {{
+        bfloat4 vv0 = as_type<bfloat4>(((const device uint2*)(x + (size_t)(b0 + b) * 2304 + bn0))[0]);
+        result[b] += wv0.x * static_cast<float>(vv0.x);
+        result[b] += wv0.y * static_cast<float>(vv0.y);
+        result[b] += wv0.z * static_cast<float>(vv0.z);
+        result[b] += wv0.w * static_cast<float>(vv0.w);
+        bfloat4 vv1 = as_type<bfloat4>(((const device uint2*)(x + (size_t)(b0 + b) * 2304 + 1024 + bn0))[0]);
+        result[b] += wv1.x * static_cast<float>(vv1.x);
+        result[b] += wv1.y * static_cast<float>(vv1.y);
+        result[b] += wv1.z * static_cast<float>(vv1.z);
+        result[b] += wv1.w * static_cast<float>(vv1.w);
+      }}
+    }}
+    if (bn0 + 2048 < 2304) {{
+      const int off = 2048 + bn0;
+      float4 wv = ((const device float4*)(wr + off))[0];
+      for (int b = 0; b < {RB}; b++) {{
+        if (b < nb) {{
+          bfloat4 vv = as_type<bfloat4>(((const device uint2*)(x + (size_t)(b0 + b) * 2304 + off))[0]);
+          result[b] += wv.x * static_cast<float>(vv.x);
+          result[b] += wv.y * static_cast<float>(vv.y);
+          result[b] += wv.z * static_cast<float>(vv.z);
+          result[b] += wv.w * static_cast<float>(vv.w);
+        }}
+      }}
+    }}
+    for (int b = 0; b < {RB}; b++) {{
+      for (ushort sn = 16; sn >= 1; sn >>= 1) result[b] += simd_shuffle_down(result[b], sn);
+    }}
+    threadgroup float tgp[{RB} * 8];
+    if (thrN == 0) {{
+      for (int b = 0; b < {RB}; b++) tgp[b * 8 + sgN] = result[b];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgN == 0 && thrN == 0) {{
+      for (int b = 0; b < {RB}; b++) {{
+        if (b < nb) {{
+          float s = result[b];
+          for (int k = 1; k < 8; k++) s += tgp[b * 8 + k];
+          o[(size_t)(b0 + b) * 128 + row] = s;
+        }}
+      }}
+    }}
+"""
+
+
 def router_from_mixed_rows(mixed, part, ln_w, w, *, eps_ln=1e-6):
     """Fused K3b(mlp) + K11 router: mixed (B,1,2304) f32, part (B,1,36) f32, ln_w (2304,) bf16, w (128,2304) f32
     -> (logits (B,128) f32, x_mlp (B,2304) bf16); bitwise identical to k3b_norm_layer + router_rows."""
     B = int(mixed.shape[0])
     N, K = w.shape
-    if B < 1 or B > 16 or N != 128 or K != 2304 or mixed.dtype != mx.float32 or part.dtype != mx.float32 or w.dtype != mx.float32:
+    if B < 1 or B > 32 or N != 128 or K != 2304 or mixed.dtype != mx.float32 or part.dtype != mx.float32 or w.dtype != mx.float32:
         raise ValueError("router_from_mixed_rows: bad shapes/dtypes")
     eps_lit = flit(eps_ln)
     key = (B, eps_lit)
@@ -210,15 +270,26 @@ def router_rows(x, w):
     N = w.shape[0]
     if x.dtype != mx.bfloat16 or w.dtype != mx.float32 or w.shape[1] != K:
         raise ValueError("router_rows: x bf16 (B,K), w f32 (N,K)")
-    tm1 = (os.environ.get("MOE_ROUTER_TM1", "1") not in ("0", "")) and N == 128 and K == 2304 and B <= 16
+    tm1 = (os.environ.get("MOE_ROUTER_TM1", "1") not in ("0", "")) and N == 128 and K == 2304 and B <= 32
     if tm1:
-        key = (B, N, K, True)
+        if B <= 16:
+            key = (B, N, K, True)
+            k = _router_kernels.get(key)
+            if k is None:
+                k = _router_kernels[key] = mx.fast.metal_kernel(
+                    name="moe_router_tm1_b%d" % B, input_names=["w", "x"], output_names=["o"],
+                    source=_router_tm1_src(B), ensure_row_contiguous=True)
+            (o,) = k(inputs=[w, x], grid=(128 * 32, 8, 1), threadgroup=(32, 8, 1),
+                     output_shapes=[(B, N)], output_dtypes=[mx.float32])
+            return o
+        key = ("chunk8", N, K)
         k = _router_kernels.get(key)
         if k is None:
             k = _router_kernels[key] = mx.fast.metal_kernel(
-                name="moe_router_tm1_b%d" % B, input_names=["w", "x"], output_names=["o"],
-                source=_router_tm1_src(B), ensure_row_contiguous=True)
-        (o,) = k(inputs=[w, x], grid=(128 * 32, 8, 1), threadgroup=(32, 8, 1),
+                name="moe_router_tm1_c8", input_names=["w", "x"], output_names=["o"],
+                source=_router_tm1_chunk_src(8), ensure_row_contiguous=True)
+        (o,) = k(inputs=[w, x], template=[("BB", B)],
+                 grid=(128 * 32, 8, (B + 7) // 8), threadgroup=(32, 8, 1),
                  output_shapes=[(B, N)], output_dtypes=[mx.float32])
         return o
     cfg = _gemv._cfg(N, K)
@@ -2234,21 +2305,500 @@ def _stream_x(tmax):
     return False
 
 
+_ROUTE_TILE_SRC = r"""
+    constexpr uint NSG = 8;
+    constexpr uint EE = 128;
+    constexpr uint PP = uint(BB) * 8u;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+
+    threadgroup uint ind_s[PP];
+    threadgroup float wt_s[PP];
+    threadgroup atomic_uint hist[NSG][EE];
+    threadgroup uint exp_tot[EE];
+    threadgroup uint tile_cnt[EE];
+    threadgroup uint sg_sums[4];
+    threadgroup uint sg_tsums[4];
+
+    for (int row = (int)sg; row < BB; row += 8) {
+        moe_route_row(logits + row * 128, bias, lane, ind_s + row * 8, wt_s + row * 8, eps, rscale);
+    }
+    for (uint i = tid; i < NSG * EE; i += 256) {
+        atomic_store_explicit(&hist[i / EE][i % EE], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < PP; i += 256) {
+        inds_o[i] = ind_s[i];
+        wts_o[i] = wt_s[i];
+    }
+
+    uint chunk = (PP + NSG - 1u) / NSG;
+    uint s0 = sg * chunk;
+    uint s1 = min(s0 + chunk, PP);
+    for (uint p = s0 + lane; p < s1; p += 32) {
+        uint e = ind_s[p];
+        atomic_fetch_add_explicit(&hist[sg][e], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < EE) {
+        uint acc = 0;
+        for (uint s = 0; s < NSG; s++) {
+            uint c = atomic_load_explicit(&hist[s][tid], memory_order_relaxed);
+            atomic_store_explicit(&hist[s][tid], acc, memory_order_relaxed);
+            acc += c;
+        }
+        exp_tot[tid] = acc;
+        tile_cnt[tid] = (acc + uint(BM) - 1u) / uint(BM);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < EE) {
+        uint v = exp_tot[tid];
+        uint ex = simd_prefix_exclusive_sum(v);
+        if (lane == 31) sg_sums[sg] = ex + v;
+        exp_tot[tid] = ex;
+
+        uint tv = tile_cnt[tid];
+        uint tex = simd_prefix_exclusive_sum(tv);
+        if (lane == 31) sg_tsums[sg] = tex + tv;
+        tile_cnt[tid] = tex;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 32) {
+        uint sv = (tid < 4) ? sg_sums[tid] : 0u;
+        uint sp = simd_prefix_exclusive_sum(sv);
+        if (tid < 4) sg_sums[tid] = sp;
+
+        uint stv = (tid < 4) ? sg_tsums[tid] : 0u;
+        uint stp = simd_prefix_exclusive_sum(stv);
+        if (tid < 4) sg_tsums[tid] = stp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < EE) {
+        uint base = exp_tot[tid] + sg_sums[sg];
+        exp_off[tid] = base;
+        for (uint s = 0; s < NSG; s++) {
+            uint off = atomic_load_explicit(&hist[s][tid], memory_order_relaxed);
+            atomic_store_explicit(&hist[s][tid], base + off, memory_order_relaxed);
+        }
+        uint tbase = tile_cnt[tid] + sg_tsums[sg];
+        uint nxt = (tid + 1u == EE) ? PP : (exp_tot[tid + 1u] + sg_sums[(tid + 1u) >> 5]);
+        uint nte = (nxt - base + uint(BM) - 1u) / uint(BM);
+        for (uint mt = 0; mt < nte; mt++) {
+            tile_meta[tbase + mt] = (tid << 20) | mt;
+        }
+        if (tid == EE - 1u) {
+            exp_off[EE] = PP;
+            uint tot_t = tbase + nte;
+            for (uint t = tot_t; t < uint(MAX_TILES); t++) {
+                tile_meta[t] = 0xFFFFFFFFu;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint p = s0 + lane; p < s1; p += 32) {
+        uint e = ind_s[p];
+        uint pos = atomic_fetch_add_explicit(&hist[sg][e], 1u, memory_order_relaxed);
+        pair_list[pos] = p;
+    }
+"""
+
+_rt_kernel = None
+
+
+def route_tile_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0, tmax=4):
+    """K11t: fused route + counting-sort + tile_meta worklist for 1 <= B <= 32, E == 128."""
+    global _rt_kernel
+    B = int(logits.shape[0])
+    if B < 1 or B > 32 or logits.shape != (B, 128) or logits.dtype != mx.float32:
+        raise ValueError("route_tile_rows: logits must be (B,128) f32, B in 1..32")
+    if bias.dtype != mx.float32:
+        bias = bias.astype(mx.float32)
+    if _rt_kernel is None:
+        _rt_kernel = mx.fast.metal_kernel(
+            name="moe_route_tile",
+            input_names=["logits", "bias", "eps", "rscale"],
+            output_names=["inds_o", "wts_o", "pair_list", "exp_off", "tile_meta"],
+            source=_ROUTE_TILE_SRC,
+            header=HEADER,
+            ensure_row_contiguous=True,
+        )
+    P = B * 8
+    max_tiles = min(P, (P + (tmax - 1) * 128) // tmax)
+    return list(_rt_kernel(
+        inputs=[logits, bias, scalar(score_eps), scalar(route_scale)],
+        template=[("BB", B), ("BM", tmax), ("MAX_TILES", max_tiles)],
+        grid=(256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, 8), (B, 8), (P,), (129,), (max_tiles,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32, mx.uint32],
+    ))
+
+
+def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
+    xoff_expr = "(pq >> 3)" if is_gu else "pq"
+    if is_gu:
+        dbg_s = (
+            "if constexpr (ROWS == 4) { ((device uint2*)(gu + (size_t)pq * NN + (size_t)out_row))[0] = "
+            "as_type<uint2>(bfloat4(bfloat16_t(gv[0]), bfloat16_t(gv[1]), bfloat16_t(gv[2]), bfloat16_t(gv[3]))); } "
+            "else { for (int r = 0; r < ROWS; r++) gu[(size_t)pq * NN + out_row + r] = bfloat16_t(gv[r]); }"
+            if dbg else ""
+        )
+        emit_code = f"""
+            float gv[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {{
+                U v = simd_sum(res[r]);
+                if constexpr (HGS) gv[r] = float(static_cast<T>(v * inv_scale_enc));
+                else gv[r] = float(static_cast<T>(v));
+            }}
+            if (lane == 0) {{
+                if constexpr (ROWS == 4) {{
+                    bfloat2 ov = bfloat2(
+                        bfloat16_t(glue_swiglu(gv[0], gv[1], {gc}, {uc})),
+                        bfloat16_t(glue_swiglu(gv[2], gv[3], {gc}, {uc})));
+                    ((device uint*)(sw + (size_t)pq * (NN / 2) + (size_t)(out_row / 2)))[0] = as_type<uint>(ov);
+                }} else {{
+                    #pragma unroll
+                    for (int pair = 0; pair < ROWS / 2; pair++) {{
+                        sw[(size_t)pq * (NN / 2) + out_row / 2 + pair] = bfloat16_t(glue_swiglu(gv[2 * pair], gv[2 * pair + 1], {gc}, {uc}));
+                    }}
+                }}
+                {dbg_s}
+            }}"""
+    else:
+        emit_code = """
+            T ov[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                U v = simd_sum(res[r]);
+                if constexpr (HGS) ov[r] = static_cast<T>(v * inv_scale_enc);
+                else ov[r] = static_cast<T>(v);
+            }
+            if (lane == 0) {
+                if constexpr (ROWS == 4) {
+                    ((device uint2*)(down + (size_t)pq * NN + (size_t)out_row))[0] = as_type<uint2>(bfloat4(ov[0], ov[1], ov[2], ov[3]));
+                } else {
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) down[(size_t)pq * NN + out_row + r] = ov[r];
+                }
+            }"""
+
+    def k_step_one():
+        return """
+            if constexpr (VPT == 8) {
+                uint4 x4 = ((const device uint4*)(x + xo + k_off))[0];
+                float4 xf0 = float4(as_type<bfloat4>(x4.xy));
+                float4 xf1 = float4(as_type<bfloat4>(x4.zw));
+                if constexpr (BITS == 4) {
+                    thread uint32_t wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_u32_fp4_8(wr[r], wv);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
+                        res[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
+                    }
+                } else {
+                    thread uint2 wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_u2_fp8_8(wr[r], wv);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
+                        res[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
+                    }
+                }
+            } else if constexpr (VPT == 4) {
+                uint2 x2 = ((const device uint2*)(x + xo + k_off))[0];
+                float4 xf0 = float4(as_type<bfloat4>(x2));
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
+                    res[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
+                }
+            } else {
+                thread U xt[VPT];
+                load_vector<T, U, VPT>(x + xo + k_off, xt);
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
+                    res[r] += dot_vals<BITS, VPT>(xt, wv, sv);
+                }
+            }"""
+
+    def k_step_multi():
+        return """
+            if constexpr (VPT == 8) {
+                thread uint4 x4[TMAX];
+                #pragma unroll
+                for (int t = 0; t < TMAX; t++) {
+                    if (TMAX == 2 || t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
+                }
+                if constexpr (BITS == 4) {
+                    thread uint32_t wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_u32_fp4_8(wr[r], wv);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
+                        #pragma unroll
+                        for (int t = 0; t < TMAX; t++) {
+                            if (TMAX == 2 || t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
+                        }
+                    }
+                } else {
+                    thread uint2 wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_u2_fp8_8(wr[r], wv);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
+                        #pragma unroll
+                        for (int t = 0; t < TMAX; t++) {
+                            if (TMAX == 2 || t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
+                        }
+                    }
+                }
+            } else if constexpr (VPT == 4) {
+                thread uint2 x2[TMAX];
+                #pragma unroll
+                for (int t = 0; t < TMAX; t++) {
+                    if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
+                }
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
+                    #pragma unroll
+                    for (int t = 0; t < TMAX; t++) {
+                        if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                    }
+                }
+            } else {
+                thread T xb[TMAX][VPT];
+                #pragma unroll
+                for (int t = 0; t < TMAX; t++) {
+                    if (t < nb) {
+                        const device T* xp = x + xo[t] + k_off;
+                        for (int i = 0; i < VPT; i++) xb[t][i] = xp[i];
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
+                    #pragma unroll
+                    for (int t = 0; t < TMAX; t++) {
+                        if (t < nb) result[t][r] += dot_vals_bf16<BITS, VPT>(xb[t], wv, sv);
+                    }
+                }
+            }"""
+
+    s_one = k_step_one()
+    s_mul = k_step_multi()
+    return f"""
+    constexpr int PF = 32 / BITS;
+    constexpr int PPT = FAST ? 2 : 1;
+    constexpr int VPT = PF * PPT;
+    constexpr int BLOCK = VPT * 32;
+    constexpr int SSTEP = GS / VPT;
+    constexpr int NFULL = KK / BLOCK;
+    constexpr int TAILK = KK - NFULL * BLOCK;
+    constexpr bool HAS_TAIL = (TAILK > 0);
+    constexpr int in_w = KK * BITS / 8;
+    constexpr int in_g = KK / GS;
+    typedef float U;
+    typedef bfloat16_t T;
+    uint3 tid = threadgroup_position_in_grid;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    const uint tile_id = tid.y;
+    const uint n_blk = tid.z;
+    const uint meta = tile_meta[tile_id];
+    if (meta == 0xFFFFFFFFu) return;
+    const uint e = meta >> 20;
+    const uint mt = meta & 0xFFFFFu;
+    const uint m_base = exp_off[e] + mt * uint(TMAX);
+    const uint m_end = exp_off[e + 1];
+    const int nb = (int)min(uint(TMAX), m_end - m_base);
+    const int out_row = (int)n_blk * (ROWS * NSG) + (int)sg * ROWS;
+    const bool tail_on = HAS_TAIL && ((int)lane * VPT < TAILK);
+
+    const device uint8_t* ws = (const device uint8_t*)w + (long)e * NN * in_w + (long)out_row * in_w + lane * PPT * 4;
+    const device uint8_t* sc = scales + (long)e * NN * in_g + (long)out_row * in_g + lane / SSTEP;
+    float inv_scale_enc = 1.0f;
+    if constexpr (HGS) inv_scale_enc = gsc[e] / (F8E4M3_MAX * F4E2M1_MAX);
+
+    if (nb == 1) {{
+        const uint pq = pair_list[m_base];
+        const long xo = (long)({xoff_expr}) * KK + (long)lane * VPT;
+        thread U res[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) res[r] = 0.0f;
+        for (int it = 0; it < NFULL; it++) {{
+            const uint k_off = (uint)it * (uint)BLOCK;
+{s_one}
+            ws += BLOCK * 4 / PF;
+            sc += BLOCK / GS;
+        }}
+        if constexpr (HAS_TAIL) {{
+            if (tail_on) {{
+                const uint k_off = (uint)NFULL * (uint)BLOCK;
+{s_one}
+            }}
+        }}
+{emit_code}
+    }} else {{
+        uint pqs[TMAX];
+        uint xo[TMAX];
+        #pragma unroll
+        for (int t = 0; t < TMAX; t++) {{
+            if (t < nb) {{
+                uint pq = pair_list[m_base + uint(t)];
+                pqs[t] = pq;
+                xo[t] = (uint)({xoff_expr}) * (uint)KK + lane * (uint)VPT;
+            }} else {{
+                pqs[t] = 0u;
+                xo[t] = 0u;
+            }}
+        }}
+        thread U result[TMAX][ROWS];
+        #pragma unroll
+        for (int t = 0; t < TMAX; t++)
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) result[t][r] = 0.0f;
+        for (int it = 0; it < NFULL; it++) {{
+            const uint k_off = (uint)it * (uint)BLOCK;
+{s_mul}
+            ws += BLOCK * 4 / PF;
+            sc += BLOCK / GS;
+        }}
+        if constexpr (HAS_TAIL) {{
+            if (tail_on) {{
+                const uint k_off = (uint)NFULL * (uint)BLOCK;
+{s_mul}
+            }}
+        }}
+        #pragma unroll
+        for (int t = 0; t < TMAX; t++) {{
+            if (TMAX == 2 || t < nb) {{
+                const uint pq = pqs[t];
+                thread U res[ROWS];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) res[r] = result[t][r];
+{emit_code}
+            }}
+        }}
+    }}
+"""
+
+
+def _tile_cfg(N, B):
+    tmax_env = os.environ.get("MOE_TILE_TMAX")
+    tmax = int(tmax_env) if tmax_env else (2 if B <= 20 else 3)
+    rows = int(os.environ.get("MOE_TILE_ROWS", "4"))
+    nsg_env = os.environ.get("MOE_TILE_NSG")
+    if nsg_env:
+        nsg = int(nsg_env)
+    else:
+        nsg = (8 if (N % (rows * 8) == 0) else 4) if B <= 20 else 4
+    if rows % 2 != 0 or N % (rows * nsg) != 0:
+        rows = 2
+        nsg = 4
+    return tmax, rows, nsg
+
+
 def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, bits, route_scale, gate_softcap,
-                up_softcap, score_eps=1e-20, route="kernel", inds=None, wts=None, grp=None, debug=False, nsg=None, rows=None, w_act=None):
+                up_softcap, score_eps=1e-20, route="kernel", inds=None, wts=None, grp=None, tile=None, debug=False, nsg=None, rows=None, w_act=None):
     """K12. logits (B,128) f32, bias (128,) f32, x (B,K) bf16, expert weights (X,N,K*bits/32) u32 / scales u8 /
     global_scale (X,) or None.
-    route: 'kernel' (routing inside TG), 'launch' (expert_routing first), 'group' (uses precomputed `grp` tuple from
-    route_group_rows or computes it in 1 launch).
+    route: 'kernel' (routing inside TG), 'launch' (expert_routing first), 'group' (route_group_rows), or 'tile'
+    (fused route_tile_rows + tile_meta-sharded grouped QMV for B=1..32).
     Returns [expert_inds (B,8) u32, expert_w (B,8) f32, swiglu (B,8,N/2) bf16 (, gate_up (B,8,N) bf16 if debug)]."""
     B, K = x.shape
-    if B > 16 or x.dtype != mx.bfloat16:
-        raise ValueError("gateup_rows: B <= 16, x bf16")
+    if B > 32 or x.dtype != mx.bfloat16:
+        raise ValueError("gateup_rows: B <= 32, x bf16")
     N, fast = _geom(w, scales, K, mode, group_size, bits)
-    if route not in ("kernel", "launch", "group"):
-        raise ValueError("route must be 'kernel', 'launch', or 'group'")
+    if route not in ("kernel", "launch", "group", "tile"):
+        raise ValueError("route must be 'kernel', 'launch', 'group', or 'tile'")
 
     hgs = global_scale is not None
+    if route == "tile":
+        tmax_t, rows_t, nsg_t = _tile_cfg(N, B)
+        if rows is not None and rows % 2 == 0 and N % (rows * nsg_t) == 0:
+            rows_t = rows
+        if nsg is not None and N % (rows_t * nsg) == 0:
+            nsg_t = nsg
+        wts_arr, inds_arr = wts, inds
+        if tile is None:
+            rt = route_tile_rows(logits, bias, score_eps=score_eps, route_scale=route_scale, tmax=tmax_t)
+            inds_arr, wts_arr = rt[0], rt[1]
+            tile = (rt[2], rt[3], rt[4], tmax_t)
+        pair_list, exp_off, tile_meta, tmax_t = tile
+        max_tiles = int(tile_meta.shape[0])
+        gsc = (global_scale if global_scale.dtype == mx.float32 else global_scale.astype(mx.float32)) if hgs else _ZERO_F32
+        key = ("gu_tile", debug, gate_softcap, up_softcap)
+        k = _kernels.get(key)
+        if k is None:
+            gc, uc = flit(gate_softcap), flit(up_softcap)
+            outs = ["sw"] + (["gu"] if debug else [])
+            k = _kernels[key] = mx.fast.metal_kernel(
+                name="moe_gu_tile_%d_%s_%s" % (debug, gc.replace(".", "p"), uc.replace(".", "p")),
+                input_names=["w", "scales", "gsc", "x", "pair_list", "exp_off", "tile_meta"],
+                output_names=outs,
+                source=_tiled_moe_src(True, debug, gc, uc),
+                header=HEADER,
+                ensure_row_contiguous=True,
+            )
+        shapes = [(B, 8, N // 2)] + ([(B, 8, N)] if debug else [])
+        dts = [mx.bfloat16] + ([mx.bfloat16] if debug else [])
+        outs = list(k(
+            inputs=[w, scales, gsc, x, pair_list, exp_off, tile_meta],
+            template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast),
+                      ("TMAX", tmax_t), ("KK", K), ("NN", N), ("NSG", nsg_t), ("ROWS", rows_t)],
+            grid=(32, nsg_t * max_tiles, N // (rows_t * nsg_t)),
+            threadgroup=(32, nsg_t, 1),
+            output_shapes=shapes,
+            output_dtypes=dts,
+        ))
+        return [inds_arr, wts_arr] + outs
     if MOE_B1_FAST and B == 1 and route == "kernel" and logits.shape[-1] == 128:
         nsg_b1 = nsg or MOE_B1_NSG_GU
         rows_b1 = rows or MOE_B1_ROWS_GU
@@ -2364,25 +2914,25 @@ def _default_conv_anc(W):
 
 
 def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, mode, group_size, bits, debug=False,
-              nsg=None, grp=None, down_mode=None, rows=None, causal=False, conv_anc=None, skip_combine=False, w_act=None):
+              nsg=None, grp=None, tile=None, down_mode=None, rows=None, causal=False, conv_anc=None, skip_combine=False, w_act=None):
     """K13. sw (B,8,K) bf16, inds (B,8) u32, wts (B,8) f32, residual (B,C) f32, cs3 (B,3,C) [or (1,3,C) when causal=True] f32,
     conv_w post-mlp conv weight (C,*,4) bf16, expert weights (X,C,K*bits/32). Returns [out (B,C) bf16, w3 (B,3,C) f32
     (, moe_out (B,C) bf16, post_mlp_conv (B,C) bf16, down (B,8,C) bf16 if debug)]."""
     B, E, K = sw.shape
     C = w.shape[1]
     cs3_ok = (cs3.ndim == 3 and cs3.shape[1:] == (3, C)) if causal else (cs3.shape == (B, 3, C))
-    if B > 16 or E != 8 or sw.dtype != mx.bfloat16 or residual.shape != (B, C) or not cs3_ok:
+    if B > 32 or E != 8 or sw.dtype != mx.bfloat16 or residual.shape != (B, C) or not cs3_ok:
         raise ValueError("down_rows: shapes / dtypes")
     if residual.dtype != mx.float32 or cs3.dtype != mx.float32 or conv_w.dtype != mx.bfloat16 or conv_w.size != C * 4:
         raise ValueError("down_rows: residual/cs3 f32, conv weight bf16 (C,4)")
     N, fast = _geom(w, scales, K, mode, group_size, bits)
-    dm = "split" if (causal or (skip_combine and not debug)) else (down_mode or DOWN_MODE or ("fused" if B == 1 else "split"))
+    dm = "split" if (causal or tile is not None or (skip_combine and not debug)) else (down_mode or DOWN_MODE or ("fused" if B == 1 else "split"))
     hgs = global_scale is not None
     scale_lit = _SCALE_CONV_LIT
     if C % 4 != 0:
         raise ValueError("C % 4")
 
-    if MOE_B1_FAST and not causal and B == 1 and dm == "fused" and grp is None:
+    if MOE_B1_FAST and not causal and B == 1 and dm == "fused" and grp is None and tile is None:
         nsg_b1 = nsg or MOE_B1_NSG_DN
         rows_b1 = rows or MOE_B1_ROWS_DN
         if C % rows_b1 != 0 and C % 4 == 0:
@@ -2421,40 +2971,68 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
     gsc = (global_scale if global_scale.dtype == mx.float32 else global_scale.astype(mx.float32)) if hgs else _ZERO_F32
 
     if dm == "split":
-        has_grp = grp is not None
-        has_wa = (w_act is not None and not has_grp)
-        use_ballot = (B <= 8 and not has_grp and os.environ.get("MOE_BALLOT_SCAN", "1") not in ("0", ""))
-        tmax_dn = _tmax(B, TMAX_CAP_DN)
-        stream_x = _stream_x(tmax_dn)
-        stg_x = _stg_x(tmax_dn)
-        kg = _kernels.get(("dn_gather6", has_grp, has_wa, stg_x, use_ballot))
-        if kg is None:
-            ins_g = ["w", "scales", "gsc", "x"] + (
-                ["num_uniq", "uniq_e", "u_off", "u_cnt", "pair_list"] if has_grp else ["inds"]
-            ) + (["w_act"] if has_wa else [])
-            kg = _kernels[("dn_gather6", has_grp, has_wa, stg_x, use_ballot)] = mx.fast.metal_kernel(
-                name="moe6_down_gather_%d_%d_%d_%d" % (has_grp, int(has_wa), int(stg_x), int(use_ballot)),
-                input_names=ins_g,
-                output_names=["down"],
-                source=_down_gather_src(has_grp, has_w_act=has_wa, has_stg=stg_x, use_ballot=use_ballot),
-                header=HEADER,
-                ensure_row_contiguous=True,
+        if tile is not None:
+            pair_list, exp_off, tile_meta, tmax_t = tile
+            _, rows_t, nsg_t = _tile_cfg(C, B)
+            if rows is not None and C % (rows * nsg_t) == 0:
+                rows_t = rows
+            if nsg is not None and C % (rows_t * nsg) == 0:
+                nsg_t = nsg
+            max_tiles = int(tile_meta.shape[0])
+            kt = _kernels.get("dn_tile")
+            if kt is None:
+                kt = _kernels["dn_tile"] = mx.fast.metal_kernel(
+                    name="moe_dn_tile",
+                    input_names=["w", "scales", "gsc", "x", "pair_list", "exp_off", "tile_meta"],
+                    output_names=["down"],
+                    source=_tiled_moe_src(False, False),
+                    header=HEADER,
+                    ensure_row_contiguous=True,
+                )
+            (down,) = kt(
+                inputs=[w, scales, gsc, sw, pair_list, exp_off, tile_meta],
+                template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast),
+                          ("TMAX", tmax_t), ("KK", K), ("NN", C), ("NSG", nsg_t), ("ROWS", rows_t)],
+                grid=(32, nsg_t * max_tiles, C // (rows_t * nsg_t)),
+                threadgroup=(32, nsg_t, 1),
+                output_shapes=[(B, 8, C)],
+                output_dtypes=[mx.bfloat16],
             )
-        if has_grp:
-            num_uniq, uniq_e, u_off, u_cnt, pair_list = grp
-            args_g = [w, scales, gsc, sw, num_uniq, uniq_e, u_off, u_cnt, pair_list]
         else:
-            args_g = [w, scales, gsc, sw, inds.astype(mx.uint32)] + ([w_act.reshape(-1)] if has_wa else [])
-        (down,) = kg(
-            inputs=args_g,
-            template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast), ("TMAX", tmax_dn),
-                      ("STREAM_X", stream_x), ("STG_X", stg_x),
-                      ("KK", K), ("NN", C), ("BB", B), ("NSG", nsg), ("ROWS", rows)],
-            grid=(32, nsg * (C // (rows * nsg)), B * 8),
-            threadgroup=(32, nsg, 1),
-            output_shapes=[(B, 8, C)],
-            output_dtypes=[mx.bfloat16],
-        )
+            has_grp = grp is not None
+            has_wa = (w_act is not None and not has_grp)
+            use_ballot = (B <= 8 and not has_grp and os.environ.get("MOE_BALLOT_SCAN", "1") not in ("0", ""))
+            tmax_dn = _tmax(B, TMAX_CAP_DN)
+            stream_x = _stream_x(tmax_dn)
+            stg_x = _stg_x(tmax_dn)
+            kg = _kernels.get(("dn_gather6", has_grp, has_wa, stg_x, use_ballot))
+            if kg is None:
+                ins_g = ["w", "scales", "gsc", "x"] + (
+                    ["num_uniq", "uniq_e", "u_off", "u_cnt", "pair_list"] if has_grp else ["inds"]
+                ) + (["w_act"] if has_wa else [])
+                kg = _kernels[("dn_gather6", has_grp, has_wa, stg_x, use_ballot)] = mx.fast.metal_kernel(
+                    name="moe6_down_gather_%d_%d_%d_%d" % (has_grp, int(has_wa), int(stg_x), int(use_ballot)),
+                    input_names=ins_g,
+                    output_names=["down"],
+                    source=_down_gather_src(has_grp, has_w_act=has_wa, has_stg=stg_x, use_ballot=use_ballot),
+                    header=HEADER,
+                    ensure_row_contiguous=True,
+                )
+            if has_grp:
+                num_uniq, uniq_e, u_off, u_cnt, pair_list = grp
+                args_g = [w, scales, gsc, sw, num_uniq, uniq_e, u_off, u_cnt, pair_list]
+            else:
+                args_g = [w, scales, gsc, sw, inds.astype(mx.uint32)] + ([w_act.reshape(-1)] if has_wa else [])
+            (down,) = kg(
+                inputs=args_g,
+                template=[("GS", group_size), ("BITS", bits), ("HGS", hgs), ("FAST", fast), ("TMAX", tmax_dn),
+                          ("STREAM_X", stream_x), ("STG_X", stg_x),
+                          ("KK", K), ("NN", C), ("BB", B), ("NSG", nsg), ("ROWS", rows)],
+                grid=(32, nsg * (C // (rows * nsg)), B * 8),
+                threadgroup=(32, nsg, 1),
+                output_shapes=[(B, 8, C)],
+                output_dtypes=[mx.bfloat16],
+            )
         if causal:
             if skip_combine and not debug:
                 return [down]
@@ -2556,27 +3134,41 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
         gu, dn, act = ex.gate_up_proj, ex.down_proj, ex.act_fn
         cw = layer.post_mlp_convolution.conv1d.weight
     B = int(mlp_mixed[0].shape[0]) if mlp_mixed is not None else x.shape[0]
-    rows_gu = 2 if (2 <= B <= 16 and "MOE_ROWS_GU" not in os.environ) else None
-    rows_dn = 2 if (2 <= B <= 16 and "MOE_ROWS_DN" not in os.environ) else None
+    w_gate = gate["weight"]
+    bias = gate["e_score_correction_bias"]
+    rscale = gate.routed_scaling_factor
+    tile_min_b = int(os.environ.get("MOE_TILE_MIN_B", "9"))
     if w_act is not None:
         assert causal and B > 1
         route = "launch"
     elif route == "auto":
         if "MOE_AUTO_ROUTE" in os.environ:
             route = AUTO_ROUTE if (B > 1 or causal) else "kernel"
+        elif B >= tile_min_b and w_gate.shape[0] == 128:
+            route = "tile"
         else:
             route = "kernel" if (B <= 2 and not causal) else AUTO_ROUTE
     if B > 8 and route == "group":
-        route = "launch"
+        route = "tile" if w_gate.shape[0] == 128 else "launch"
+    rows_gu = 2 if (route != "tile" and 2 <= B <= 32 and "MOE_ROWS_GU" not in os.environ) else None
+    rows_dn = 2 if (route != "tile" and 2 <= B <= 32 and "MOE_ROWS_DN" not in os.environ) else None
 
-    w_gate = gate["weight"]
-    bias = gate["e_score_correction_bias"]
-    rscale = gate.routed_scaling_factor
     grp = None
+    tile = None
     if mlp_mixed is not None:
         m_mix, m_part, m_lw, m_eps = mlp_mixed
         logits, x = router_from_mixed_rows(m_mix, m_part, m_lw, w_gate, eps_ln=m_eps)
-        if route == "group":
+        if route == "tile":
+            tmax_t, _, _ = _tile_cfg(gu["weight"].shape[1], B)
+            rt = route_tile_rows(logits, bias, route_scale=rscale, tmax=tmax_t)
+            inds_arr, wts_arr = rt[0], rt[1]
+            tile = (rt[2], rt[3], rt[4], tmax_t)
+            r = gateup_rows(logits, bias, x, gu["weight"], gu["scales"], gu.get("global_scale"),
+                            mode=gu.mode, group_size=gu.group_size, bits=gu.bits, route_scale=rscale,
+                            gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route="tile", inds=inds_arr, wts=wts_arr,
+                            tile=tile, debug=debug, rows=rows_gu)
+            inds, wts, sw = inds_arr, wts_arr, r[2]
+        elif route == "group":
             rg = route_group_rows(logits, bias, route_scale=rscale)
             inds_arr, wts_arr = rg[0], rg[1]
             grp = rg[2:]
@@ -2591,6 +3183,17 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
                             gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route=route, debug=debug,
                             rows=rows_gu, w_act=w_act)
             inds, wts, sw = r[0], r[1], r[2]
+    elif route == "tile":
+        logits = router_rows(x, w_gate)
+        tmax_t, _, _ = _tile_cfg(gu["weight"].shape[1], B)
+        rt = route_tile_rows(logits, bias, route_scale=rscale, tmax=tmax_t)
+        inds_arr, wts_arr = rt[0], rt[1]
+        tile = (rt[2], rt[3], rt[4], tmax_t)
+        r = gateup_rows(logits, bias, x, gu["weight"], gu["scales"], gu.get("global_scale"),
+                        mode=gu.mode, group_size=gu.group_size, bits=gu.bits, route_scale=rscale,
+                        gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route="tile", inds=inds_arr, wts=wts_arr,
+                        tile=tile, debug=debug, rows=rows_gu)
+        inds, wts, sw = inds_arr, wts_arr, r[2]
     elif route == "group":
         logits = router_rows(x, w_gate)
         rg = route_group_rows(logits, bias, route_scale=rscale)
@@ -2625,7 +3228,7 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
 
     o = down_rows(sw, inds, wts, residual, cs3, cw, dn["weight"], dn["scales"],
                   dn.get("global_scale"), mode=dn.mode, group_size=dn.group_size, bits=dn.bits, debug=debug, grp=grp,
-                  causal=causal, conv_anc=conv_anc, skip_combine=skip_combine, rows=rows_dn, w_act=w_act)
+                  tile=tile, causal=causal, conv_anc=conv_anc, skip_combine=skip_combine, rows=rows_dn, w_act=w_act)
     if skip_combine and not debug and len(o) == 1:
         return dict(router_logits=logits, expert_inds=inds, expert_w=wts, swiglu=sw, down=o[0], residual=residual, cs3=cs3, conv_w=cw)
     res = dict(router_logits=logits, expert_inds=inds, expert_w=wts, swiglu=sw, out=o[0], w3=o[1])

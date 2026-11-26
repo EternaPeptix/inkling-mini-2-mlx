@@ -569,6 +569,8 @@ class DFlash2Drafter:
             }
             self.layers.append(lw)
             to_eval.extend(lw.values())
+        del w, q_w, k_w, v_w, g_w, u_w, qkv_w, kv_w, gu_w
+        mx.clear_cache()
 
         self.target = target
         self._mask_emb = target.model.language_model.embed(mx.array([[self.mask_id]], mx.int32))[0]  # (1, H)
@@ -589,6 +591,7 @@ class DFlash2Drafter:
                 lm["weight"], scales=lm["scales"], biases=lm["biases"], group_size=64, bits=8, mode="affine"
             )[: self._unpadded_vocab]
             wq4, sc4, bi4 = mx.quantize(w8_f, group_size=64, bits=4, mode="affine")
+            del w8_f
             self._lm_q4 = (wq4, sc4, bi4)
             to_eval.extend([wq4, sc4, bi4])
         self._df_pre_rope, self._df_post_attn = _get_df_compiled(
@@ -596,6 +599,7 @@ class DFlash2Drafter:
         )
         to_eval.extend([self._mask_emb, self._mask_7])
         mx.eval(*to_eval)
+        mx.clear_cache()
 
         self.ck: list[mx.array | None] = [None] * self.nl
         self.cv: list[mx.array | None] = [None] * self.nl

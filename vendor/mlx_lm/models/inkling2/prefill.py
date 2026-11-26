@@ -1690,85 +1690,298 @@ _DEPTH_ATTN_RMS_SRC = r"""
     uint lid = thread_position_in_threadgroup.x;
     uint lane = lid & 31;
     uint sg = lid >> 5;
-    uint c = lid * 4;
-    threadgroup float buf[N][32];
+    threadgroup float buf[N][16];
     threadgroup float nr_s[D];
     if (PRE_UNW_RMS) {
         GL_NOFMA
-        bfloat4 hv = as_type<bfloat4>(((const device uint2*)(h + (size_t)row * D + c))[0]);
-        float h0 = float(hv.x), h1 = float(hv.y), h2 = float(hv.z), h3 = float(hv.w);
-        float racc = 0.0f;
-        racc = fma(h0, h0, racc); racc = fma(h1, h1, racc);
-        racc = fma(h2, h2, racc); racc = fma(h3, h3, racc);
-        racc = simd_sum(racc);
-        if (lane == 0) buf[0][sg] = racc;
+        uint c0 = (sg * 2 * 32 + lane) * 4;
+        uint c1 = ((sg * 2 + 1) * 32 + lane) * 4;
+        float4 p0 = float4(as_type<bfloat4>(((const device uint2*)(h + (size_t)row * D + c0))[0]));
+        float4 p1 = float4(as_type<bfloat4>(((const device uint2*)(h + (size_t)row * D + c1))[0]));
+        float r0 = 0.0f, r1 = 0.0f;
+        r0 = fma(p0.x, p0.x, r0); r0 = fma(p0.y, p0.y, r0); r0 = fma(p0.z, p0.z, r0); r0 = fma(p0.w, p0.w, r0);
+        r1 = fma(p1.x, p1.x, r1); r1 = fma(p1.y, p1.y, r1); r1 = fma(p1.z, p1.z, r1); r1 = fma(p1.w, p1.w, r1);
+        r0 = simd_sum(r0); r1 = simd_sum(r1);
+        if (lane == 0) { nr_s[sg * 2] = r0; nr_s[sg * 2 + 1] = r1; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float inv0 = metal::precise::rsqrt(simd_sum(lane < 18u ? buf[0][lane] : 0.0f) / float(D) + 1e-6f);
-        float4 p(h0 * inv0, h1 * inv0, h2 * inv0, h3 * inv0);
-        ((threadgroup float4*)(nr_s + c))[0] = p;
-        if (OUT_NR) ((device float4*)(nr_out + (size_t)row * D + c))[0] = p;
+        float inv0 = metal::precise::rsqrt(simd_sum(lane < 18u ? nr_s[lane] : 0.0f) / float(D) + 1e-6f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        p0 *= inv0; p1 *= inv0;
+        ((threadgroup float4*)(nr_s + c0))[0] = p0;
+        ((threadgroup float4*)(nr_s + c1))[0] = p1;
+        if (OUT_NR) {
+            ((device float4*)(nr_out + (size_t)row * D + c0))[0] = p0;
+            ((device float4*)(nr_out + (size_t)row * D + c1))[0] = p1;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    float acc[N];
+    for (int i = 0; i < N; i++) acc[i] = 0.0f;
     float xc[8][N];
-    if (lid < 288) {
-        float acc[N];
-        for (int i = 0; i < N; i++) acc[i] = 0.0f;
-        int it_idx = 0;
-        for (int d = lid; d < D; d += 288, it_idx++) {
-            for (int i = 0; i < K; i++) xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
-            xc[it_idx][K] = PRE_UNW_RMS ? nr_s[d] : part_in[size_t(row) * D + d];
-            float qv = queries[d];
-            for (int i = 0; i < N; i++) acc[i] = fma(xc[it_idx][i], qv, acc[i]);
-        }
-        for (int i = 0; i < N; i++) {
-            float v = simd_sum(acc[i]);
-            if (lane == 0) buf[i][sg] = v;
-        }
+    int it_idx = 0;
+    for (int d = lid; d < D; d += 288, it_idx++) {
+        for (int i = 0; i < K; i++) xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
+        xc[it_idx][K] = PRE_UNW_RMS ? nr_s[d] : part_in[size_t(row) * D + d];
+        float qv = queries[d];
+        for (int i = 0; i < N; i++) acc[i] = fma(xc[it_idx][i], qv, acc[i]);
+    }
+    for (int i = 0; i < N; i++) {
+        float v = simd_sum(acc[i]);
+        if (lane == 0) buf[i][sg] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 288) {
-        float w[N];
-        for (int i = 0; i < N; i++) {
-            float t = 0.0f;
-            for (int s = 0; s < 9; s++) t += buf[i][s];
-            w[i] = t * scale[0];
-        }
-        float m = -INFINITY;
-        for (int i = 0; i < N; i++) m = max(m, w[i]);
-        float z = 0.0f;
-        for (int i = 0; i < N; i++) { w[i] = metal::exp(w[i] - m); z += w[i]; }
-        for (int i = 0; i < N; i++) w[i] /= z;
-        int it_idx = 0;
-        for (int d = lid; d < D; d += 288, it_idx++) {
-            float o = 0.0f;
-            for (int i = 0; i < N; i++) o = fma(w[i], xc[it_idx][i], o);
-            nr_s[d] = o;
-        }
+    float w[N];
+    for (int i = 0; i < N; i++) {
+        float tv = 0.0f;
+        for (int s = 0; s < 9; s++) tv += buf[i][s];
+        w[i] = tv * scale[0];
+    }
+    float m = -INFINITY;
+    for (int i = 0; i < N; i++) m = max(m, w[i]);
+    float z = 0.0f;
+    for (int i = 0; i < N; i++) { w[i] = metal::exp(w[i] - m); z += w[i]; }
+    for (int i = 0; i < N; i++) w[i] /= z;
+    it_idx = 0;
+    for (int d = lid; d < D; d += 288, it_idx++) {
+        float o = 0.0f;
+        for (int i = 0; i < N; i++) o = fma(w[i], xc[it_idx][i], o);
+        nr_s[d] = o;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
         GL_NOFMA
-        float4 xv = ((threadgroup float4*)(nr_s + c))[0];
-        float acc2 = 0.0f;
-        acc2 = fma(xv.x, xv.x, acc2); acc2 = fma(xv.y, xv.y, acc2);
-        acc2 = fma(xv.z, xv.z, acc2); acc2 = fma(xv.w, xv.w, acc2);
-        acc2 = simd_sum(acc2);
-        if (lane == 0) buf[0][sg] = acc2;
+        uint c0 = (sg * 2 * 32 + lane) * 4;
+        uint c1 = ((sg * 2 + 1) * 32 + lane) * 4;
+        float4 xv0 = ((threadgroup float4*)(nr_s + c0))[0];
+        float4 xv1 = ((threadgroup float4*)(nr_s + c1))[0];
+        float r0 = 0.0f, r1 = 0.0f;
+        r0 = fma(xv0.x, xv0.x, r0); r0 = fma(xv0.y, xv0.y, r0); r0 = fma(xv0.z, xv0.z, r0); r0 = fma(xv0.w, xv0.w, r0);
+        r1 = fma(xv1.x, xv1.x, r1); r1 = fma(xv1.y, xv1.y, r1); r1 = fma(xv1.z, xv1.z, r1); r1 = fma(xv1.w, xv1.w, r1);
+        r0 = simd_sum(r0); r1 = simd_sum(r1);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float inv2 = metal::precise::rsqrt(simd_sum(lane < 18u ? buf[0][lane] : 0.0f) / float(D) + eps[0]);
-        bfloat4 wv = as_type<bfloat4>(((const device uint2*)(nw + c))[0]);
-        bfloat4 ov = bfloat4(
-            bfloat16_t(glue_rms_apply<float>(xv.x, inv2, wv.x)),
-            bfloat16_t(glue_rms_apply<float>(xv.y, inv2, wv.y)),
-            bfloat16_t(glue_rms_apply<float>(xv.z, inv2, wv.z)),
-            bfloat16_t(glue_rms_apply<float>(xv.w, inv2, wv.w)));
-        ((device uint2*)(out + (size_t)row * D + c))[0] = as_type<uint2>(ov);
+        if (lane == 0) { nr_s[sg * 2] = r0; nr_s[sg * 2 + 1] = r1; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv2 = metal::precise::rsqrt(simd_sum(lane < 18u ? nr_s[lane] : 0.0f) / float(D) + eps[0]);
+        bfloat4 wv0 = as_type<bfloat4>(((const device uint2*)(nw + c0))[0]);
+        bfloat4 wv1 = as_type<bfloat4>(((const device uint2*)(nw + c1))[0]);
+        bfloat4 ov0(
+            bfloat16_t(glue_rms_apply<float>(xv0.x, inv2, wv0.x)),
+            bfloat16_t(glue_rms_apply<float>(xv0.y, inv2, wv0.y)),
+            bfloat16_t(glue_rms_apply<float>(xv0.z, inv2, wv0.z)),
+            bfloat16_t(glue_rms_apply<float>(xv0.w, inv2, wv0.w)));
+        bfloat4 ov1(
+            bfloat16_t(glue_rms_apply<float>(xv1.x, inv2, wv1.x)),
+            bfloat16_t(glue_rms_apply<float>(xv1.y, inv2, wv1.y)),
+            bfloat16_t(glue_rms_apply<float>(xv1.z, inv2, wv1.z)),
+            bfloat16_t(glue_rms_apply<float>(xv1.w, inv2, wv1.w)));
+        ((device uint2*)(out + (size_t)row * D + c0))[0] = as_type<uint2>(ov0);
+        ((device uint2*)(out + (size_t)row * D + c1))[0] = as_type<uint2>(ov1);
     }
+"""
+
+_URMS_DA_F32_SRC = r"""
+    constexpr int N = K + 1;
+    uint row = threadgroup_position_in_grid.x;
+    uint rows = threadgroups_per_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint lane = lid & 31;
+    uint sg = lid >> 5;
+    threadgroup float buf[N * Q][16];
+    threadgroup float nr_s[D];
+    {
+        GL_NOFMA
+        uint c0 = (sg * 2 * 32 + lane) * 4;
+        uint c1 = ((sg * 2 + 1) * 32 + lane) * 4;
+        float4 p0 = float4(as_type<bfloat4>(((const device uint2*)(h + (size_t)row * D + c0))[0]));
+        float4 p1 = float4(as_type<bfloat4>(((const device uint2*)(h + (size_t)row * D + c1))[0]));
+        float r0 = 0.0f, r1 = 0.0f;
+        r0 = fma(p0.x, p0.x, r0); r0 = fma(p0.y, p0.y, r0); r0 = fma(p0.z, p0.z, r0); r0 = fma(p0.w, p0.w, r0);
+        r1 = fma(p1.x, p1.x, r1); r1 = fma(p1.y, p1.y, r1); r1 = fma(p1.z, p1.z, r1); r1 = fma(p1.w, p1.w, r1);
+        r0 = simd_sum(r0); r1 = simd_sum(r1);
+        if (lane == 0) { nr_s[sg * 2] = r0; nr_s[sg * 2 + 1] = r1; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv0 = metal::precise::rsqrt(simd_sum(lane < 18u ? nr_s[lane] : 0.0f) / float(D) + 1e-6f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        p0 *= inv0; p1 *= inv0;
+        ((threadgroup float4*)(nr_s + c0))[0] = p0;
+        ((threadgroup float4*)(nr_s + c1))[0] = p1;
+        if (OUT_NR) {
+            ((device float4*)(nr_out + (size_t)row * D + c0))[0] = p0;
+            ((device float4*)(nr_out + (size_t)row * D + c1))[0] = p1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float acc[N * Q];
+    for (int i = 0; i < N * Q; i++) acc[i] = 0.0f;
+    float xc[8][N];
+    int it_idx = 0;
+    for (int d = lid; d < D; d += 288, it_idx++) {
+        for (int i = 0; i < K; i++) xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
+        xc[it_idx][K] = nr_s[d];
+        for (int j = 0; j < Q; j++) {
+            float qv = queries[j * D + d];
+            for (int i = 0; i < N; i++) acc[i * Q + j] += xc[it_idx][i] * qv;
+        }
+    }
+    for (int i = 0; i < N * Q; i++) {
+        float v = simd_sum(acc[i]);
+        if (lane == 0) buf[i][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float w[N * Q];
+    for (int i = 0; i < N * Q; i++) {
+        float tv = 0.0f;
+        for (int s = 0; s < 9; s++) tv += buf[i][s];
+        w[i] = tv * scale[0];
+    }
+    for (int j = 0; j < Q; j++) {
+        float m = -INFINITY;
+        for (int i = 0; i < N; i++) m = max(m, w[i * Q + j]);
+        float z = 0.0f;
+        for (int i = 0; i < N; i++) { w[i * Q + j] = metal::exp(w[i * Q + j] - m); z += w[i * Q + j]; }
+        for (int i = 0; i < N; i++) w[i * Q + j] /= z;
+    }
+    it_idx = 0;
+    for (int d = lid; d < D; d += 288, it_idx++) {
+        for (int j = 0; j < Q; j++) {
+            float o = 0.0f;
+            for (int i = 0; i < N; i++) o += w[i * Q + j] * xc[it_idx][i];
+            out[(size_t(row) * Q + j) * D + d] = o;
+        }
+    }
+"""
+
+_SC_ATTN_DA_SRC = f"""
+    constexpr int N = K + 1;
+    uint row = threadgroup_position_in_grid.x;
+    uint rows = threadgroups_per_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint lane = lid & 31;
+    uint sg = lid >> 5;
+    uint b = row / LL;
+    uint t = row % LL;
+    threadgroup float buf[N][16];
+    threadgroup float nr_s[D];
+    {{
+        GL_NOFMA
+        auto conv_chunk = [&](uint c) -> float4 {{
+            float4 w0, w1, w2, w3;
+            for (uint k = 0; k < 4; k++) {{
+                const device bfloat16_t* cp = cw + (c + k) * 4;
+                w0[k] = float(cp[0]); w1[k] = float(cp[1]); w2[k] = float(cp[2]); w3[k] = float(cp[3]);
+            }}
+            auto tap4 = [&](int p) -> float4 {{
+                if (p >= 0) return float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * D + c))[0]));
+                int sidx = 3 + p;
+                if (!HAS_CS) return float4(0.0f);
+                return float4(bfloat4(((const device float4*)(cs + ((size_t)b * 3 + sidx) * D + c))[0]));
+            }};
+            float4 s0 = tap4(int(t) - 3), s1 = tap4(int(t) - 2), s2 = tap4(int(t) - 1);
+            size_t off = (size_t)row * D + c;
+            float4 x3 = float4(as_type<bfloat4>(((const device uint2*)(x + off))[0]));
+            float4 acc = float4(0.0f);
+            acc = fma(w0, s0, acc); acc = fma(w1, s1, acc); acc = fma(w2, s2, acc); acc = fma(w3, x3, acc);
+            float4 conv = float4(bfloat4(acc));
+            float4 y = float4(bfloat4((conv + x3) / {_S5_LIT}));
+            float4 rv = ADD_RES ? (float4(as_type<bfloat4>(((const device uint2*)(bres + off))[0])) + y) : y;
+            ((device float4*)(res_out + off))[0] = rv;
+            if (t == 0) {{
+                for (int r = 0; r < 3; r++) {{
+                    int p = int(LL) - 3 + r;
+                    float4 v = (p >= 0)
+                        ? float4(as_type<bfloat4>(((const device uint2*)(x + ((size_t)b * LL + p) * D + c))[0]))
+                        : (HAS_CS ? ((const device float4*)(cs + ((size_t)b * 3 + (3 + p)) * D + c))[0] : float4(0.0f));
+                    ((device float4*)(ncs + ((size_t)b * 3 + r) * D + c))[0] = v;
+                }}
+            }}
+            return rv;
+        }};
+        uint c0 = (sg * 2 * 32 + lane) * 4;
+        uint c1 = ((sg * 2 + 1) * 32 + lane) * 4;
+        float4 rv0 = conv_chunk(c0);
+        float4 rv1 = conv_chunk(c1);
+        float r0 = 0.0f, r1 = 0.0f;
+        r0 = fma(rv0.x, rv0.x, r0); r0 = fma(rv0.y, rv0.y, r0); r0 = fma(rv0.z, rv0.z, r0); r0 = fma(rv0.w, rv0.w, r0);
+        r1 = fma(rv1.x, rv1.x, r1); r1 = fma(rv1.y, rv1.y, r1); r1 = fma(rv1.z, rv1.z, r1); r1 = fma(rv1.w, rv1.w, r1);
+        r0 = simd_sum(r0); r1 = simd_sum(r1);
+        if (lane == 0) {{ nr_s[sg * 2] = r0; nr_s[sg * 2 + 1] = r1; }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv0 = metal::precise::rsqrt(simd_sum(lane < 18u ? nr_s[lane] : 0.0f) / float(D) + 1e-6f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ((threadgroup float4*)(nr_s + c0))[0] = rv0 * inv0;
+        ((threadgroup float4*)(nr_s + c1))[0] = rv1 * inv0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    float acc[N];
+    for (int i = 0; i < N; i++) acc[i] = 0.0f;
+    float xc[8][N];
+    int it_idx = 0;
+    for (int d = lid; d < D; d += 288, it_idx++) {{
+        for (int i = 0; i < K; i++) xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
+        xc[it_idx][K] = nr_s[d];
+        float qv = queries[d];
+        for (int i = 0; i < N; i++) acc[i] = fma(xc[it_idx][i], qv, acc[i]);
+    }}
+    for (int i = 0; i < N; i++) {{
+        float v = simd_sum(acc[i]);
+        if (lane == 0) buf[i][sg] = v;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float w[N];
+    for (int i = 0; i < N; i++) {{
+        float tv = 0.0f;
+        for (int s = 0; s < 9; s++) tv += buf[i][s];
+        w[i] = tv * scale[0];
+    }}
+    float m = -INFINITY;
+    for (int i = 0; i < N; i++) m = max(m, w[i]);
+    float z = 0.0f;
+    for (int i = 0; i < N; i++) {{ w[i] = metal::exp(w[i] - m); z += w[i]; }}
+    for (int i = 0; i < N; i++) w[i] /= z;
+    it_idx = 0;
+    for (int d = lid; d < D; d += 288, it_idx++) {{
+        float o = 0.0f;
+        for (int i = 0; i < N; i++) o = fma(w[i], xc[it_idx][i], o);
+        if constexpr (DO_RMS) nr_s[d] = o;
+        else out_f32[(size_t)row * D + d] = o;
+    }}
+    if constexpr (DO_RMS) {{
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {{
+            GL_NOFMA
+            uint c0 = (sg * 2 * 32 + lane) * 4;
+            uint c1 = ((sg * 2 + 1) * 32 + lane) * 4;
+            float4 xv0 = ((threadgroup float4*)(nr_s + c0))[0];
+            float4 xv1 = ((threadgroup float4*)(nr_s + c1))[0];
+            float r0 = 0.0f, r1 = 0.0f;
+            r0 = fma(xv0.x, xv0.x, r0); r0 = fma(xv0.y, xv0.y, r0); r0 = fma(xv0.z, xv0.z, r0); r0 = fma(xv0.w, xv0.w, r0);
+            r1 = fma(xv1.x, xv1.x, r1); r1 = fma(xv1.y, xv1.y, r1); r1 = fma(xv1.z, xv1.z, r1); r1 = fma(xv1.w, xv1.w, r1);
+            r0 = simd_sum(r0); r1 = simd_sum(r1);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {{ nr_s[sg * 2] = r0; nr_s[sg * 2 + 1] = r1; }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv2 = metal::precise::rsqrt(simd_sum(lane < 18u ? nr_s[lane] : 0.0f) / float(D) + eps[0]);
+            bfloat4 wv0 = as_type<bfloat4>(((const device uint2*)(nw + c0))[0]);
+            bfloat4 wv1 = as_type<bfloat4>(((const device uint2*)(nw + c1))[0]);
+            bfloat4 ov0(
+                bfloat16_t(glue_rms_apply<float>(xv0.x, inv2, wv0.x)),
+                bfloat16_t(glue_rms_apply<float>(xv0.y, inv2, wv0.y)),
+                bfloat16_t(glue_rms_apply<float>(xv0.z, inv2, wv0.z)),
+                bfloat16_t(glue_rms_apply<float>(xv0.w, inv2, wv0.w)));
+            bfloat4 ov1(
+                bfloat16_t(glue_rms_apply<float>(xv1.x, inv2, wv1.x)),
+                bfloat16_t(glue_rms_apply<float>(xv1.y, inv2, wv1.y)),
+                bfloat16_t(glue_rms_apply<float>(xv1.z, inv2, wv1.z)),
+                bfloat16_t(glue_rms_apply<float>(xv1.w, inv2, wv1.w)));
+            ((device uint2*)(out_bf16 + (size_t)row * D + c0))[0] = as_type<uint2>(ov0);
+            ((device uint2*)(out_bf16 + (size_t)row * D + c1))[0] = as_type<uint2>(ov1);
+        }}
+    }}
 """
 
 
 def unw_rms_depth_attn_rms_bf16(h: mx.array, blocks: mx.array, query: mx.array, ln, *, need_nr: bool):
-    """Fused unweighted_rms_norm(h.f32) + attention_input(blocks, nr) + rms_norm_f32_bf16."""
+    """Fused unweighted_rms_norm(h.f32) + attention_input(blocks, nr) + rms_norm_f32_bf16 (TG=288)."""
     B, L, D = h.shape
     assert D == _D
     sc = _PARAMS_CACHE.get(("da_sc", D))
@@ -1783,16 +1996,89 @@ def unw_rms_depth_attn_rms_bf16(h: mx.array, blocks: mx.array, query: mx.array, 
     out, nr_out = k(
         inputs=[h, _DUMMY_F32, blocks, query.reshape(-1), sc, ln.weight, _get_eps(ln.eps)],
         template=[("K", blocks.shape[0]), ("D", D), ("PRE_UNW_RMS", 1), ("OUT_NR", int(need_nr))],
-        grid=(B * L * _TG_RMS, 1, 1),
-        threadgroup=(_TG_RMS, 1, 1),
+        grid=(B * L * 288, 1, 1),
+        threadgroup=(288, 1, 1),
         output_shapes=[(B, L, D), (B, L, D) if need_nr else (1,)],
         output_dtypes=[mx.bfloat16, mx.float32],
     )
     return out, (nr_out if need_nr else None)
 
 
+def unw_rms_depth_attn_f32(h: mx.array, blocks: mx.array, query: mx.array, *, need_nr: bool):
+    """Fused unweighted_rms_norm(h.f32) + attention_input(blocks, nr) -> ((B, L, Q, D) f32, nr_out)."""
+    B, L, D = h.shape
+    assert D == _D
+    q2 = query.reshape(-1, D)
+    Q = q2.shape[0]
+    sc = _PARAMS_CACHE.get(("da_sc", D))
+    if sc is None:
+        sc = _PARAMS_CACHE[("da_sc", D)] = mx.array([D ** -0.5], dtype=mx.float32)
+    k = _k(
+        "pf_urms_da_f32",
+        ("h", "blocks", "queries", "scale"),
+        ("out", "nr_out"),
+        _URMS_DA_F32_SRC,
+    )
+    out, nr_out = k(
+        inputs=[h, blocks, q2, sc],
+        template=[("K", blocks.shape[0]), ("D", D), ("Q", Q), ("OUT_NR", int(need_nr))],
+        grid=(B * L * 288, 1, 1),
+        threadgroup=(288, 1, 1),
+        output_shapes=[(B, L, Q, D), (B, L, D) if need_nr else (1,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return out, (nr_out if need_nr else None)
+
+
+def short_conv_attn_depth_attn(
+    x: mx.array,
+    conv_state: mx.array | None,
+    weight: mx.array,
+    block_residual: mx.array | None,
+    blocks: mx.array,
+    query: mx.array,
+    ln=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Fused post_attn_conv + residual + unw_rms + mlp_input [+ post_attn_ln when ln is not None] (TG=288)."""
+    B, L, D = x.shape
+    assert D == _D
+    has_cs = int(conv_state is not None)
+    add_res = int(block_residual is not None)
+    do_rms = int(ln is not None)
+    cs_in = conv_state if conv_state is not None else _DUMMY_F32
+    br_in = block_residual if block_residual is not None else _DUMMY_BF16
+    nw_in = ln.weight if ln is not None else _DUMMY_BF16
+    eps_in = _get_eps(ln.eps) if ln is not None else _DUMMY_F32
+    sc = _PARAMS_CACHE.get(("da_sc", D))
+    if sc is None:
+        sc = _PARAMS_CACHE[("da_sc", D)] = mx.array([D ** -0.5], dtype=mx.float32)
+    k = _k(
+        "pf_sc_attn_da",
+        ("x", "cs", "cw", "bres", "blocks", "queries", "scale", "nw", "eps"),
+        ("res_out", "ncs", "out_bf16", "out_f32"),
+        _SC_ATTN_DA_SRC,
+    )
+    res_out, ncs, out_bf16, out_f32 = k(
+        inputs=[x, cs_in, weight, br_in, blocks, query.reshape(-1), sc, nw_in, eps_in],
+        template=[
+            ("K", blocks.shape[0]), ("D", D), ("LL", L),
+            ("HAS_CS", has_cs), ("ADD_RES", add_res), ("DO_RMS", do_rms),
+        ],
+        grid=(B * L * 288, 1, 1),
+        threadgroup=(288, 1, 1),
+        output_shapes=[
+            (B, L, D),
+            (B, 3, D),
+            (B, L, D) if do_rms else (1,),
+            (1,) if do_rms else (B, L, D),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.bfloat16, mx.float32],
+    )
+    return res_out, (out_bf16 if do_rms else out_f32), ncs
+
+
 def depth_attn_rms_bf16(blocks: mx.array, partial: mx.array, query: mx.array, ln) -> mx.array:
-    """Fused mlp_input(blocks, partial) + rms_norm_f32_bf16 -> (B, L, D) bf16."""
+    """Fused mlp_input(blocks, partial) + rms_norm_f32_bf16 -> (B, L, D) bf16 (TG=288)."""
     B, L, D = partial.shape
     assert D == _D
     sc = _PARAMS_CACHE.get(("da_sc", D))
@@ -1807,8 +2093,8 @@ def depth_attn_rms_bf16(blocks: mx.array, partial: mx.array, query: mx.array, ln
     return k(
         inputs=[_DUMMY_BF16, partial, blocks, query.reshape(-1), sc, ln.weight, _get_eps(ln.eps)],
         template=[("K", blocks.shape[0]), ("D", D), ("PRE_UNW_RMS", 0), ("OUT_NR", 0)],
-        grid=(B * L * _TG_RMS, 1, 1),
-        threadgroup=(_TG_RMS, 1, 1),
+        grid=(B * L * 288, 1, 1),
+        threadgroup=(288, 1, 1),
         output_shapes=[(B, L, D), (1,)],
         output_dtypes=[mx.bfloat16, mx.float32],
     )[0]

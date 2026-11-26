@@ -1338,7 +1338,7 @@ def sdpa_b1_packed(
 
 
 _CAUSAL_HEADER = _HEADER + r"""
-template <typename T, typename PBT, int D, int NS, bool HAS_GATE, bool HAS_STAGE = false>
+template <typename T, typename PBT, int D, int NS, bool HAS_GATE, bool HAS_STAGE = false, int OPASS = 2>
 METAL_FUNC void sdpa1_head_v32_causal(
     const device T* queries, const device T* K, const device T* V,
     const device T* Knew, const device T* Vnew, const device T* gate, device T* out,
@@ -1352,12 +1352,12 @@ METAL_FUNC void sdpa1_head_v32_causal(
   constexpr int NV = BN / NS;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = D / BD;
+  constexpr int EP = v_per_thread / OPASS;
   typedef float U;
-  int anc[16];
-  for (int t = 0; t <= db; t++) anc[t] = anc_ptr[t];
   thread U q[qk_per_thread];
-  thread U o[v_per_thread];
-  queries += simd_lid * qk_per_thread;
+  thread U o_reg[NV][v_per_thread];
+  const int loff = (int)simd_lid * qk_per_thread;
+  queries += loff;
   bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
   q[0] = static_cast<U>(scale) * qb.x;
   q[1] = static_cast<U>(scale) * qb.y;
@@ -1365,7 +1365,7 @@ METAL_FUNC void sdpa1_head_v32_causal(
   q[3] = static_cast<U>(scale) * qb.w;
   for (int v = 0; v < NV; v++) {
     int vg = (int)simd_gid + v * NS;
-    for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    U o0 = 0, o1 = 0, o2 = 0, o3 = 0;
     U max_score = Limits<U>::finite_min;
     U sum_exp_score = 0;
     if (vg == 0) {
@@ -1380,20 +1380,21 @@ METAL_FUNC void sdpa1_head_v32_causal(
         const device T* kp;
         const device T* vp;
         if (is_new) {
-          kp = Knew + (size_t)anc[d] * D + simd_lid * qk_per_thread;
-          vp = Vnew + (size_t)anc[d] * D + simd_lid * v_per_thread;
+          int ancd = anc_ptr[d];
+          kp = Knew + (size_t)ancd * D + loff;
+          vp = Vnew + (size_t)ancd * D + loff;
         } else if constexpr (HAS_STAGE) {
           int ds = rot ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
           if (ds >= 0 && ds < st_len) {
-            kp = Kst + (size_t)ds * D + simd_lid * qk_per_thread;
-            vp = Vst + (size_t)ds * D + simd_lid * v_per_thread;
+            kp = Kst + (size_t)ds * D + loff;
+            vp = Vst + (size_t)ds * D + loff;
           } else {
-            kp = K + (size_t)i * D + simd_lid * qk_per_thread;
-            vp = V + (size_t)i * D + simd_lid * v_per_thread;
+            kp = K + (size_t)i * D + loff;
+            vp = V + (size_t)i * D + loff;
           }
         } else {
-          kp = K + (size_t)i * D + simd_lid * qk_per_thread;
-          vp = V + (size_t)i * D + simd_lid * v_per_thread;
+          kp = K + (size_t)i * D + loff;
+          vp = V + (size_t)i * D + loff;
         }
         bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
         U score = 0;
@@ -1409,18 +1410,26 @@ METAL_FUNC void sdpa1_head_v32_causal(
         max_score = new_max;
         sum_exp_score = sum_exp_score * factor + exp_score;
         bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
-        o[0] = o[0] * factor + exp_score * vb.x;
-        o[1] = o[1] * factor + exp_score * vb.y;
-        o[2] = o[2] * factor + exp_score * vb.z;
-        o[3] = o[3] * factor + exp_score * vb.w;
+        o0 = o0 * factor + exp_score * vb.x;
+        o1 = o1 * factor + exp_score * vb.y;
+        o2 = o2 * factor + exp_score * vb.z;
+        o3 = o3 * factor + exp_score * vb.w;
       }
     }
     if (simd_lid == 0) {
       max_scores[vg] = max_score;
       sum_exp_scores[vg] = sum_exp_score;
     }
-    for (int i = 0; i < v_per_thread; i++) {
-      outputs[(i * BD + simd_lid) * BN + vg] = o[i];
+    if constexpr (OPASS == 1) {
+      outputs[(0 * BD + simd_lid) * BN + vg] = o0;
+      outputs[(1 * BD + simd_lid) * BN + vg] = o1;
+      outputs[(2 * BD + simd_lid) * BN + vg] = o2;
+      outputs[(3 * BD + simd_lid) * BN + vg] = o3;
+    } else {
+      o_reg[v][0] = o0;
+      o_reg[v][1] = o1;
+      o_reg[v][2] = o2;
+      o_reg[v][3] = o3;
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1428,24 +1437,66 @@ METAL_FUNC void sdpa1_head_v32_causal(
   U new_max = simd_max(max_score);
   U factor = fast::exp(max_score - new_max);
   U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
-  for (int f = (int)simd_gid; f < BD; f += NS) {
-    for (int i = 0; i < v_per_thread; i++) {
-      o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
-      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+  if constexpr (OPASS == 1) {
+    for (int f = (int)simd_gid; f < BD; f += NS) {
+      U o[4];
+      for (int i = 0; i < 4; i++) {
+        o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      }
+      if (simd_lid == 0) {
+        int base = f * v_per_thread;
+        if constexpr (HAS_GATE) {
+          bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+          bfloat4 ob = bfloat4(
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
+          ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+        } else {
+          bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+          ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+        }
+      }
+    }
+  } else {
+    for (int p = 0; p < OPASS; p++) {
+      for (int e = 0; e < EP; e++) {
+        int i = p * EP + e;
+        for (int v = 0; v < NV; v++) {
+          int vg = (int)simd_gid + v * NS;
+          outputs[(e * BD + simd_lid) * BN + vg] = o_reg[v][i];
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int e = 0; e < EP; e++) {
+        int i = p * EP + e;
+        for (int fi = 0; fi < NV; fi++) {
+          int f = (int)simd_gid + fi * NS;
+          U r = simd_sum(outputs[(e * BD + f) * BN + simd_lid] * factor);
+          o_reg[fi][i] = sum_exp_score == 0 ? r : (r / sum_exp_score);
+        }
+      }
+      if (p + 1 < OPASS) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
     }
     if (simd_lid == 0) {
-      int base = f * v_per_thread;
-      if constexpr (HAS_GATE) {
-        bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
-        bfloat4 ob = bfloat4(
-            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
-            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
-            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
-            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
-        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
-      } else {
-        bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
-        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      for (int fi = 0; fi < NV; fi++) {
+        int base = ((int)simd_gid + fi * NS) * v_per_thread;
+        if constexpr (HAS_GATE) {
+          bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+          bfloat4 ob = bfloat4(
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o_reg[fi][0])), static_cast<float>(gb.x))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o_reg[fi][1])), static_cast<float>(gb.y))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o_reg[fi][2])), static_cast<float>(gb.z))),
+              static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o_reg[fi][3])), static_cast<float>(gb.w))));
+          ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+        } else {
+          bfloat4 ob = bfloat4(static_cast<T>(o_reg[fi][0]), static_cast<T>(o_reg[fi][1]), static_cast<T>(o_reg[fi][2]), static_cast<T>(o_reg[fi][3]));
+          ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+        }
       }
     }
   }
@@ -1594,17 +1645,27 @@ METAL_FUNC void sdpa2_block_causal(
 
 _CAUSAL_SHORT_SRC = r"""
     constexpr int D = 128;
-    threadgroup float outputs[4 * 1024];
+    threadgroup float outputs[(4 / OPASS) * 1024];
     threadgroup float max_scores[32];
     threadgroup float sum_exp_scores[32];
-    int bh_l = (int)threadgroup_position_in_grid.x;
+    int tg = (int)threadgroup_position_in_grid.x;
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint simd_lid = thread_index_in_simdgroup;
-    int b_idx = bh_l / HQ;
-    int h = bh_l % HQ;
+    int b_idx, h, kvh;
+    if constexpr (KVH_MAJ) {
+        int gpk = B_CNT * GQA;
+        kvh = tg / gpk;
+        int rem = tg % gpk;
+        b_idx = rem / GQA;
+        h = kvh * GQA + (rem % GQA);
+    } else {
+        b_idx = tg / HQ;
+        h = tg % HQ;
+        kvh = h / GQA;
+    }
+    int bh_l = b_idx * HQ + h;
     int b = BOFF + b_idx;
     int bh = b * HQ + h;
-    int kvh = h / GQA;
     const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
     const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
     constexpr int TMW = (WW > 8) ? 17 : 9;
@@ -1620,7 +1681,7 @@ _CAUSAL_SHORT_SRC = r"""
     msk.S = S_b; msk.end = end_b; msk.idx = idx_b; msk.rot = ROT;
     msk.R = R; msk.window = WIN; msk.pb = pb + (size_t)bh * R;
     float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
-    sdpa1_head_v32_causal<T, PBT, D, NS, true>(
+    sdpa1_head_v32_causal<T, PBT, D, NS, true, false, OPASS>(
         q + (size_t)bh * D, K, V, Knew, Vnew, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, out + (size_t)bh_l * D,
         S_b, scale[0], sink, msk, db, tree_meta + b * TMW + 1, S0, slot0, max_size, ROT,
         nullptr, nullptr, 0, 0,
@@ -1684,7 +1745,7 @@ _CAUSAL_2P2_SRC = r"""
 
 _CAUSAL_SHORT_ST_SRC = r"""
     constexpr int D = 128;
-    threadgroup float outputs[4 * 1024];
+    threadgroup float outputs[2 * 1024];
     threadgroup float max_scores[32];
     threadgroup float sum_exp_scores[32];
     int bh_l = (int)threadgroup_position_in_grid.x;
@@ -2286,7 +2347,10 @@ def sdpa_causal_w_packed(
 
     def _run_short(b_off, b_cnt):
         ns_env = os.environ.get("LOOPLING_SDPA1_NS", "")
-        ns = int(ns_env) if ns_env and ns_env != "0" else 32
+        ns = int(ns_env) if ns_env and ns_env != "0" else (16 if b_cnt >= 4 else 32)
+        opass_env = os.environ.get("LOOPLING_CW_OPASS", "")
+        opass = int(opass_env) if opass_env and opass_env != "0" else 1
+        kvh_maj = os.environ.get("LOOPLING_CW_KVH_MAJ", "1") not in ("0", "")
         if kv_stage is not None:
             (o,) = s1_short(
                 inputs=[q, kv_buf, kv_stage, kv_new, pb, qkv_flat, mta, sc, tree_meta],
@@ -2308,7 +2372,8 @@ def sdpa_causal_w_packed(
             template=[
                 ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
                 ("R", R), ("WIN", int(window)), ("NS", ns), ("ROT", int(rot)), ("WW", int(W)),
-                ("BOFF", int(b_off)), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", g_str),
+                ("BOFF", int(b_off)), ("B_CNT", int(b_cnt)), ("OPASS", opass), ("KVH_MAJ", kvh_maj),
+                ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", g_str),
                 ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
                 ("KV_LIDX", kv_lidx_t),
             ],
@@ -3869,14 +3934,20 @@ def _sdpa_mid_source(full, thr_q, thr_k, thr_r, eps_v):
         float sw[4];
         for (int k = 0; k < 4; k++) sw[k] = float(k_static[k * 1024 + c]);
         y[i] = mid_conv_d(x0v, s0v, s1v, s2v, sw, dy);""" if full else f"""
-        bfloat4 cwb = as_type<bfloat4>(((const device uint2*)(k_conv + c * 4))[0]);
-        y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cwb.x), float(cwb.y), float(cwb.z), float(cwb.w), {scale_conv});"""
+        y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cwb[i].x), float(cwb[i].y), float(cwb[i].z), float(cwb[i].w), {scale_conv});"""
     v_conv_expr = """
         float sw[4];
         for (int k = 0; k < 4; k++) sw[k] = float(v_static[k * 1024 + c]);
         y[i] = mid_conv_d(x0v, s0v, s1v, s2v, sw, dy);""" if full else f"""
-        bfloat4 cwb = as_type<bfloat4>(((const device uint2*)(v_conv + c * 4))[0]);
-        y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cwb.x), float(cwb.y), float(cwb.z), float(cwb.w), {scale_conv});"""
+        y[i] = mid_conv_s(x0v, s0v, s1v, s2v, float(cwb[i].x), float(cwb[i].y), float(cwb[i].z), float(cwb[i].w), {scale_conv});"""
+    k_cw_load = "" if full else """
+      uint4 cw0 = ((const device uint4*)(k_conv + c0 * 4))[0];
+      uint4 cw1 = ((const device uint4*)(k_conv + c0 * 4 + 8))[0];
+      bfloat4 cwb[4] = {as_type<bfloat4>(cw0.xy), as_type<bfloat4>(cw0.zw), as_type<bfloat4>(cw1.xy), as_type<bfloat4>(cw1.zw)};"""
+    v_cw_load = "" if full else """
+      uint4 cw0 = ((const device uint4*)(v_conv + c0 * 4))[0];
+      uint4 cw1 = ((const device uint4*)(v_conv + c0 * 4 + 8))[0];
+      bfloat4 cwb[4] = {as_type<bfloat4>(cw0.xy), as_type<bfloat4>(cw0.zw), as_type<bfloat4>(cw1.xy), as_type<bfloat4>(cw1.zw)};"""
     k_dy_load = """
       bfloat4 dyp = as_type<bfloat4>(((const device uint2*)(qkv + OFF_KW + kvh * 4))[0]);
       float dy[4] = {float(dyp.x), float(dyp.y), float(dyp.z), float(dyp.w)};""" if full else ""
@@ -3934,7 +4005,7 @@ def _sdpa_mid_source(full, thr_q, thr_k, thr_r, eps_v):
         ((device float4*)(w0 + c0))[0] = s1f;
         ((device float4*)(w0 + 1024 + c0))[0] = s2f;
         ((device float4*)(w0 + 2048 + c0))[0] = x0f;
-      }}{k_dy_load}
+      }}{k_dy_load}{k_cw_load}
       float x0a[4] = {{x0f.x, x0f.y, x0f.z, x0f.w}};
       float s0a[4] = {{s0f.x, s0f.y, s0f.z, s0f.w}};
       float s1a[4] = {{s1f.x, s1f.y, s1f.z, s1f.w}};
@@ -3961,7 +4032,7 @@ def _sdpa_mid_source(full, thr_q, thr_k, thr_r, eps_v):
         ((device float4*)(w1 + c0))[0] = s1f;
         ((device float4*)(w1 + 1024 + c0))[0] = s2f;
         ((device float4*)(w1 + 2048 + c0))[0] = x0f;
-      }}{v_dy_load}
+      }}{v_dy_load}{v_cw_load}
       float x0a[4] = {{x0f.x, x0f.y, x0f.z, x0f.w}};
       float s0a[4] = {{s0f.x, s0f.y, s0f.z, s0f.w}};
       float s1a[4] = {{s1f.x, s1f.y, s1f.z, s1f.w}};
@@ -3984,8 +4055,8 @@ def _sdpa_mid_source(full, thr_q, thr_k, thr_r, eps_v):
       if (kv_owner) ((device uint2*)(kv_out + 1024 + c0))[0] = pk;
     }} else if (simd_gid < uint(3 + P_SG)) {{
       const int p = (int)simd_gid - 3;
-      const int n_pb = min(S, R);
-      const int n_pb16 = (n_pb + 15) & ~15;
+      const int n_pb = min(S, (WIN > 0) ? min(R, WIN) : R);
+      const int n_pb16 = min(R, (n_pb + 15) & ~15);
       if (p * 16 < n_pb16) {{
         threadgroup bfloat16_t* rel_tile = (threadgroup bfloat16_t*)(outputs + 256u + (uint)p * 64u);
         ((threadgroup uint2*)rel_tile)[simd_lid] = uint2(0u, 0u);
@@ -4086,9 +4157,7 @@ def sdpa_mid_b1(
     Returns (attn_out (1, 3072) bf16, kv_new (2, 8, 1, 128) bf16, w0 (1, 3, 1024) f32, w1 (1, 3, 1024) f32)."""
     assert S_now < _TWO_PASS_N
     full, q_sc, r_sc, cw0, cw1, thr_q, thr_k, thr_r, eps_v, Hq, Hkv = _get_sdpa_mid_layer_meta(layer)
-    gqa = Hq // Hkv
     R = int(rel_w.shape[1])
-    offs = {item[0]: item[1] for item in qkv_lay}
     sck = float(scale)
     sc = _SCALE_CACHE.get(sck)
     if sc is None:
@@ -4107,7 +4176,7 @@ def sdpa_mid_b1(
         ins += [tau.reshape(-1), cw0, cw1]
     else:
         ins += [cw0, cw1]
-    kkey = (full, thr_q, thr_k, thr_r, eps_v, tuple(x.dtype for x in ins))
+    kkey = (full, thr_q, thr_k, thr_r, eps_v)
     kern = _sdpa_mid_kernels.get(kkey)
     if kern is None:
         in_names = ["qkv", "kv", "cs0", "cs1", "q_scale", "rel_scale", "rw", "meta", "scale"]
@@ -4121,14 +4190,22 @@ def sdpa_mid_b1(
             ensure_row_contiguous=True,
         )
     ns = _SDPA_MID_NS
-    tmpl = [
-        ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("R", R), ("WIN", int(window)), ("NS", ns),
-        ("OFF_Q", offs["q_proj"]), ("OFF_R", offs["r_proj"]),
-        ("OFF_K", offs["k_proj"]), ("OFF_V", offs["v_proj"]),
-        ("GATE_OFF", offs["gate"]), ("SINK_OFF", offs["sinks"]),
-    ]
-    if full:
-        tmpl += [("OFF_KW", offs["k_wproj"]), ("OFF_VW", offs["v_wproj"])]
+    tkey = ("b1", full, Hq, Hkv, R, int(window), ns, tuple(qkv_lay))
+    tmpl = _sdpa_mid_tmpl_cache.get(tkey)
+    if tmpl is None:
+        if len(_sdpa_mid_tmpl_cache) >= 512:
+            _sdpa_mid_tmpl_cache.clear()
+        gqa = Hq // Hkv
+        offs = {item[0]: item[1] for item in qkv_lay}
+        tmpl = [
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("R", R), ("WIN", int(window)), ("NS", ns),
+            ("OFF_Q", offs["q_proj"]), ("OFF_R", offs["r_proj"]),
+            ("OFF_K", offs["k_proj"]), ("OFF_V", offs["v_proj"]),
+            ("GATE_OFF", offs["gate"]), ("SINK_OFF", offs["sinks"]),
+        ]
+        if full:
+            tmpl += [("OFF_KW", offs["k_wproj"]), ("OFF_VW", offs["v_wproj"])]
+        _sdpa_mid_tmpl_cache[tkey] = tmpl
     return kern(
         inputs=ins,
         template=tmpl,
@@ -4583,7 +4660,7 @@ def sdpa_mid_rows_staged(
 
 # =============================================================================================== Causal-W (W=1..8) Fused K5 MID+REL + K8 SDPA (S < 1024)
 _SDPA_MID_CW_HEADER = _SDPA_MID_HEADER + r"""
-template <int D, int NS>
+template <int D, int NS, int OPASS = 2>
 METAL_FUNC void sdpa1_head_v32_mid_causal(
     const threadgroup bfloat16_t* q_s,
     const device bfloat16_t* K_main,
@@ -4611,6 +4688,7 @@ METAL_FUNC void sdpa1_head_v32_mid_causal(
   constexpr int NV = BN / NS;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = D / BD;
+  constexpr int EP = v_per_thread / OPASS;
   typedef float U;
   thread U q[qk_per_thread];
   thread U o_reg[NV][v_per_thread];
@@ -4673,18 +4751,24 @@ METAL_FUNC void sdpa1_head_v32_mid_causal(
   U new_max = simd_max(max_score);
   U factor = fast::exp(max_score - new_max);
   U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
-  for (int i = 0; i < v_per_thread; i++) {
-    for (int v = 0; v < NV; v++) {
-      int vg = (int)simd_gid + v * NS;
-      outputs[simd_lid * BN + vg] = o_reg[v][i];
+  for (int p = 0; p < OPASS; p++) {
+    for (int e = 0; e < EP; e++) {
+      int i = p * EP + e;
+      for (int v = 0; v < NV; v++) {
+        int vg = (int)simd_gid + v * NS;
+        outputs[(e * BD + simd_lid) * BN + vg] = o_reg[v][i];
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int fi = 0; fi < NV; fi++) {
-      int f = (int)simd_gid + fi * NS;
-      U r = simd_sum(outputs[f * BN + simd_lid] * factor);
-      o_reg[fi][i] = sum_exp_score == 0 ? r : (r / sum_exp_score);
+    for (int e = 0; e < EP; e++) {
+      int i = p * EP + e;
+      for (int fi = 0; fi < NV; fi++) {
+        int f = (int)simd_gid + fi * NS;
+        U r = simd_sum(outputs[(e * BD + f) * BN + simd_lid] * factor);
+        o_reg[fi][i] = sum_exp_score == 0 ? r : (r / sum_exp_score);
+      }
     }
-    if (i + 1 < v_per_thread) {
+    if (p + 1 < OPASS) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
@@ -4815,22 +4899,26 @@ def _sdpa_mid_cw_source(full, scale_lit, has_wa):
     wa_guard = "\n    if (b >= w_act[0]) return;" if has_wa else ""
     return f"""
     constexpr int D = 128;
-    constexpr int P_SG = 4;
-    threadgroup float outputs[1024];
+    constexpr int P_SG = (NS >= 16) ? 8 : 4;
+    constexpr int KV_SLOTS = (WW <= 4) ? 4 : 8;
+    threadgroup float outputs[2 * 1024];
     threadgroup float max_scores[32];
     threadgroup float sum_exp_scores[32];
     threadgroup uint2 q_raw[32];
-    threadgroup uint2 kn_raw[8 * 32];
-    threadgroup uint2 vn_raw[8 * 32];
+    threadgroup uint2 kn_raw[KV_SLOTS * 32];
+    threadgroup uint2 vn_raw[KV_SLOTS * 32];
     threadgroup bfloat16_t pb_s[1024];
     threadgroup bfloat16_t* q_s = (threadgroup bfloat16_t*)q_raw;
     threadgroup bfloat16_t* knew_s = (threadgroup bfloat16_t*)kn_raw;
     threadgroup bfloat16_t* vnew_s = (threadgroup bfloat16_t*)vn_raw;
 
-    const int t = (int)threadgroup_position_in_grid.x;
-    const int b = t / HQ;
-    const int h = t % HQ;{wa_guard}
-    const int kvh = h / GQA;
+    const int tg = (int)threadgroup_position_in_grid.x;
+    const int gpk = WW * GQA;
+    const int kvh = tg / gpk;
+    const int rem = tg % gpk;
+    const int b = rem / GQA;
+    const int h = kvh * GQA + (rem % GQA);{wa_guard}
+    const int bh = b * HQ + h;
     const bool kv_owner = (h == kvh * GQA);
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
@@ -4884,55 +4972,58 @@ def _sdpa_mid_cw_source(full, scale_lit, has_wa):
       if (db >= 1) {{
         const int c0 = kvh * 128 + (int)simd_lid * 4;{v_cw_hoist}
         for (int d = 1; d <= db; d += 2) {{
-          {v_anc_body(896)}
+          {v_anc_body(128)}
         }}
       }}
-    }} else if (simd_gid >= 3u && simd_gid < uint(3 + P_SG)) {{
-      const int p = (int)simd_gid - 3;
-      const int n_pb = min(S_b, (WIN > 0) ? min(R, WIN) : R);
-      const int n_pb16 = min(R, (n_pb + 15) & ~15);
-      if (p * 16 < n_pb16) {{
-        threadgroup bfloat16_t* rel_tile = (threadgroup bfloat16_t*)(outputs + 128u + (uint)p * 64u);
-        ((threadgroup uint2*)rel_tile)[simd_lid] = uint2(0u, 0u);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_lid == 0u) {{
-          float s[16];
-          const device bfloat16_t* rp = qkv + OFF_R + (size_t)b * STR_R + (size_t)h * 16u;
-          const device bfloat16_t* rsp = qr_scale + HQ * 128 + h * 16;
-          for (int i = 0; i < 16; i++) s[i] = float(rp[i]) * float(rsp[i]);
-          glue_l2_clip_row16(s, thr_r);
-          for (int i = 0; i < 16; i++) {{
-            bfloat16_t o = bfloat16_t(s[i]);
-            {"o = bfloat16_t(glue_tau(float(o), tau_v));" if full else ""}
-            rel_tile[i] = o;
-          }}
-        }}
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_bfloat8x8 ma0, ma1;
-        simdgroup_load(ma0, rel_tile + 0, 16);
-        simdgroup_load(ma1, rel_tile + 8, 16);
-        threadgroup float* st = outputs + 384u + (uint)p * 128u;
-        for (int n0 = p * 16; n0 < n_pb16; n0 += P_SG * 16) {{
-          const device bfloat16_t* Bm = rw + n0;
-          simdgroup_bfloat8x8 mb00, mb10, mb01, mb11;
-          simdgroup_load(mb00, Bm + 0 * R + 0, R);
-          simdgroup_load(mb10, Bm + 8 * R + 0, R);
-          simdgroup_load(mb01, Bm + 0 * R + 8, R);
-          simdgroup_load(mb11, Bm + 8 * R + 8, R);
-          simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-          simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-          simdgroup_multiply_accumulate(acc0, ma0, mb00, acc0);
-          simdgroup_multiply_accumulate(acc0, ma1, mb10, acc0);
-          simdgroup_multiply_accumulate(acc1, ma0, mb01, acc1);
-          simdgroup_multiply_accumulate(acc1, ma1, mb11, acc1);
-          simdgroup_store(acc0, st, 8);
-          simdgroup_store(acc1, st + 64u, 8);
+    }} else {{
+      const int p = (simd_gid >= 3u && simd_gid <= 6u) ? ((int)simd_gid - 3)
+                    : ((P_SG == 8 && simd_gid >= 8u && simd_gid < 12u) ? ((int)simd_gid - 4) : -1);
+      if (p >= 0) {{
+        const int n_pb = min(S_b, (WIN > 0) ? min(R, WIN) : R);
+        const int n_pb16 = min(R, (n_pb + 15) & ~15);
+        if (p * 16 < n_pb16) {{
+          threadgroup bfloat16_t* rel_tile = (threadgroup bfloat16_t*)(outputs + 256u + (uint)p * 64u);
+          ((threadgroup uint2*)rel_tile)[simd_lid] = uint2(0u, 0u);
           simdgroup_barrier(mem_flags::mem_threadgroup);
-          if (simd_lid < 16u) {{
-            int col = n0 + (int)simd_lid;
-            if (col < 1024) pb_s[col] = bfloat16_t(st[(simd_lid < 8u) ? simd_lid : (64u + simd_lid - 8u)]);
+          if (simd_lid == 0u) {{
+            float s[16];
+            const device bfloat16_t* rp = qkv + OFF_R + (size_t)b * STR_R + (size_t)h * 16u;
+            const device bfloat16_t* rsp = qr_scale + HQ * 128 + h * 16;
+            for (int i = 0; i < 16; i++) s[i] = float(rp[i]) * float(rsp[i]);
+            glue_l2_clip_row16(s, thr_r);
+            for (int i = 0; i < 16; i++) {{
+              bfloat16_t o = bfloat16_t(s[i]);
+              {"o = bfloat16_t(glue_tau(float(o), tau_v));" if full else ""}
+              rel_tile[i] = o;
+            }}
           }}
           simdgroup_barrier(mem_flags::mem_threadgroup);
+          simdgroup_bfloat8x8 ma0, ma1;
+          simdgroup_load(ma0, rel_tile + 0, 16);
+          simdgroup_load(ma1, rel_tile + 8, 16);
+          threadgroup float* st = outputs + 768u + (uint)p * 128u;
+          for (int n0 = p * 16; n0 < n_pb16; n0 += P_SG * 16) {{
+            const device bfloat16_t* Bm = rw + n0;
+            simdgroup_bfloat8x8 mb00, mb10, mb01, mb11;
+            simdgroup_load(mb00, Bm + 0 * R + 0, R);
+            simdgroup_load(mb10, Bm + 8 * R + 0, R);
+            simdgroup_load(mb01, Bm + 0 * R + 8, R);
+            simdgroup_load(mb11, Bm + 8 * R + 8, R);
+            simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_multiply_accumulate(acc0, ma0, mb00, acc0);
+            simdgroup_multiply_accumulate(acc0, ma1, mb10, acc0);
+            simdgroup_multiply_accumulate(acc1, ma0, mb01, acc1);
+            simdgroup_multiply_accumulate(acc1, ma1, mb11, acc1);
+            simdgroup_store(acc0, st, 8);
+            simdgroup_store(acc1, st + 64u, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lid < 16u) {{
+              int col = n0 + (int)simd_lid;
+              if (col < 1024) pb_s[col] = bfloat16_t(st[(simd_lid < 8u) ? simd_lid : (64u + simd_lid - 8u)]);
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }}
         }}
       }}
     }}
@@ -4945,10 +5036,10 @@ def _sdpa_mid_cw_source(full, scale_lit, has_wa):
     msk.S = S_b; msk.end = end_b; msk.idx = idx_b; msk.rot = ROT;
     msk.R = R; msk.window = WIN;
     float sink = float(static_cast<bfloat16_t>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
-    sdpa1_head_v32_mid_causal<D, NS>(
+    sdpa1_head_v32_mid_causal<D, NS, 2>(
         q_s, K, V, knew_s, vnew_s,
         qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D,
-        out + (size_t)t * D,
+        out + (size_t)bh * D,
         S_b, {scale_lit}, sink, msk, db, S0, slot0, max_size, ROT,
         outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
 """

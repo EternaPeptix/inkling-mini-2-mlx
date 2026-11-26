@@ -1681,7 +1681,7 @@ def dflash2_exact_generate_step(
 
         pa_adapt = bool(use_budget) and os.environ.get("LOOPLING_DFLASH2_PA_ADAPT", "1") not in ("0", "", "false", "False")
         pa_ar_burst_en = os.environ.get("LOOPLING_DFLASH2_PA_AR_BURST", "0") not in ("0", "", "false", "False")
-        pa_promote = float(os.environ.get("LOOPLING_DFLASH2_PA_PROMOTE", "4.8"))
+        pa_promote = float(os.environ.get("LOOPLING_DFLASH2_PA_PROMOTE", "5.3"))
         pa_demote = pa_promote - 0.6
         pa_demote4 = float(os.environ.get("LOOPLING_DFLASH2_PA_DEMOTE4", "2.40"))
         pa_promote4 = pa_demote4 + 0.50

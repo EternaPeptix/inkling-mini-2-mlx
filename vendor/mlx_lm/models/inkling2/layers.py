@@ -937,6 +937,18 @@ class DecoderLayer(nn.Module):
                 block_residual, block_states, self.attention_input.query,
                 self.input_layernorm, need_nr=self.is_block_boundary,
             )
+        elif (
+            P._PF_DEPTH_RMS
+            and P.active(dtype, hidden_states)
+            and self.attention_input is not None
+            and block_states is not None
+            and hidden_states.shape[-1] == P._D
+            and self.attention_input.query.dtype == mx.float32
+        ):
+            attention_inputs, normed_residual = P.unw_rms_depth_attn_f32(
+                block_residual, block_states, self.attention_input.query,
+                need_nr=self.is_block_boundary,
+            )
         else:
             normed_residual = unweighted_rms_norm(block_residual.astype(mx.float32))
             attention_inputs = None
@@ -945,13 +957,49 @@ class DecoderLayer(nn.Module):
         hidden_states = self._self_attention(
             hidden_states, attention_inputs, cache, conv_states, conv_mask, messages, fast_conv=fast_conv
         )
-        if (
+        can_sc_post = (
             fast_conv
             and self.post_attention_convolution.kernel_size == 4
             and hidden_states.shape[-1] == P._D
             and self.post_attention_convolution.conv1d.weight.dtype == mx.bfloat16
             and (conv_states[2] is None or conv_states[2].dtype == mx.float32)
-        ):
+        )
+        if can_sc_post and P._PF_DEPTH_RMS and P.active(dtype, block_residual) and self.mlp_input.query.dtype == mx.float32:
+            if self.is_block_boundary:
+                block = normed_residual[None]
+                block_states = block if block_states is None else mx.concatenate([block_states, block])
+            if block_states is not None and (
+                messages is not None or self.post_attention_layernorm.weight.dtype == mx.bfloat16
+            ):
+                ln_post = self.post_attention_layernorm if messages is None else None
+                residual, da_out, conv_states[2] = P.short_conv_attn_depth_attn(
+                    hidden_states,
+                    conv_states[2],
+                    self.post_attention_convolution.conv1d.weight,
+                    None if self.is_block_boundary else block_residual,
+                    block_states,
+                    self.mlp_input.query,
+                    ln=ln_post,
+                )
+                if messages is None:
+                    mlp_in = da_out
+                elif P.msg_gate_ok(self.mlp_message_gate, da_out, messages, self.post_attention_layernorm):
+                    mlp_in = P.msg_gate_norm_single(
+                        self.mlp_message_gate, da_out, messages, 3, self.post_attention_layernorm
+                    )
+                else:
+                    mlp_in = self.post_attention_layernorm(
+                        self.mlp_message_gate(da_out, messages[..., 3, :])
+                    ).astype(dtype)
+                normed_states = None
+            else:
+                residual, normed_states, conv_states[2] = P.short_conv_attn_post(
+                    hidden_states,
+                    conv_states[2],
+                    self.post_attention_convolution.conv1d.weight,
+                    None if self.is_block_boundary else block_residual,
+                )
+        elif can_sc_post:
             residual, normed_states, conv_states[2] = P.short_conv_attn_post(
                 hidden_states,
                 conv_states[2],
@@ -980,41 +1028,42 @@ class DecoderLayer(nn.Module):
                 residual = hidden_states = block_residual.astype(mx.float32) + hidden_states
 
             normed_states = unweighted_rms_norm(hidden_states)
-        if (
-            messages is None
-            and P._PF_DEPTH_RMS
-            and P.active(dtype, block_residual)
-            and block_states is not None
-            and normed_states.dtype == mx.float32
-            and normed_states.shape[-1] == P._D
-            and self.post_attention_layernorm.weight.dtype == mx.bfloat16
-            and self.mlp_input.query.dtype == mx.float32
-        ):
-            mlp_in = P.depth_attn_rms_bf16(
-                block_states, normed_states, self.mlp_input.query, self.post_attention_layernorm
-            )
-        else:
-            hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
+        if normed_states is not None:
             if (
-                messages is not None
-                and P.active(dtype, block_residual)
-                and P.msg_gate_ok(self.mlp_message_gate, hidden_states, messages, self.post_attention_layernorm)
-            ):
-                mlp_in = P.msg_gate_norm_single(
-                    self.mlp_message_gate, hidden_states, messages, 3, self.post_attention_layernorm
-                )
-            elif (
                 messages is None
+                and P._PF_DEPTH_RMS
                 and P.active(dtype, block_residual)
-                and hidden_states.dtype == mx.float32
-                and hidden_states.shape[-1] == P._D
+                and block_states is not None
+                and normed_states.dtype == mx.float32
+                and normed_states.shape[-1] == P._D
                 and self.post_attention_layernorm.weight.dtype == mx.bfloat16
+                and self.mlp_input.query.dtype == mx.float32
             ):
-                mlp_in = P.rms_norm_f32_bf16(hidden_states, self.post_attention_layernorm)
+                mlp_in = P.depth_attn_rms_bf16(
+                    block_states, normed_states, self.mlp_input.query, self.post_attention_layernorm
+                )
             else:
-                if messages is not None:
-                    hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
-                mlp_in = self.post_attention_layernorm(hidden_states).astype(dtype)
+                hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
+                if (
+                    messages is not None
+                    and P.active(dtype, block_residual)
+                    and P.msg_gate_ok(self.mlp_message_gate, hidden_states, messages, self.post_attention_layernorm)
+                ):
+                    mlp_in = P.msg_gate_norm_single(
+                        self.mlp_message_gate, hidden_states, messages, 3, self.post_attention_layernorm
+                    )
+                elif (
+                    messages is None
+                    and P.active(dtype, block_residual)
+                    and hidden_states.dtype == mx.float32
+                    and hidden_states.shape[-1] == P._D
+                    and self.post_attention_layernorm.weight.dtype == mx.bfloat16
+                ):
+                    mlp_in = P.rms_norm_f32_bf16(hidden_states, self.post_attention_layernorm)
+                else:
+                    if messages is not None:
+                        hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
+                    mlp_in = self.post_attention_layernorm(hidden_states).astype(dtype)
         hidden_states = self.mlp(mlp_in)
         fused_mlp_post = (
             fast_conv

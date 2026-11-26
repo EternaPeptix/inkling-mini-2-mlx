@@ -1360,8 +1360,17 @@ def qmv_softcap_argmax_walk_rows(
     """Fused 8-bit qmv_rows -> softcap -> argmax p2 + on-GPU tree walk & metadata update (11-tuple)."""
     B, K = x.shape
     N = w.shape[0]
+    use_two_k = (
+        x.ndim == 2
+        and B in (5, 7, 8)
+        and N >= 16384
+        and not os.environ.get("LOOPLING_LM_CFG")
+        and not os.environ.get("LOOPLING_LM_SP")
+        and os.environ.get("LOOPLING_LM_TWO_K", "1") not in ("0", "")
+    )
     if (
-        os.environ.get("LOOPLING_FUSED_LM_ARGMAX", "1") in ("0", "")
+        use_two_k
+        or os.environ.get("LOOPLING_FUSED_LM_ARGMAX", "1") in ("0", "")
         or x.ndim != 2
         or x.dtype != mx.bfloat16
         or B not in (2, 3, 4, 5, 6, 7, 8)

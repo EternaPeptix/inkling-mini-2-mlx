@@ -243,6 +243,7 @@ _multi_conv_anc_cache: dict = {}
 _batch_st_infos_cache: dict = {}
 _update_kv_stage_k: dict = {}
 _stage_commit_multi_k: dict = {}
+_gather_stack_kv_k: dict = {}
 
 
 def build_multi_chain_conv_anc(C: int, W: int):
@@ -618,6 +619,62 @@ class _BatchKVStage:
         self.st_lens = [0] * self.C
         self._prev_step = None
         self._refresh_meta()
+
+
+def _gather_stack_kv_chunk(kvs, path_pad, W, keep_arr=None):
+    """Gather `kv[:, :, path_pad, :]` (clamping `w >= keep` to `path_pad[0]` when `keep_arr` is set) and stack <=24 tensors in 1 launch."""
+    N = len(kvs)
+    has_keep = keep_arr is not None
+    assert 1 <= N <= 24 and kvs[0].dtype == mx.bfloat16 and kvs[0].shape[0] == 2 and kvs[0].shape[1] == 8 and kvs[0].shape[3] == 128
+    key = (N, has_keep)
+    k = _gather_stack_kv_k.get(key)
+    if k is None:
+        ptrs = ", ".join(f"(const device uint4*)k{i}" for i in range(N))
+        src_w_expr = "int src_w = (int(w_i) < keep_arr[0]) ? path_pad[w_i] : path_pad[0];" if has_keep else "int src_w = path_pad[w_i];"
+        src = f"""
+  uint tid = thread_position_in_grid.x;
+  const uint total_v8 = uint(NN) * 2u * 8u * uint(WW) * 16u;
+  if (tid >= total_v8) return;
+  uint d8 = tid & 15u;
+  uint q0 = tid >> 4;
+  uint w_i = q0 % uint(WW);
+  uint q1 = q0 / uint(WW);
+  uint h = q1 & 7u;
+  uint q2 = q1 >> 3;
+  uint kv = q2 & 1u;
+  uint n = q2 >> 1;
+  {src_w_expr}
+  size_t s_off = (((size_t(kv) * 8u + h) * uint(WW) + uint(src_w)) * 16u) + d8;
+  const device uint4* ptrs[NN] = {{{ptrs}}};
+  ((device uint4*)out)[tid] = ptrs[n][s_off];
+"""
+        ins_names = [f"k{i}" for i in range(N)] + ["path_pad"] + (["keep_arr"] if has_keep else [])
+        k = _gather_stack_kv_k[key] = mx.fast.metal_kernel(
+            name=f"gather_stack_kv_{N}_{int(has_keep)}",
+            input_names=ins_names,
+            output_names=["out"],
+            source=src,
+            ensure_row_contiguous=True,
+        )
+    n_v8 = N * 2 * 8 * int(W) * 16
+    ins = list(kvs) + [path_pad.reshape(-1)] + ([keep_arr.reshape(-1)] if has_keep else [])
+    return k(
+        inputs=ins,
+        template=[("NN", N), ("WW", int(W))],
+        grid=(((n_v8 + 255) // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(N, 2, 8, int(W), 128)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+def _gather_stack_kv_gpu(kvs, path_pad, W, keep_arr=None):
+    if len(kvs) <= 24:
+        return _gather_stack_kv_chunk(kvs, path_pad, W, keep_arr=keep_arr)
+    parts = []
+    for i in range(0, len(kvs), 20):
+        parts.append(_gather_stack_kv_chunk(kvs[i : i + 20], path_pad, W, keep_arr=keep_arr))
+    return mx.concatenate(parts, axis=0)
 
 
 def update_kv_stage_gpu(st_old, kvs, path_pad, st_pos, W):
@@ -3713,24 +3770,23 @@ class BatchDecoder:
 
         buf_f = self._kv_full
         self._kv_full = None
-        src_f = mx.stack([kv_news[v][:, :, path_pad, :] for v in self._full_visits], axis=0)
+        src_f = _gather_stack_kv_gpu([kv_news[v] for v in self._full_visits], path_pad, W)
         self._kv_full = mx.slice_update(buf_f, src_f, end_f_old, axes=(3,))
 
         buf_r = self._kv_ring
         self._kv_ring = None
-        src_r = mx.stack([kv_news[v][:, :, path_pad, :] for v in self._ring_visits], axis=0)
         if not ring_may_wrap:
+            src_r = _gather_stack_kv_gpu([kv_news[v] for v in self._ring_visits], path_pad, W)
             self._kv_ring = mx.slice_update(buf_r, src_r, slot_r_old, axes=(3,))
         else:
+            src_safe = _gather_stack_kv_gpu([kv_news[v] for v in self._ring_visits], path_pad, W, keep_arr=keep_arr)
             max_size = int(self.caches[0][self._ring_visits[0]][0].max_size)
             WW = int(W)
             ar = _cw_ar_cache.get(WW)
             if ar is None:
                 ar = _cw_ar_cache[WW] = mx.arange(WW, dtype=mx.int32)
-            s0 = src_r[:, :, :, 0:1, :]
             cond = ar < keep_arr
             pos_r = mx.where(cond, (slot_r_old + ar) % max_size, slot_r_old)
-            src_safe = mx.where(cond.reshape(1, 1, 1, WW, 1), src_r, s0)
             buf_r[:, :, :, pos_r, :] = src_safe
             self._kv_ring = buf_r
 

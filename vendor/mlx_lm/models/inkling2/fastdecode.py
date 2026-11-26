@@ -27,6 +27,7 @@ _SDPA_MID_B1 = os.environ.get("LOOPLING_SDPA_MID_B1", "1") not in ("0", "")
 _FUSE_K3B_MLP = os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
 _ctx: dict = {}
 _tau: dict = {}
+_tau_1d: dict = {}
 _wpos_cache: dict = {}
 _fds: dict = {}  # id(layer) -> compiled segments; the entry is removed when the layer dies
 _RM_MODS = None
@@ -316,6 +317,17 @@ def _full_tau(layer, offset):
     return t
 
 
+def _full_tau_1d(layer, offset):
+    a = layer.self_attn
+    key = (offset, a.log_scaling_alpha, a.log_scaling_n_floor)
+    t = _tau_1d.get(key)
+    if t is None:
+        if len(_tau_1d) > 8:
+            _tau_1d.clear()
+        t = _tau_1d[key] = _full_tau(layer, offset).reshape(-1)
+    return t
+
+
 def _core(layer, q, k, v, pb, sinks, kv):
     from mlx_lm.models.inkling2 import layers as L
 
@@ -471,7 +483,7 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
 
     r1 = RL.k1_pre_layer(layer, h2, bs_in, m2)
     nr = r1["normed_residual"]
-    tau_1d = None if sliding else _full_tau(layer, _end(kv)).reshape(-1)
+    tau_1d = None if sliding else _full_tau_1d(layer, _end(kv))
     rel_w_bf = _rel_w_bf(a["rel_logits_proj"])
 
     use_int8_kv = (

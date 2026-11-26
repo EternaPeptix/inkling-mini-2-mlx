@@ -1565,7 +1565,6 @@ class BatchDecoder:
         rel_w_bf = FD._rel_w_bf(rel_proj)
         if (
             os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
-            and (len(step_Ss[v]) <= 2 or max(step_Ss[v]) >= 256)
             and max(step_Ss[v]) < RS._TWO_PASS_N
         ):
             attn_out, kv_new, w0, w1 = RS.sdpa_mid_rows_staged(
@@ -2629,7 +2628,7 @@ class BatchDecoder:
             stage = self._stage_main
             sdpa_mid = os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
             regime_sig = tuple(
-                (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N), max(Ss) >= 256)
+                (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N))
                 for Ss in step_Ss
             )
             cd_key = self._loopcd_cd_key(cfg, ref_pass, force_hidden=True) if (use_cd and cfg.mode == "hidden") else None

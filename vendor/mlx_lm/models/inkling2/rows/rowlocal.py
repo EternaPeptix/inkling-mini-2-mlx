@@ -251,6 +251,24 @@ _K1_CACHE: dict = {}
 _K1_DOWN_CACHE: dict = {}
 _K10_CACHE: dict = {}
 _K3B_CACHE: dict = {}
+_RL_TG_TUP = (TG, 1, 1)
+
+
+class _K1MsgDict(dict):
+    """Dict with lazy q/k/v_gate_in slice views (avoids 72 unused MLX slice nodes/token on hot decode)."""
+    __slots__ = ()
+
+    def __missing__(self, key):
+        if key == "q_gate_in":
+            v = self["qkv_gate_in"][:, 0]
+        elif key == "k_gate_in":
+            v = self["qkv_gate_in"][:, 1]
+        elif key == "v_gate_in":
+            v = self["qkv_gate_in"][:, 2]
+        else:
+            raise KeyError(key)
+        self[key] = v
+        return v
 
 
 # ===================================================================================================== K1 PRE
@@ -318,19 +336,22 @@ def k1_pre(h, bs, msg, query, ln_w, *, sliding, eps_ln=1e-6, debug=False, w_act=
     has_wa = w_act is not None
     if has_wa:
         args.append(w_act if w_act.ndim == 1 else w_act.reshape(-1))
-    bd = (B, D)
-    if msg is None:
-        shapes = [bd, bd] if G == 1 else [bd, bd, bd, bd]
-    else:
-        shapes = [bd, bd, (B, 3, 2 * D)] if G == 1 else [bd, bd, bd, bd, (B, 3, 2 * D)]
-    if debug and has_ai:
-        shapes.append((B, G, D))
-
     ckey = (sliding, NB, bs_is_list, has_ai, msg is not None, eps_ln, debug, has_wa)
     cached = _K1_CACHE.get(ckey)
     if cached is not None:
-        k, outs, dts, gpar = cached
-        r = k(inputs=args, grid=(B * gpar * TG, 1, 1), threadgroup=(TG, 1, 1), output_shapes=shapes, output_dtypes=dts)
+        k, outs, dts, gpar, b_cache = cached
+        bmeta = b_cache.get(B)
+        if bmeta is None:
+            bd = (B, D)
+            if msg is None:
+                shapes = [bd, bd] if G == 1 else [bd, bd, bd, bd]
+            else:
+                shapes = [bd, bd, (B, 3, 2 * D)] if G == 1 else [bd, bd, bd, bd, (B, 3, 2 * D)]
+            if debug and has_ai:
+                shapes.append((B, G, D))
+            bmeta = b_cache[B] = ((B * gpar * TG, 1, 1), shapes)
+        grid, shapes = bmeta
+        r = k(inputs=args, grid=grid, threadgroup=_RL_TG_TUP, output_shapes=shapes, output_dtypes=dts)
         if msg is None:
             if sliding:
                 x0 = r[1]
@@ -344,18 +365,12 @@ def k1_pre(h, bs, msg, query, ln_w, *, sliding, eps_ln=1e-6, debug=False, w_act=
         else:
             if sliding:
                 s0, gi = r[1], r[2]
-                res = {
-                    "normed_residual": r[0], "s_q": s0, "s_k": s0, "s_v": s0,
-                    "qkv_gate_in": gi, "q_gate_in": gi[:, 0], "k_gate_in": gi[:, 1], "v_gate_in": gi[:, 2],
-                }
+                res = _K1MsgDict({"normed_residual": r[0], "s_q": s0, "s_k": s0, "s_v": s0, "qkv_gate_in": gi})
                 if debug and has_ai:
                     res["attn_input"] = r[3]
             else:
                 gi = r[4]
-                res = {
-                    "normed_residual": r[0], "s_q": r[1], "s_k": r[2], "s_v": r[3],
-                    "qkv_gate_in": gi, "q_gate_in": gi[:, 0], "k_gate_in": gi[:, 1], "v_gate_in": gi[:, 2],
-                }
+                res = _K1MsgDict({"normed_residual": r[0], "s_q": r[1], "s_k": r[2], "s_v": r[3], "qkv_gate_in": gi})
                 if debug and has_ai:
                     res["attn_input"] = r[5]
         return res
@@ -389,7 +404,7 @@ def k1_pre(h, bs, msg, query, ln_w, *, sliding, eps_ln=1e-6, debug=False, w_act=
         outs.append("ai")
         dts.append(_F32)
 
-    gpar = G if has_ai else 1
+    gpar = (3 if msg is not None else G) if has_ai else 1
     s = [
         "uint tgx = threadgroup_position_in_grid.x;",
         f"uint row = tgx / {gpar}; uint g_id = tgx % {gpar}; (void)g_id;",
@@ -471,126 +486,71 @@ def k1_pre(h, bs, msg, query, ln_w, *, sliding, eps_ln=1e-6, debug=False, w_act=
                 "}",
             ]
     else:
-        if G > 1:
+        s += [
+            "if (g_id == 0) { ((device float4*)(nr + size_t(row) * RL_D + b0))[0] = nr0; ((device float4*)(nr + size_t(row) * RL_D + b1))[0] = nr1; }",
+            "const device float* qg = query + g_id * RL_D;" if G > 1 else "const device float* qg = query;",
+            f"threadgroup float dbuf[{(NB + 1) * 9}];",
+            f"float acc[{NB + 1}]; for (int i = 0; i < {NB + 1}; i++) acc[i] = 0.0f;",
+            "for (int k = 0; k < 8; k++) { int d = int(tid) + k * RL_TG; float qv = qg[d];",
+        ]
+        for i in range(NB):
+            s += [f"  acc[{i}] += {_bs_d(i)} * qv;"]
+        s += [
+            f"  acc[{NB}] += glue_rms_apply_nw<float>(float(hr[d]), inv0) * qv; }}",
+            f"for (int i = 0; i < {NB + 1}; i++) {{ float v = simd_sum(acc[i]); if (lane == 0) dbuf[i * 9 + sg] = v; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"float wt[{NB + 1}]; float mxw = -INFINITY;",
+            f"for (int i = 0; i < {NB + 1}; i++) {{ float t = 0.0f; for (int ss = 0; ss < 9; ss++) t += dbuf[i * 9 + ss]; wt[i] = t * {_SCALE_DEPTH}; mxw = max(mxw, wt[i]); }}",
+            f"float zz = 0.0f; for (int i = 0; i < {NB + 1}; i++) {{ wt[i] = metal::exp(wt[i] - mxw); zz += wt[i]; }}",
+            f"for (int i = 0; i < {NB + 1}; i++) wt[i] /= zz;",
+            "float4 o0 = float4(0.0f); float4 o1 = float4(0.0f);",
+        ]
+        for i in range(NB):
+            s += [f"o0 += wt[{i}] * {_bs_f4(i, 'b0')}; o1 += wt[{i}] * {_bs_f4(i, 'b1')};"]
+        s += [f"o0 += wt[{NB}] * nr0; o1 += wt[{NB}] * nr1;"]
+        for g in range(G):
             s += [
-                "if (g_id == 0) { ((device float4*)(nr + size_t(row) * RL_D + b0))[0] = nr0; ((device float4*)(nr + size_t(row) * RL_D + b1))[0] = nr1; }",
-                "const device float* qg = query + g_id * RL_D;",
-                f"threadgroup float dbuf[{(NB + 1) * 9}];",
-                f"float acc[{NB + 1}]; for (int i = 0; i < {NB + 1}; i++) acc[i] = 0.0f;",
-                "for (int k = 0; k < 8; k++) { int d = int(tid) + k * RL_TG; float qv = qg[d];",
+                f"if (g_id == {g}) {{ ((device float4*)(s{g} + size_t(row) * RL_D + b0))[0] = o0; ((device float4*)(s{g} + size_t(row) * RL_D + b1))[0] = o1; }}",
             ]
-            for i in range(NB):
-                s += [f"  acc[{i}] += {_bs_d(i)} * qv;"]
-            s += [
-                f"  acc[{NB}] += glue_rms_apply_nw<float>(float(hr[d]), inv0) * qv; }}",
-                f"for (int i = 0; i < {NB + 1}; i++) {{ float v = simd_sum(acc[i]); if (lane == 0) dbuf[i * 9 + sg] = v; }}",
-                "threadgroup_barrier(mem_flags::mem_threadgroup);",
-                f"float wt[{NB + 1}]; float mxw = -INFINITY;",
-                f"for (int i = 0; i < {NB + 1}; i++) {{ float t = 0.0f; for (int ss = 0; ss < 9; ss++) t += dbuf[i * 9 + ss]; wt[i] = t * {_SCALE_DEPTH}; mxw = max(mxw, wt[i]); }}",
-                f"float zz = 0.0f; for (int i = 0; i < {NB + 1}; i++) {{ wt[i] = metal::exp(wt[i] - mxw); zz += wt[i]; }}",
-                f"for (int i = 0; i < {NB + 1}; i++) wt[i] /= zz;",
-                "float4 o0 = float4(0.0f); float4 o1 = float4(0.0f);",
-            ]
-            for i in range(NB):
-                s += [f"o0 += wt[{i}] * {_bs_f4(i, 'b0')}; o1 += wt[{i}] * {_bs_f4(i, 'b1')};"]
-            s += [f"o0 += wt[{NB}] * nr0; o1 += wt[{NB}] * nr1;"]
-            for g in range(G):
-                s += [
-                    f"if (g_id == {g}) {{ ((device float4*)(s{g} + size_t(row) * RL_D + b0))[0] = o0; ((device float4*)(s{g} + size_t(row) * RL_D + b1))[0] = o1; }}",
-                ]
-            if debug:
+        if debug:
+            if G > 1:
                 s += [
                     f"((device float4*)(ai + (size_t(row) * {G} + g_id) * RL_D + b0))[0] = o0;",
                     f"((device float4*)(ai + (size_t(row) * {G} + g_id) * RL_D + b1))[0] = o1;",
                 ]
-            s += [
-                "const device float* mp = msg + (size_t(row) * 4 + g_id) * RL_D;",
-                "float4 mv0 = ((const device float4*)(mp + b0))[0]; float4 mv1 = ((const device float4*)(mp + b1))[0];",
-                "float ins_, inm;",
-                f"rl_rms_inv_reg2(o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w, mv0.x, mv0.y, mv0.z, mv0.w, mv1.x, mv1.y, mv1.z, mv1.w, {flit(EPS_UW)}, part, sg, lane, ins_, inm);",
-                "size_t gio = (size_t(row) * 3 + g_id) * 2 * RL_D;",
-                "rl_store_bf4(gi + gio + b0, float4(glue_rms_apply_nw<float>(o0.x, ins_), glue_rms_apply_nw<float>(o0.y, ins_), glue_rms_apply_nw<float>(o0.z, ins_), glue_rms_apply_nw<float>(o0.w, ins_)));",
-                "rl_store_bf4(gi + gio + b1, float4(glue_rms_apply_nw<float>(o1.x, ins_), glue_rms_apply_nw<float>(o1.y, ins_), glue_rms_apply_nw<float>(o1.z, ins_), glue_rms_apply_nw<float>(o1.w, ins_)));",
-                "rl_store_bf4(gi + gio + RL_D + b0, float4(glue_rms_apply_nw<float>(mv0.x, inm), glue_rms_apply_nw<float>(mv0.y, inm), glue_rms_apply_nw<float>(mv0.z, inm), glue_rms_apply_nw<float>(mv0.w, inm)));",
-                "rl_store_bf4(gi + gio + RL_D + b1, float4(glue_rms_apply_nw<float>(mv1.x, inm), glue_rms_apply_nw<float>(mv1.y, inm), glue_rms_apply_nw<float>(mv1.z, inm), glue_rms_apply_nw<float>(mv1.w, inm)));",
-            ]
-        else:
-            s += [
-                "((device float4*)(nr + size_t(row) * RL_D + b0))[0] = nr0;",
-                "((device float4*)(nr + size_t(row) * RL_D + b1))[0] = nr1;",
-                f"threadgroup float dbuf[{(NB + 1) * G * 9}];",
-                f"float acc[{(NB + 1) * G}]; for (int i = 0; i < {(NB + 1) * G}; i++) acc[i] = 0.0f;",
-                "for (int k = 0; k < 8; k++) { int d = int(tid) + k * RL_TG;",
-                f"  float qv[{G}]; for (int j = 0; j < {G}; j++) qv[j] = query[j * RL_D + d];",
-            ]
-            for i in range(NB):
-                s += [f"  {{ float sv = {_bs_d(i)}; for (int j = 0; j < {G}; j++) acc[{i} * {G} + j] += sv * qv[j]; }}"]
-            s += [
-                f"  {{ float sv = glue_rms_apply_nw<float>(float(hr[d]), inv0); for (int j = 0; j < {G}; j++) acc[{NB} * {G} + j] += sv * qv[j]; }} }}",
-                f"for (int i = 0; i < {(NB + 1) * G}; i++) {{ float v = simd_sum(acc[i]); if (lane == 0) dbuf[i * 9 + sg] = v; }}",
-                "threadgroup_barrier(mem_flags::mem_threadgroup);",
-                f"float wt[{(NB + 1) * G}];",
-                f"for (int i = 0; i < {(NB + 1) * G}; i++) {{ float t = 0.0f; for (int ss = 0; ss < 9; ss++) t += dbuf[i * 9 + ss]; wt[i] = t * {_SCALE_DEPTH}; }}",
-                f"for (int j = 0; j < {G}; j++) {{ float m = -INFINITY; for (int i = 0; i < {NB + 1}; i++) m = max(m, wt[i * {G} + j]); float z = 0.0f; for (int i = 0; i < {NB + 1}; i++) {{ wt[i * {G} + j] = metal::exp(wt[i * {G} + j] - m); z += wt[i * {G} + j]; }} for (int i = 0; i < {NB + 1}; i++) wt[i * {G} + j] /= z; }}",
-                f"float4 o0[{G}], o1[{G}]; for (int j = 0; j < {G}; j++) {{ o0[j] = float4(0.0f); o1[j] = float4(0.0f); }}",
-            ]
-            for i in range(NB):
+            else:
                 s += [
-                    f"{{ float4 bv0 = {_bs_f4(i, 'b0')}; float4 bv1 = {_bs_f4(i, 'b1')};",
-                    f"  for (int j = 0; j < {G}; j++) {{ o0[j] += wt[{i} * {G} + j] * bv0; o1[j] += wt[{i} * {G} + j] * bv1; }} }}",
+                    "if (g_id == 0) { ((device float4*)(ai + size_t(row) * RL_D + b0))[0] = o0; ((device float4*)(ai + size_t(row) * RL_D + b1))[0] = o1; }",
                 ]
-            s += [f"for (int j = 0; j < {G}; j++) {{ o0[j] += wt[{NB} * {G} + j] * nr0; o1[j] += wt[{NB} * {G} + j] * nr1; }}"]
-            for g in range(G):
-                s += [
-                    f"((device float4*)(s{g} + size_t(row) * RL_D + b0))[0] = o0[{g}];",
-                    f"((device float4*)(s{g} + size_t(row) * RL_D + b1))[0] = o1[{g}];",
-                ]
-                if debug:
-                    s += [
-                        f"((device float4*)(ai + (size_t(row) * {G} + {g}) * RL_D + b0))[0] = o0[{g}];",
-                        f"((device float4*)(ai + (size_t(row) * {G} + {g}) * RL_D + b1))[0] = o1[{g}];",
-                    ]
-            s += [
-                f"threadgroup float partm[{(G + 3) * 32}];",
-                "const device float* mp0 = msg + size_t(row) * 4 * RL_D;",
-                "float4 mv0[3], mv1[3];",
-                "for (int m = 0; m < 3; m++) { mv0[m] = ((const device float4*)(mp0 + m * RL_D + b0))[0]; mv1[m] = ((const device float4*)(mp0 + m * RL_D + b1))[0]; }",
-                "{ GL_NOFMA",
-                f"  for (int g = 0; g < {G}; g++) {{",
-                "    float a0 = 0.0f; a0 = fma(o0[g].x, o0[g].x, a0); a0 = fma(o0[g].y, o0[g].y, a0); a0 = fma(o0[g].z, o0[g].z, a0); a0 = fma(o0[g].w, o0[g].w, a0); a0 = simd_sum(a0); if (lane == 0) partm[g * 32 + sg] = a0;",
-                "    float a1 = 0.0f; a1 = fma(o1[g].x, o1[g].x, a1); a1 = fma(o1[g].y, o1[g].y, a1); a1 = fma(o1[g].z, o1[g].z, a1); a1 = fma(o1[g].w, o1[g].w, a1); a1 = simd_sum(a1); if (lane == 0) partm[g * 32 + sg + 9] = a1;",
-                "  }",
-                "  for (int m = 0; m < 3; m++) {",
-                f"    float b0m = 0.0f; b0m = fma(mv0[m].x, mv0[m].x, b0m); b0m = fma(mv0[m].y, mv0[m].y, b0m); b0m = fma(mv0[m].z, mv0[m].z, b0m); b0m = fma(mv0[m].w, mv0[m].w, b0m); b0m = simd_sum(b0m); if (lane == 0) partm[({G} + m) * 32 + sg] = b0m;",
-                f"    float b1m = 0.0f; b1m = fma(mv1[m].x, mv1[m].x, b1m); b1m = fma(mv1[m].y, mv1[m].y, b1m); b1m = fma(mv1[m].z, mv1[m].z, b1m); b1m = fma(mv1[m].w, mv1[m].w, b1m); b1m = simd_sum(b1m); if (lane == 0) partm[({G} + m) * 32 + sg + 9] = b1m;",
-                "  }",
-                "}",
-                "threadgroup_barrier(mem_flags::mem_threadgroup);",
-                f"float ins_[{G}], inm[3];",
-                "{ GL_NOFMA",
-                f"  for (int g = 0; g < {G}; g++) {{ float tot = simd_sum(lane < 18u ? partm[g * 32 + lane] : 0.0f); ins_[g] = metal::precise::rsqrt(tot / float(RL_D) + {flit(EPS_UW)}); }}",
-                f"  for (int m = 0; m < 3; m++) {{ float tot = simd_sum(lane < 18u ? partm[({G} + m) * 32 + lane] : 0.0f); inm[m] = metal::precise::rsqrt(tot / float(RL_D) + {flit(EPS_UW)}); }}",
-                "}",
-            ]
-            for i in range(3):
-                g = 0 if sliding else i
-                s += [
-                    f"{{ size_t gio = (size_t(row) * 3 + {i}) * 2 * RL_D;",
-                    f"  rl_store_bf4(gi + gio + b0, float4(glue_rms_apply_nw<float>(o0[{g}].x, ins_[{g}]), glue_rms_apply_nw<float>(o0[{g}].y, ins_[{g}]), glue_rms_apply_nw<float>(o0[{g}].z, ins_[{g}]), glue_rms_apply_nw<float>(o0[{g}].w, ins_[{g}])));",
-                    f"  rl_store_bf4(gi + gio + b1, float4(glue_rms_apply_nw<float>(o1[{g}].x, ins_[{g}]), glue_rms_apply_nw<float>(o1[{g}].y, ins_[{g}]), glue_rms_apply_nw<float>(o1[{g}].z, ins_[{g}]), glue_rms_apply_nw<float>(o1[{g}].w, ins_[{g}])));",
-                    f"  rl_store_bf4(gi + gio + RL_D + b0, float4(glue_rms_apply_nw<float>(mv0[{i}].x, inm[{i}]), glue_rms_apply_nw<float>(mv0[{i}].y, inm[{i}]), glue_rms_apply_nw<float>(mv0[{i}].z, inm[{i}]), glue_rms_apply_nw<float>(mv0[{i}].w, inm[{i}])));",
-                    f"  rl_store_bf4(gi + gio + RL_D + b1, float4(glue_rms_apply_nw<float>(mv1[{i}].x, inm[{i}]), glue_rms_apply_nw<float>(mv1[{i}].y, inm[{i}]), glue_rms_apply_nw<float>(mv1[{i}].z, inm[{i}]), glue_rms_apply_nw<float>(mv1[{i}].w, inm[{i}]))); }}",
-                ]
+        s += [
+            "const device float* mp = msg + (size_t(row) * 4 + g_id) * RL_D;",
+            "float4 mv0 = ((const device float4*)(mp + b0))[0]; float4 mv1 = ((const device float4*)(mp + b1))[0];",
+            "float ins_, inm;",
+            f"rl_rms_inv_reg2(o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w, mv0.x, mv0.y, mv0.z, mv0.w, mv1.x, mv1.y, mv1.z, mv1.w, {flit(EPS_UW)}, part, sg, lane, ins_, inm);",
+            "size_t gio = (size_t(row) * 3 + g_id) * 2 * RL_D;",
+            "rl_store_bf4(gi + gio + b0, float4(glue_rms_apply_nw<float>(o0.x, ins_), glue_rms_apply_nw<float>(o0.y, ins_), glue_rms_apply_nw<float>(o0.z, ins_), glue_rms_apply_nw<float>(o0.w, ins_)));",
+            "rl_store_bf4(gi + gio + b1, float4(glue_rms_apply_nw<float>(o1.x, ins_), glue_rms_apply_nw<float>(o1.y, ins_), glue_rms_apply_nw<float>(o1.z, ins_), glue_rms_apply_nw<float>(o1.w, ins_)));",
+            "rl_store_bf4(gi + gio + RL_D + b0, float4(glue_rms_apply_nw<float>(mv0.x, inm), glue_rms_apply_nw<float>(mv0.y, inm), glue_rms_apply_nw<float>(mv0.z, inm), glue_rms_apply_nw<float>(mv0.w, inm)));",
+            "rl_store_bf4(gi + gio + RL_D + b1, float4(glue_rms_apply_nw<float>(mv1.x, inm), glue_rms_apply_nw<float>(mv1.y, inm), glue_rms_apply_nw<float>(mv1.z, inm), glue_rms_apply_nw<float>(mv1.w, inm)));",
+        ]
     src = "\n".join(s)
     name = "rl_k1_%s_%d_%d_%d_%d_%s%s_%s" % (
         "S" if sliding else "F", NB, int(bs_is_list), int(has_ai), int(msg is not None), flit(eps_ln), "_wa" if has_wa else "", "dbg" if debug else ""
     )
     outs_t = tuple(outs)
     k = _kernel(name.replace(".", "p").replace("-", "m"), src, tuple(ins), outs_t)
-    _K1_CACHE[ckey] = (k, outs_t, dts, gpar)
-    r = k(inputs=args, grid=(B * gpar * TG, 1, 1), threadgroup=(TG, 1, 1), output_shapes=shapes, output_dtypes=dts)
+    bd = (B, D)
+    if msg is None:
+        shapes = [bd, bd] if G == 1 else [bd, bd, bd, bd]
+    else:
+        shapes = [bd, bd, (B, 3, 2 * D)] if G == 1 else [bd, bd, bd, bd, (B, 3, 2 * D)]
+    if debug and has_ai:
+        shapes.append((B, G, D))
+    grid = (B * gpar * TG, 1, 1)
+    _K1_CACHE[ckey] = (k, outs_t, dts, gpar, {B: (grid, shapes)})
+    r = k(inputs=args, grid=grid, threadgroup=_RL_TG_TUP, output_shapes=shapes, output_dtypes=dts)
     o = dict(zip(outs_t, r))
-    res = {"normed_residual": o["nr"]}
+    res = _K1MsgDict({"normed_residual": o["nr"]}) if msg is not None else {"normed_residual": o["nr"]}
     if msg is None:
         if sliding:
             res.update(q_in=o["x0"], k_in=o["x0"], v_in=o["x0"])
@@ -601,8 +561,7 @@ def k1_pre(h, bs, msg, query, ln_w, *, sliding, eps_ln=1e-6, debug=False, w_act=
             res.update(s_q=o["s0"], s_k=o["s0"], s_v=o["s0"])
         else:
             res.update(s_q=o["s0"], s_k=o["s1"], s_v=o["s2"])
-        gi = o["gi"]
-        res.update(qkv_gate_in=gi, q_gate_in=gi[:, 0], k_gate_in=gi[:, 1], v_gate_in=gi[:, 2])
+        res["qkv_gate_in"] = o["gi"]
     if "ai" in o:
         res["attn_input"] = o["ai"]
     return res
@@ -685,6 +644,41 @@ def _k1_from_down_impl(
     else:
         args.extend(ln_w)
 
+    ckey = (causal, B, sliding, NB, bs_is_list, has_ai, msg is not None, eps_ln, emit_h, debug)
+    cached = _K1_DOWN_CACHE.get(ckey)
+    if cached is not None:
+        k, outs_t, dts, grid, shapes = cached
+        r = k(inputs=args, grid=grid, threadgroup=_RL_TG_TUP, output_shapes=shapes, output_dtypes=dts)
+        idx = 0
+        if emit_h:
+            h_out = r[0]
+            idx = 1
+        w3, nr = r[idx], r[idx + 1]
+        base = idx + 2
+        if msg is None:
+            if sliding:
+                x0 = r[base]
+                res = {"w3": w3, "normed_residual": nr, "q_in": x0, "k_in": x0, "v_in": x0}
+                if debug and has_ai:
+                    res["attn_input"] = r[base + 1]
+            else:
+                res = {"w3": w3, "normed_residual": nr, "q_in": r[base], "k_in": r[base + 1], "v_in": r[base + 2]}
+                if debug and has_ai:
+                    res["attn_input"] = r[base + 3]
+        else:
+            if sliding:
+                s0, gi = r[base], r[base + 1]
+                res = _K1MsgDict({"w3": w3, "normed_residual": nr, "s_q": s0, "s_k": s0, "s_v": s0, "qkv_gate_in": gi})
+                if debug and has_ai:
+                    res["attn_input"] = r[base + 2]
+            else:
+                gi = r[base + 3]
+                res = _K1MsgDict({"w3": w3, "normed_residual": nr, "s_q": r[base], "s_k": r[base + 1], "s_v": r[base + 2], "qkv_gate_in": gi})
+                if debug and has_ai:
+                    res["attn_input"] = r[base + 4]
+        if emit_h:
+            res["h"] = h_out
+        return res
     shapes = ([(B, D)] if emit_h else []) + [(B, 3, D), (B, D)]
     if msg is None:
         shapes += [(B, D)] * G
@@ -692,12 +686,7 @@ def _k1_from_down_impl(
         shapes += [(B, D)] * G + [(B, 3, 2 * D)]
     if debug and has_ai:
         shapes.append((B, G, D))
-
-    ckey = (causal, B, sliding, NB, bs_is_list, has_ai, msg is not None, eps_ln, emit_h, debug)
-    cached = _K1_DOWN_CACHE.get(ckey)
-    if cached is not None:
-        k, outs_t, dts, gpar = cached
-    else:
+    if True:
         ins = ["down", "wts", "resid", "cs3", "cw"] + (["conv_anc"] if causal else [])
         if has_ai:
             if bs_is_list:
@@ -746,10 +735,10 @@ def _k1_from_down_impl(
             ]
         else:
             s += [
-                "threadgroup float ww_s[8];",
-                "if (int(tid) < 8) ww_s[tid] = wts[row * 8 + tid];",
+                "const device float4* wp4 = (const device float4*)(wts + row * 8);",
+                "float4 wv0 = wp4[0], wv1 = wp4[1];",
+                "float wv_r[8] = {wv0.x, wv0.y, wv0.z, wv0.w, wv1.x, wv1.y, wv1.z, wv1.w};",
                 "threadgroup bfloat16_t h_s[RL_D];",
-                "threadgroup_barrier(mem_flags::mem_threadgroup);",
                 "const device float* st = cs3 + size_t(row) * 3 * RL_D;",
             ]
         s += [
@@ -809,9 +798,9 @@ def _k1_from_down_impl(
                 "  uint4 cwq1 = ((const device uint4*)(cw + bc * 4))[1];",
                 "  bfloat4 cwa[4] = { as_type<bfloat4>(cwq0.xy), as_type<bfloat4>(cwq0.zw), as_type<bfloat4>(cwq1.xy), as_type<bfloat4>(cwq1.zw) };",
                 "  for (int m = 0; m < 4; m++) {",
-                "    float ev[8], wv[8];",
-                "    for (int j = 0; j < 8; j++) { ev[j] = float(dv[j][m]); wv[j] = ww_s[j]; }",
-                "    float x0 = float(bfloat16_t(glue_moe_combine8(ev, wv)));",
+                "    float ev[8];",
+                "    for (int j = 0; j < 8; j++) ev[j] = float(dv[j][m]);",
+                "    float x0 = float(bfloat16_t(glue_moe_combine8(ev, wv_r)));",
                 "    float r0 = r0s[m], r1 = r1s[m], r2 = r2s[m];",
                 "    bfloat4 cww = cwa[m];",
                 f"    bfloat16_t hch = rl_conv_pmc_resid(cww, r0, r1, r2, x0, ress[m], {_SCALE_CONV});",
@@ -978,11 +967,12 @@ def _k1_from_down_impl(
         )
         outs_t = tuple(outs)
         k = _kernel(name.replace(".", "p").replace("-", "m"), src, tuple(ins), outs_t, ensure_row_contiguous=True)
-        _K1_DOWN_CACHE[ckey] = (k, outs_t, dts, gpar)
+        grid = (B * gpar * TG, 1, 1)
+        _K1_DOWN_CACHE[ckey] = (k, outs_t, dts, grid, shapes)
 
-    r = k(inputs=args, grid=(B * gpar * TG, 1, 1), threadgroup=(TG, 1, 1), output_shapes=shapes, output_dtypes=dts)
+    r = k(inputs=args, grid=grid, threadgroup=_RL_TG_TUP, output_shapes=shapes, output_dtypes=dts)
     o = dict(zip(outs_t, r))
-    res = {"w3": o["w3"], "normed_residual": o["nr"]}
+    res = _K1MsgDict({"w3": o["w3"], "normed_residual": o["nr"]}) if msg is not None else {"w3": o["w3"], "normed_residual": o["nr"]}
     if emit_h:
         res["h"] = o["h_out"]
     if msg is None:
@@ -995,8 +985,7 @@ def _k1_from_down_impl(
             res.update(s_q=o["s0"], s_k=o["s0"], s_v=o["s0"])
         else:
             res.update(s_q=o["s0"], s_k=o["s1"], s_v=o["s2"])
-        gi = o["gi"]
-        res.update(qkv_gate_in=gi, q_gate_in=gi[:, 0], k_gate_in=gi[:, 1], v_gate_in=gi[:, 2])
+        res["qkv_gate_in"] = o["gi"]
     if "ai" in o:
         res["attn_input"] = o["ai"]
     return res
@@ -1201,6 +1190,27 @@ def k10_post(o_proj, h, nr, bs, cs2, conv_w, query, ln_w, msg, *, boundary, eps_
         args.append(conv_anc)
     if has_wa:
         args.append(w_act if w_act.ndim == 1 else w_act.reshape(-1))
+    ckey = (NB, bs_is_list, boundary, msg is not None, eps_ln, debug, causal, has_wa)
+    cached = _K10_CACHE.get(ckey)
+    if cached is not None:
+        k, outs, dts, b_cache = cached
+        bmeta = b_cache.get(B)
+        if bmeta is None:
+            bd = (B, D)
+            if not debug:
+                shapes = [(B, 3, D), bd, bd] if msg is None else [(B, 3, D), bd, bd, (B, 2 * D)]
+            else:
+                shapes = [bd, (B, 3, D), bd, bd, bd, (B, 2 * D) if msg is not None else bd]
+            bmeta = b_cache[B] = ((B * TG, 1, 1), shapes)
+        grid, shapes = bmeta
+        r = k(inputs=args, grid=grid, threadgroup=_RL_TG_TUP, output_shapes=shapes, output_dtypes=dts)
+        if not debug:
+            if msg is None:
+                return {"w2": r[0], "residual": r[1], "mlp_x": r[2]}
+            return {"w2": r[0], "residual": r[1], "mlp_src": r[2], "mlp_gate_in": r[3]}
+        if msg is None:
+            return {"post_attn_conv": r[0], "w2": r[1], "residual": r[2], "normed": r[3], "mlp_src": r[4], "mlp_x": r[5]}
+        return {"post_attn_conv": r[0], "w2": r[1], "residual": r[2], "normed": r[3], "mlp_src": r[4], "mlp_gate_in": r[5]}
     bd = (B, D)
     if not debug:
         if msg is None:
@@ -1209,19 +1219,6 @@ def k10_post(o_proj, h, nr, bs, cs2, conv_w, query, ln_w, msg, *, boundary, eps_
             shapes = [(B, 3, D), bd, bd, (B, 2 * D)]
     else:
         shapes = [bd, (B, 3, D), bd, bd, bd, (B, 2 * D) if msg is not None else bd]
-
-    ckey = (NB, bs_is_list, boundary, msg is not None, eps_ln, debug, causal, has_wa)
-    cached = _K10_CACHE.get(ckey)
-    if cached is not None:
-        k, outs, dts = cached
-        r = k(inputs=args, grid=(B * TG, 1, 1), threadgroup=(TG, 1, 1), output_shapes=shapes, output_dtypes=dts)
-        if not debug:
-            if msg is None:
-                return {"w2": r[0], "residual": r[1], "mlp_x": r[2]}
-            return {"w2": r[0], "residual": r[1], "mlp_src": r[2], "mlp_gate_in": r[3]}
-        if msg is None:
-            return {"post_attn_conv": r[0], "w2": r[1], "residual": r[2], "normed": r[3], "mlp_src": r[4], "mlp_x": r[5]}
-        return {"post_attn_conv": r[0], "w2": r[1], "residual": r[2], "normed": r[3], "mlp_src": r[4], "mlp_gate_in": r[5]}
 
     bs_ins = [f"bs{i}" for i in range(NB)] if bs_is_list else (["bs"] if NB else [])
     ins = ["op", "h", "nr"] + bs_ins + ["cs", "cw", "query", "w"] + (["msg"] if msg is not None else []) + (["conv_anc"] if causal else []) + (["w_act"] if has_wa else [])
@@ -1269,7 +1266,7 @@ def k10_post(o_proj, h, nr, bs, cs2, conv_w, query, ln_w, msg, *, boundary, eps_
         "int b0 = (int(sg) * 32 + int(lane)) * 4;",
         "int b1 = ((int(sg) + 9) * 32 + int(lane)) * 4;",
         "const device bfloat16_t* opr = op + size_t(row) * RL_D;",
-        "const device bfloat16_t* hr = h + size_t(row) * RL_D;",
+        "const device bfloat16_t* hr = h + size_t(row) * RL_D; (void)hr;",
         "const device float* st = cs" + ("" if causal else " + size_t(row) * 3 * RL_D") + "; (void)st;",
         "device float* w2r = w2 + size_t(row) * 3 * RL_D;",
     ] + anc_decl + [
@@ -1281,12 +1278,11 @@ def k10_post(o_proj, h, nr, bs, cs2, conv_w, query, ln_w, msg, *, boundary, eps_
         "  ((device float4*)(w2r + base))[0] = r1v;",
         "  ((device float4*)(w2r + RL_D + base))[0] = r2v;",
         "  ((device float4*)(w2r + 2 * RL_D + base))[0] = x0v;",
-        "  float4 hv = rl_load_bf4(hr + base);",
+        *([] if boundary else ["  float4 hv = rl_load_bf4(hr + base);", "  float ha[4] = {hv.x, hv.y, hv.z, hv.w};"]),
         "  float x0a[4] = {x0v.x, x0v.y, x0v.z, x0v.w};",
         "  float r0a[4] = {r0v.x, r0v.y, r0v.z, r0v.w};",
         "  float r1a[4] = {r1v.x, r1v.y, r1v.z, r1v.w};",
         "  float r2a[4] = {r2v.x, r2v.y, r2v.z, r2v.w};",
-        "  float ha[4] = {hv.x, hv.y, hv.z, hv.w};",
         "  uint4 cwq0 = ((const device uint4*)(cw + base * 4))[0];",
         "  uint4 cwq1 = ((const device uint4*)(cw + base * 4))[1];",
         "  bfloat4 cwa[4] = { as_type<bfloat4>(cwq0.xy), as_type<bfloat4>(cwq0.zw), as_type<bfloat4>(cwq1.xy), as_type<bfloat4>(cwq1.zw) };",
@@ -1382,8 +1378,9 @@ def k10_post(o_proj, h, nr, bs, cs2, conv_w, query, ln_w, msg, *, boundary, eps_
         NB, int(bs_is_list), int(boundary), int(msg is not None), flit(eps_ln), "_c" if causal else "", "_wa" if has_wa else "", "_dbg" if debug else ""
     )
     k = _kernel(name.replace(".", "p").replace("-", "m"), src, tuple(ins), outs)
-    _K10_CACHE[ckey] = (k, outs, dts)
-    r = k(inputs=args, grid=(B * TG, 1, 1), threadgroup=(TG, 1, 1), output_shapes=shapes, output_dtypes=dts)
+    grid = (B * TG, 1, 1)
+    _K10_CACHE[ckey] = (k, outs, dts, {B: (grid, shapes)})
+    r = k(inputs=args, grid=grid, threadgroup=_RL_TG_TUP, output_shapes=shapes, output_dtypes=dts)
     o = dict(zip(outs, r))
     res = dict(w2=o["w2"], residual=o["res_o"])
     if has_src:

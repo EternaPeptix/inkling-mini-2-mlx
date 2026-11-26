@@ -39,6 +39,7 @@ MOE_B1_NSG_GU = int(os.environ.get("MOE_B1_NSG_GU", "1"))
 MOE_B1_ROWS_GU = int(os.environ.get("MOE_B1_ROWS_GU", "4"))
 MOE_B1_NSG_DN = int(os.environ.get("MOE_B1_NSG_DN", "8"))
 MOE_B1_ROWS_DN = int(os.environ.get("MOE_B1_ROWS_DN", "2"))
+MOE_FP8_LUT = os.environ.get("MOE_FP8_LUT", "1") not in ("0", "")
 _ZERO_F32 = mx.zeros((1,), mx.float32)
 _SCALE_CONV_LIT = repr(float(np.float32(math.sqrt(4 + 1)))) + "f"
 
@@ -339,7 +340,42 @@ inline uint moe_route_row_q(RPtr row, const device float* bias, uint lane, int t
 }
 """
 
-_DOT_BF16 = r"""
+def _gen_fp_luts():
+    e4m3 = []
+    for b in range(256):
+        s = -1.0 if (b & 0x80) else 1.0
+        exp = (b >> 3) & 0xF
+        man = b & 0x7
+        if exp == 15 and man == 7:
+            e4m3.append("NAN")
+        elif exp == 0:
+            v = s * (man / 8.0) * (2.0 ** -6)
+            e4m3.append(("-0.0f" if (b & 0x80) else "0.0f") if man == 0 else f"{v!r}f")
+        else:
+            v = s * (1.0 + man / 8.0) * (2.0 ** (exp - 7))
+            e4m3.append(f"{v!r}f")
+    fp4 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+    fp4_s = ", ".join(("-0.0f" if i == 8 else f"{v!r}f") for i, v in enumerate(fp4))
+    return (
+        "constant float FP8_E4M3_LUT[256] = {" + ", ".join(e4m3) + "};\n"
+        + "constant float FP4_E2M1_LUT[16] = {" + fp4_s + "};\n"
+    )
+
+
+_FP_LUT_HEADER = _gen_fp_luts() if MOE_FP8_LUT else ""
+
+_DOT_BF16 = _FP_LUT_HEADER + (r"""
+template <int GS>
+inline float moe_dequant_scale(uint8_t s) {
+  if constexpr (GS == 16) return FP8_E4M3_LUT[s];
+  else return dequantize_scale<float, GS>(s);
+}
+""" if MOE_FP8_LUT else r"""
+template <int GS>
+inline float moe_dequant_scale(uint8_t s) {
+  return dequantize_scale<float, GS>(s);
+}
+""") + r"""
 template <int bits, int values_per_thread>
 inline float dot_vals_bf16(const thread bfloat16_t* xt, const thread float* d, float scale) {
   float accum = 0;
@@ -438,6 +474,34 @@ inline void dequant_u32_fp4_8(uint32_t v, thread float* d) {
   d[6] = Dequantize<4>{}(uint16_t(v >> 24));
   d[7] = Dequantize<4>{}(uint16_t(v >> 28));
 }
+""" + (r"""
+inline void dequant_u32_fp4_8_b1(uint32_t v, thread float* d) {
+  d[0] = FP4_E2M1_LUT[v & 15u];
+  d[1] = FP4_E2M1_LUT[(v >> 4) & 15u];
+  d[2] = FP4_E2M1_LUT[(v >> 8) & 15u];
+  d[3] = FP4_E2M1_LUT[(v >> 12) & 15u];
+  d[4] = FP4_E2M1_LUT[(v >> 16) & 15u];
+  d[5] = FP4_E2M1_LUT[(v >> 20) & 15u];
+  d[6] = FP4_E2M1_LUT[(v >> 24) & 15u];
+  d[7] = FP4_E2M1_LUT[(v >> 28) & 15u];
+}
+
+inline void dequant_u2_fp8_8(uint2 v, thread float* d) {
+  uchar4 c0 = as_type<uchar4>(v.x);
+  uchar4 c1 = as_type<uchar4>(v.y);
+  d[0] = FP8_E4M3_LUT[c0.x];
+  d[1] = FP8_E4M3_LUT[c0.y];
+  d[2] = FP8_E4M3_LUT[c0.z];
+  d[3] = FP8_E4M3_LUT[c0.w];
+  d[4] = FP8_E4M3_LUT[c1.x];
+  d[5] = FP8_E4M3_LUT[c1.y];
+  d[6] = FP8_E4M3_LUT[c1.z];
+  d[7] = FP8_E4M3_LUT[c1.w];
+}
+""" if MOE_FP8_LUT else r"""
+inline void dequant_u32_fp4_8_b1(uint32_t v, thread float* d) {
+  dequant_u32_fp4_8(v, d);
+}
 
 inline void dequant_u2_fp8_8(uint2 v, thread float* d) {
   uchar4 c0 = as_type<uchar4>(v.x);
@@ -451,7 +515,7 @@ inline void dequant_u2_fp8_8(uint2 v, thread float* d) {
   d[6] = Dequantize<8>{}(c1.z);
   d[7] = Dequantize<8>{}(c1.w);
 }
-"""
+""")
 
 HEADER = mlx_header() + _DOT_BF16 + GLUE_HEADER + _ROUTE_FN
 
@@ -717,7 +781,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) {
@@ -740,7 +804,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) {
@@ -767,7 +831,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[VPT];
                                 dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4_s[t * 32 + lane], wv, sv);
@@ -787,7 +851,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[VPT];
                                 dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2_s[t * 32 + lane], wv, sv);
@@ -841,7 +905,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u32_fp4_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                     }
                 } else {
@@ -856,7 +920,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                     }
                 }
@@ -867,7 +931,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                 for (int r = 0; r < ROWS; r++) {
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                 }
             } else {
@@ -877,7 +941,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                 for (int r = 0; r < ROWS; r++) {
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals<BITS, VPT>(xt, wv, sv);
                 }
             }
@@ -903,7 +967,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[8];
                             dequant_u32_fp4_8(wr[r], wv);
-                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            U sv = moe_dequant_scale<GS>(sr[r]);
                             result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                         }
                     } else {
@@ -918,7 +982,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[8];
                             dequant_u2_fp8_8(wr[r], wv);
-                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            U sv = moe_dequant_scale<GS>(sr[r]);
                             result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                         }
                     }
@@ -929,7 +993,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                     }
                 } else {
@@ -939,7 +1003,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals<BITS, VPT>(xt, wv, sv);
                     }
                 }
@@ -964,7 +1028,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) {
@@ -991,7 +1055,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[8];
                                 dequant_u32_fp4_8(wr[r], wv);
-                                U sv = dequantize_scale<U, GS>(sr[r]);
+                                U sv = moe_dequant_scale<GS>(sr[r]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
@@ -1009,7 +1073,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[8];
                                 dequant_u2_fp8_8(wr[r], wv);
-                                U sv = dequantize_scale<U, GS>(sr[r]);
+                                U sv = moe_dequant_scale<GS>(sr[r]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
@@ -1023,7 +1087,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) {
@@ -1042,7 +1106,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
@@ -1062,7 +1126,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                     for (int r = 0; r < ROWS; r++) {
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         #pragma unroll
                         for (int t = 0; t < TMAX; t++) {
                             if (t < nb) result[t][r] += dot_vals_bf16<BITS, VPT>(xb[t], wv, sv);
@@ -1081,7 +1145,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[VPT];
                                 dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) {
@@ -1108,7 +1172,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                                 for (int r = 0; r < ROWS; r++) {
                                     thread U wv[8];
                                     dequant_u32_fp4_8(wr[r], wv);
-                                    U sv = dequantize_scale<U, GS>(sr[r]);
+                                    U sv = moe_dequant_scale<GS>(sr[r]);
                                     #pragma unroll
                                     for (int t = 0; t < TMAX; t++) {
                                         if (t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
@@ -1126,7 +1190,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                                 for (int r = 0; r < ROWS; r++) {
                                     thread U wv[8];
                                     dequant_u2_fp8_8(wr[r], wv);
-                                    U sv = dequantize_scale<U, GS>(sr[r]);
+                                    U sv = moe_dequant_scale<GS>(sr[r]);
                                     #pragma unroll
                                     for (int t = 0; t < TMAX; t++) {
                                         if (t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
@@ -1140,7 +1204,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[VPT];
                                 dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) {
@@ -1159,7 +1223,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int r = 0; r < ROWS; r++) {
                                 thread U wv[VPT];
                                 dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                                 #pragma unroll
                                 for (int t = 0; t < TMAX; t++) {
                                     if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
@@ -1179,7 +1243,7 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                         for (int r = 0; r < ROWS; r++) {
                             thread U wv[VPT];
                             dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                             #pragma unroll
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) result[t][r] += dot_vals_bf16<BITS, VPT>(xb[t], wv, sv);
@@ -1241,7 +1305,7 @@ def _k_body(xoff_expr, epi_src):
             #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 dequant_vals<BITS, VPT>(ws + r * in_w, wv[r]);
-                sv[r] = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                sv[r] = moe_dequant_scale<GS>((sc + r * in_g)[0]);
             }
             #pragma unroll
             for (int t = 0; t < TMAX; t++) {
@@ -1264,7 +1328,7 @@ def _k_body(xoff_expr, epi_src):
                 #pragma unroll
                 for (int r = 0; r < ROWS; r++) {
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv[r]);
-                    sv[r] = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    sv[r] = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                 }
                 #pragma unroll
                 for (int t = 0; t < TMAX; t++) {
@@ -1852,8 +1916,8 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                 #pragma unroll
                 for (int r = 0; r < ROWS; r++) {{
                     thread U wv[8];
-                    dequant_u32_fp4_8(wr[r], wv);
-                    U sv = dequantize_scale<U, GS>(sr[r]);
+                    dequant_u32_fp4_8_b1(wr[r], wv);
+                    U sv = moe_dequant_scale<GS>(sr[r]);
                     result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                 }}
             }} else {{
@@ -1868,7 +1932,7 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                 for (int r = 0; r < ROWS; r++) {{
                     thread U wv[8];
                     dequant_u2_fp8_8(wr[r], wv);
-                    U sv = dequantize_scale<U, GS>(sr[r]);
+                    U sv = moe_dequant_scale<GS>(sr[r]);
                     result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                 }}
             }}
@@ -1879,7 +1943,7 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
             for (int r = 0; r < ROWS; r++) {{
                 thread U wv[VPT];
                 dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                 result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
             }}
         }} else {{
@@ -1887,7 +1951,7 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
             load_vector<T, U, VPT>(xp + k_off, xt);
             #pragma unroll
             for (int r = 0; r < ROWS; r++) {{
-                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                 result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
             }}
         }}
@@ -1912,8 +1976,8 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                     #pragma unroll
                     for (int r = 0; r < ROWS; r++) {{
                         thread U wv[8];
-                        dequant_u32_fp4_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        dequant_u32_fp4_8_b1(wr[r], wv);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                     }}
                 }} else {{
@@ -1928,7 +1992,7 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                     for (int r = 0; r < ROWS; r++) {{
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                     }}
                 }}
@@ -1939,7 +2003,7 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                 for (int r = 0; r < ROWS; r++) {{
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                 }}
             }} else {{
@@ -1947,7 +2011,7 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                 load_vector<T, U, VPT>(xp + k_off, xt);
                 #pragma unroll
                 for (int r = 0; r < ROWS; r++) {{
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
                 }}
             }}
@@ -2024,8 +2088,8 @@ def _down_b1_src(dbg, scale_lit):
                     #pragma unroll
                     for (int r = 0; r < ROWS; r++) {{
                         thread U wv[8];
-                        dequant_u32_fp4_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        dequant_u32_fp4_8_b1(wr[r], wv);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
                     }}
                 }} else {{
@@ -2040,7 +2104,7 @@ def _down_b1_src(dbg, scale_lit):
                     for (int r = 0; r < ROWS; r++) {{
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
-                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        U sv = moe_dequant_scale<GS>(sr[r]);
                         result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
                     }}
                 }}
@@ -2051,7 +2115,7 @@ def _down_b1_src(dbg, scale_lit):
                 for (int r = 0; r < ROWS; r++) {{
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                 }}
             }} else {{
@@ -2059,7 +2123,7 @@ def _down_b1_src(dbg, scale_lit):
                 load_vector<T, U, VPT>(xp + k_off, xt);
                 #pragma unroll
                 for (int r = 0; r < ROWS; r++) {{
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
                 }}
             }}
@@ -2077,7 +2141,7 @@ def _down_b1_src(dbg, scale_lit):
                     for (int r = 0; r < ROWS; r++) {{
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
                     }}
                 }} else if constexpr (VPT == 4) {{
@@ -2087,7 +2151,7 @@ def _down_b1_src(dbg, scale_lit):
                     for (int r = 0; r < ROWS; r++) {{
                         thread U wv[VPT];
                         dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
                     }}
                 }} else {{
@@ -2095,7 +2159,7 @@ def _down_b1_src(dbg, scale_lit):
                     load_vector<T, U, VPT>(xp + k_off, xt);
                     #pragma unroll
                     for (int r = 0; r < ROWS; r++) {{
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                         result[r] += qdot<U, VPT, BITS>(ws + r * in_w, xt, sv);
                     }}
                 }}

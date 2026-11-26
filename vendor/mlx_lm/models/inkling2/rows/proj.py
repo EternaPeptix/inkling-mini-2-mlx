@@ -220,6 +220,8 @@ def _P(m):
 _qkv_cat_cache: dict = {}
 _QKV_CAT = os.environ.get("LOOPLING_QKV_CAT", "1") not in ("0", "")
 _GD_TM1 = os.environ.get("LOOPLING_GD_TM1", "1") not in ("0", "")
+_OUT_DT_BF = [mx.bfloat16]
+_OUT_DT_F32_2 = [mx.float32, mx.float32]
 
 
 def _aff8_ok(m):
@@ -347,7 +349,7 @@ def qkv_rows(a, q_in, k_in, v_in, full=None, flat=False):
         single_x = (not full) and (q_in is k_in) and (k_in is v_in)
         cat = _get_qkv_cat(a, single_x, full)
         if cat is not None:
-            cat_groups, grp_widths, fields, _fw, b_cache = cat
+            cat_groups, grp_widths, fields, flat_w, b_cache = cat
             B, K = q_in.shape
             if single_x:
                 if B == 1:
@@ -358,6 +360,60 @@ def qkv_rows(a, q_in, k_in, v_in, full=None, flat=False):
                     ).reshape(-1)
                 else:
                     buf = _qmv.qmv_rows(q_in, *cat_groups[0]).reshape(-1)
+            elif 1 <= B <= MAX_B and K % _qmv._K_ALIGN == 0 and K not in (64, 128) and q_in.dtype == mx.bfloat16 and k_in.dtype == mx.bfloat16 and v_in.dtype == mx.bfloat16:
+                xmap = (0, 0, 0) if (q_in is k_in and k_in is v_in) else ((0, 1, 1) if k_in is v_in else ((0, 0, 1) if q_in is k_in else ((0, 1, 0) if q_in is v_in else (0, 1, 2))))
+                lkey = ("lq", B, K, xmap)
+                lmeta = b_cache.get(lkey)
+                if lmeta is None:
+                    tot_n = sum(grp_widths)
+                    nw = len(cat_groups)
+                    rout = _qmv._use_rout(B, tot_n, nw, pro=False)
+                    f32x = _qmv._use_rout_f32x(B, tot_n, nw, pro=False) if rout else False
+                    ro = _qmv._use_ro(B, tot_n, pro=False, rout=rout)
+                    stg_x = _qmv._use_stg_x(B, tot_n, rout, pro=False)
+                    rps, nsg, rb, stg = _qmv._cfg(B, False, N=tot_n, rout=rout, ro=ro)
+                    tmpl = [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb)]
+                    if not (rout or ro):
+                        tmpl.append(("STG", stg))
+                    tw = rps * nsg
+                    tiles = 0
+                    for i, gw in enumerate(grp_widths):
+                        tmpl.append((f"N{i}", gw))
+                        tiles += (gw + tw - 1) // tw
+                    kern = _qkernel(nw, xmap, False, rout=rout, ro=ro, stg_x=stg_x, f32x=f32x)
+                    grid = (((B + rb - 1) // rb) * 32, nsg * tiles, 1)
+                    tg = (32, nsg, 1)
+                    out_shp = [(B * tot_n,)]
+                    grp_bases = (0, B * grp_widths[0], B * (grp_widths[0] + grp_widths[1]))
+                    lay = [(nm, grp_bases[gi] + loc, gw, nc) for nm, gi, loc, gw, nc in fields]
+                    lmeta = b_cache[lkey] = (kern, tmpl, grid, tg, out_shp, lay, grp_bases)
+                kern, tmpl, grid, tg, out_shp, lay, grp_bases = lmeta
+                if xmap == (0, 1, 2):
+                    x_in = [q_in, k_in, v_in]
+                elif xmap == (0, 0, 0):
+                    x_in = [q_in]
+                elif xmap == (0, 1, 1):
+                    x_in = [q_in, k_in]
+                elif xmap == (0, 0, 1):
+                    x_in = [q_in, v_in]
+                else:
+                    x_in = [q_in, k_in]
+                buf = kern(
+                    inputs=x_in + flat_w,
+                    template=tmpl,
+                    grid=grid,
+                    threadgroup=tg,
+                    output_shapes=out_shp,
+                    output_dtypes=_OUT_DT_BF,
+                )[0]
+                if flat:
+                    return buf, lay
+                out = {}
+                for nm, gi, loc, gw, nc in fields:
+                    gb = grp_bases[gi]
+                    view = buf[gb : gb + B * gw].reshape(B, gw)[:, loc : loc + nc]
+                    out[nm] = view if (loc == 0 and gw == nc) else mx.contiguous(view)
+                return out
             else:
                 buf = _launch_q([q_in, k_in, v_in], list(cat_groups))
             if flat:
@@ -1504,21 +1560,23 @@ def gate_down_rows(x, ws):
             raise ValueError("weights must all be (N,K) bf16")
     if _GD_TM1 and N == 64 and K == 4608 and B <= 16:
         key = ("tm1", B, G, N, K)
-        kern = _k2.get(key)
-        if kern is None:
-            kern = _k2[key] = mx.fast.metal_kernel(
+        ent = _k2.get(key)
+        if ent is None:
+            kern = mx.fast.metal_kernel(
                 name="f3_gate_down_tm1_b%d_g%d" % (B, G),
                 input_names=["x"] + ["w%d" % g for g in range(G)],
                 output_names=["o"],
                 source=_gd_tm1_src(G, B),
                 ensure_row_contiguous=True,
             )
+            ent = _k2[key] = (kern, (G * 64 * 32, 8, 1), (32, 8, 1), [(B, G, N)])
+        kern, grid, tg, out_shp = ent
         return kern(
             inputs=[x] + list(ws),
-            grid=(G * 64 * 32, 8, 1),
-            threadgroup=(32, 8, 1),
-            output_shapes=[(B, G, N)],
-            output_dtypes=[mx.bfloat16],
+            grid=grid,
+            threadgroup=tg,
+            output_shapes=out_shp,
+            output_dtypes=_OUT_DT_BF,
         )[0]
     cfg = _gemv._cfg(N, K)
     bm, bn, sm, sn, tm, tn = cfg
@@ -1912,9 +1970,9 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
     nsg = 8
     nt = 36  # 2304 / 64 = 36 half-SG tiles (108 TGs for G=3 -> all 80 M3 Ultra cores busy, 1 pass!)
     rb = _gmix_rb(B)
-    key = (B, rb, G, tuple(smap), tuple(slots), use_bf16)
-    kern = _k3p.get(key)
-    if kern is None:
+    key = (B, rb, G, smap, slots, use_bf16)
+    ent = _k3p.get(key)
+    if ent is None:
         lines = [
             f"threadgroup bfloat16_t dn_s[{rb} * 64];",
             f"threadgroup float mix_s[{rb} * 64];",
@@ -1943,14 +2001,15 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
             source="\n".join(lines),
             ensure_row_contiguous=True,
         )
-        _k3p[key] = kern
-    tg_t = nsg * 32
+        tg_t = nsg * 32
+        ent = _k3p[key] = (kern, (((B + rb - 1) // rb) * tg_t, G * nt, 1), (tg_t, 1, 1), [(B, G, D), (B, G, 36)])
+    kern, grid, tg, out_shp = ent
     return kern(
         inputs=[down, msg] + uniq + w_ins,
-        grid=(((B + rb - 1) // rb) * tg_t, G * nt, 1),
-        threadgroup=(tg_t, 1, 1),
-        output_shapes=[(B, G, D), (B, G, 36)],
-        output_dtypes=[mx.float32, mx.float32],
+        grid=grid,
+        threadgroup=tg,
+        output_shapes=out_shp,
+        output_dtypes=_OUT_DT_F32_2,
     )
 
 
@@ -1970,9 +2029,9 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
     rows_tg = nsg * 8
     nt = D // rows_tg
     rb = _gmix_rb(B)
-    key = (B, rb, G, D, nsg, tuple(smap), tuple(slots), use_bf16)
-    kern = _k3.get(key)
-    if kern is None:
+    key = (B, rb, G, D, nsg, smap, slots, use_bf16)
+    ent = _k3.get(key)
+    if ent is None:
         lines = [
             f"threadgroup bfloat16_t dn_s[{rb} * 64];",
             "const uint t = threadgroup_position_in_grid.y;",
@@ -2000,12 +2059,13 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
             source="\n".join(lines),
             ensure_row_contiguous=True,
         )
-        _k3[key] = kern
-    tg_t = nsg * 32
+        tg_t = nsg * 32
+        ent = _k3[key] = (kern, (((B + rb - 1) // rb) * tg_t, G * nt, 1), (tg_t, 1, 1), [(B, G, D)], [mx.float32])
+    kern, grid, tg, out_shp, out_dt = ent
     return kern(
         inputs=[down, msg] + uniq + w_ins,
-        grid=(((B + rb - 1) // rb) * tg_t, G * nt, 1),
-        threadgroup=(tg_t, 1, 1),
-        output_shapes=[(B, G, D)],
-        output_dtypes=[mx.float32],
+        grid=grid,
+        threadgroup=tg,
+        output_shapes=out_shp,
+        output_dtypes=out_dt,
     )[0]

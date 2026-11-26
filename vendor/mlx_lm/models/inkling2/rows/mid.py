@@ -70,7 +70,7 @@ def _source(full, H, HK, thr_q, thr_k, thr_r, eps, debug, flat=False, rel_r=0, p
     uint role = threadgroup_position_in_grid.x;
     uint lid = thread_position_in_threadgroup.x;
     uint lane = lid & 31, sg = lid >> 5;
-    threadgroup float vbuf[8 * 128];
+    threadgroup float vbuf[8 * {"256" if fused_rel else "128"}];
     float tau_v = {"tau[b]" if full else "1.0f"};{flat_ptrs}
     if (role < 3) {{                          // q: head = 8*role + sg
       uint h = role * 8 + sg;
@@ -217,7 +217,6 @@ def _source(full, H, HK, thr_q, thr_k, thr_r, eps, debug, flat=False, rel_r=0, p
       simdgroup_load(mb10, Bm + 8 * R + 0, R);
       simdgroup_load(mb01, Bm + 0 * R + 8, R);
       simdgroup_load(mb11, Bm + 8 * R + 8, R);
-      threadgroup float* st = vbuf + sg * 128;
       int r = int(lane >> 2), c = int(lane & 3) * 4;
       for (int mi = 0; mi < 3; mi++) {{
         simdgroup_bfloat8x8 ma0, ma1;
@@ -229,13 +228,13 @@ def _source(full, H, HK, thr_q, thr_k, thr_r, eps, debug, flat=False, rel_r=0, p
         simdgroup_multiply_accumulate(acc0, ma1, mb10, acc0);
         simdgroup_multiply_accumulate(acc1, ma0, mb01, acc1);
         simdgroup_multiply_accumulate(acc1, ma1, mb11, acc1);
+        threadgroup float* st = vbuf + (sg * 2 + (mi & 1)) * 128;
         simdgroup_store(acc0, st + 0, 16);
         simdgroup_store(acc1, st + 8, 16);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         float4 fv = ((const threadgroup float4*)(st + r * 16 + c))[0];
         bfloat4 bv = bfloat4(bfloat16_t(fv.x), bfloat16_t(fv.y), bfloat16_t(fv.z), bfloat16_t(fv.w));
         ((device uint2*)(Cm + (mi * 8 + r) * R + c))[0] = as_type<uint2>(bv);
-        if (mi < 2) simdgroup_barrier(mem_flags::mem_threadgroup);
       }}
     }}
 """
@@ -258,8 +257,10 @@ def _source(full, H, HK, thr_q, thr_k, thr_r, eps, debug, flat=False, rel_r=0, p
 _cache = {}
 _CHAIN_CONV_ANC = {}
 _FLAT_TMPL_CACHE = {}
+_MID_FAST_CACHE = {}
 _MID_DTS_PKV_REL = [mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.float32, mx.float32]
 _MID_DTS_UNP_REL = [mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.float32, mx.float32]
+_MID_TG = (256, 1, 1)
 
 
 def _default_conv_anc(W):
@@ -295,6 +296,40 @@ def _run_mid(
     layer, q_proj, r_proj, k_proj, v_proj, flat_buf, flat_layout, cs0, cs1, tau, k_wproj, v_wproj, debug,
     rel_w=None, packed_kv=False, causal_w_B=0, conv_anc=None, w_act=None, packed_kv_b=False,
 ):
+    if flat_buf is not None and not debug:
+        B_f = int(causal_w_B) if causal_w_B > 0 else cs0.shape[0]
+        rel_r_f = rel_w.shape[1] if rel_w is not None else 0
+        fkey = (id(layer), id(flat_layout), B_f, packed_kv, packed_kv_b, causal_w_B, rel_r_f, w_act is not None)
+        ent = _MID_FAST_CACHE.get(fkey)
+        if ent is not None and ent[0] is flat_layout:
+            (_lay_ref, a_ref, full_f, ql2, rl2, ksconv, vsconv, w_refs, k, tmpl, grid, shapes, dts, C_f) = ent
+            if isinstance(a_ref, dict):
+                q_sc = ql2["scale"]
+                r_sc = rl2["scale"]
+                cw0 = ksconv["static_weight"] if full_f else ksconv["conv1d"]["weight"]
+                cw1 = vsconv["static_weight"] if full_f else vsconv["conv1d"]["weight"]
+            else:
+                q_sc = ql2.scale
+                r_sc = rl2.scale
+                cw0 = ksconv.static_weight if full_f else ksconv.conv1d.weight
+                cw1 = vsconv.static_weight if full_f else vsconv.conv1d.weight
+            if (q_sc is w_refs[0] and r_sc is w_refs[1] and cw0 is w_refs[2] and cw1 is w_refs[3]
+                and flat_buf.ndim == 1 and flat_buf.dtype == mx.bfloat16
+                and cs0.dtype == mx.float32 and cs1.dtype == mx.float32):
+                ins = [flat_buf, cs0, cs1, q_sc, r_sc]
+                if causal_w_B > 0:
+                    ins.append(_default_conv_anc(B_f) if conv_anc is None else conv_anc)
+                if full_f:
+                    if tau.ndim != 1:
+                        tau = tau.reshape(-1)
+                    ins.append(tau)
+                ins.append(cw0)
+                ins.append(cw1)
+                if rel_w is not None:
+                    ins.append(rel_w)
+                if w_act is not None:
+                    ins.append(w_act if w_act.ndim == 1 else w_act.reshape(-1))
+                return k(inputs=ins, grid=grid, threadgroup=_MID_TG, output_shapes=shapes, output_dtypes=dts, template=tmpl)
     a = dict.get(layer, "self_attn", layer) if isinstance(layer, dict) else getattr(layer, "self_attn", layer)
     if isinstance(a, dict):
         ql2, kl2, rl2 = a["q_l2_clip"], a["k_l2_clip"], a["rel_l2_clip"]
@@ -435,9 +470,17 @@ def _run_mid(
             name="mid_rows_%s%s%s%s%s%s%s_%d" % ("F" if full else "S", "_flat" if flat else "", "_rel" if rel_r else "", "_pkv" if packed_kv else "", "_pkb" if packed_kv_b else "", "_cw" if causal_w else "", "_wa" if has_wa else "", abs(hash(key)) % 10**9),
             input_names=names, output_names=outs, source=src, header=GLUE_HEADER + _MID_HEADER,
             ensure_row_contiguous=True)
+    grid = (256 * ntg, B, 1)
+    if flat and not debug:
+        fkey = (id(layer), id(flat_layout), B, packed_kv, packed_kv_b, causal_w_B, rel_r, has_wa)
+        if len(_MID_FAST_CACHE) >= 512:
+            _MID_FAST_CACHE.clear()
+        cw0 = ksw if full else kcw
+        cw1 = vsw if full else vcw
+        _MID_FAST_CACHE[fkey] = (flat_layout, a, full, ql2, rl2, ksconv, vsconv, (q_sc, r_sc, cw0, cw1), k, tmpl, grid, shapes, dts, C)
     if tmpl is not None:
-        return k(inputs=ins, grid=(256 * ntg, B, 1), threadgroup=(256, 1, 1), output_shapes=shapes, output_dtypes=dts, template=tmpl)
-    return k(inputs=ins, grid=(256 * ntg, B, 1), threadgroup=(256, 1, 1), output_shapes=shapes, output_dtypes=dts)
+        return k(inputs=ins, grid=grid, threadgroup=_MID_TG, output_shapes=shapes, output_dtypes=dts, template=tmpl)
+    return k(inputs=ins, grid=grid, threadgroup=_MID_TG, output_shapes=shapes, output_dtypes=dts)
 
 
 def mid_rows(layer, q_proj, r_proj, k_proj, v_proj, cs0, cs1, tau=None, k_wproj=None, v_wproj=None, debug=False, rel_w=None):

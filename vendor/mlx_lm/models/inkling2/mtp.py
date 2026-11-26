@@ -382,6 +382,10 @@ class FastDrafter:
             return fn
 
         self._get_qkv_prep = _get_qkv_prep
+        self._ctx_compiled = {}
+        self._dink_compiled = {}
+        self._pidx0 = mx.array([1, 2], mx.int32)
+        self._z_st = mx.zeros((1, self.rank), mx.bfloat16)
         self.reset()
 
     def reset(self):
@@ -417,9 +421,56 @@ class FastDrafter:
             return qmv4_fp16_rows(x2d, w, s, b)
         return mx.quantized_matmul(x2d, w, scales=s, biases=b, transpose=True, group_size=64, bits=4, mode="affine")
 
+    def _get_append_ctx_compiled(self, T: int, cap: int):
+        key = (T, cap)
+        fn = self._ctx_compiled.get(key)
+        if fn is not None:
+            return fn
+        nl, H, nkv, hd, theta = self.nl, self.H, self.nkv, self.hd, self.theta
+        qlw, dnorm, alpha = self.qlw, self.dnorm, self.alpha
+        alphas = [alpha[l].reshape(1, 1, -1, 1) for l in range(nl)]
+        kw = nkv * hd
+
+        @mx.compile
+        def _run(feats, pos_arr, *ckv):
+            cks = list(ckv[:nl])
+            cvs = list(ckv[nl:])
+            rope_off = pos_arr[0]
+            out_k = []
+            out_v = []
+            for l in range(nl):
+                lw = qlw[l]
+                m = (feats.astype(mx.float32) * alphas[l]).sum(axis=2)
+                c = mx.fast.rms_norm(m, dnorm[l].astype(mx.float32), EPS).astype(mx.float16).reshape(T, H)
+                w, s, b = lw["kv_ctx"]
+                kv = qmv4_fp16_rows(c, w, s, b)
+                k = mx.fast.rms_norm(kv[:, :kw].reshape(1, T, nkv, hd), lw["k_norm_ctx"], EPS).transpose(0, 2, 1, 3)
+                k = mx.fast.rope(k, hd, traditional=False, base=theta, scale=1.0, offset=rope_off)
+                v = kv[:, kw:].reshape(1, T, nkv, hd).transpose(0, 2, 1, 3)
+                out_k.append(mx.slice_update(cks[l], k, pos_arr, axes=(2,)))
+                out_v.append(mx.slice_update(cvs[l], v, pos_arr, axes=(2,)))
+            return tuple(out_k) + tuple(out_v)
+
+        self._ctx_compiled[key] = _run
+        return _run
+
     def append_ctx_gpu(self, feats, pos_arr):
         """feats: (1, T, ntap, H). Append next T committed positions at GPU `pos_arr (1,) i32`."""
-        T = feats.shape[1]
+        T = int(feats.shape[1])
+        if (
+            1 <= T <= 16
+            and self.ck[0] is not None
+            and os.environ.get("LOOPLING_MTP_COMPILE", "1") not in ("0", "")
+        ):
+            cap = int(self.ck[0].shape[2])
+            fn = self._get_append_ctx_compiled(T, cap)
+            cks, cvs = self.ck, self.cv
+            self.ck = [None] * self.nl
+            self.cv = [None] * self.nl
+            res = fn(feats, pos_arr, *cks, *cvs)
+            self.ck = list(res[: self.nl])
+            self.cv = list(res[self.nl :])
+            return
         rope_off = pos_arr[0]
         for l in range(self.nl):
             lw = self.qlw[l]
@@ -601,10 +652,116 @@ class FastDrafter:
         t0, p0, triples = self._draft_candidates(anchor, f_feat, max_depth=max_depth, beam_w=beam_w, pos_arr=pos_arr)
         return pack_tree_gpu_multi(t0, p0, triples, anchor, W)
 
+    def _get_dink_compiled(self, max_depth: int, W_max: int, cap: int, sl_sp: int, temp: float, use_lm_qmm: bool, fuse_sdpa_qkv: bool):
+        key = (max_depth, W_max, cap, sl_sp, float(temp), bool(use_lm_qmm), bool(fuse_sdpa_qkv))
+        fn = self._dink_compiled.get(key)
+        if fn is not None:
+            return fn
+        B = 1 + max_depth
+        nl, H, nh, nkv, hd, theta, window = self.nl, self.H, self.nh, self.nkv, self.hd, self.theta, self.window
+        local = self.local
+        qlw = self.qlw
+        mask_embed, final_norm = self.mask_embed, self.final_norm
+        lm_w, lm_s, lm_b = self.lm_w, self.lm_s, self.lm_b
+        alpha_mk = self.alpha[nl].reshape(1, 1, -1, 1)
+        mk_dnorm = self.mk_dnorm
+        w_ctx_h_f16, w_ctx_f_f16, rnn_bias_f16 = self.w_ctx_h_f16, self.w_ctx_f_f16, self.rnn_bias_f16
+        w1, w_recT_f32 = self.w1, self.w_recT_f32
+        fold_b_f16, fold_w_f16 = self.fold_b_f16, self.fold_w_f16
+        softcap, r = self.softcap, self.rank
+        embed = self.target.model.language_model.embed
+        emb_rms = _get_emb_rms_f16(B)
+        pidx0, z_st = self._pidx0, self._z_st
+        scale = hd**-0.5
+
+        @mx.compile
+        def _run(anchor, f_feat, cost_arr, dink_cfg, pos_arr, *ckv):
+            cks = ckv[:nl]
+            cvs = ckv[nl:]
+            emb = embed(anchor.reshape(1, 1))
+            res, h = emb_rms(emb, mask_embed, qlw[0]["in_ln"])
+            for l in range(nl):
+                lw = qlw[l]
+                qkv = mx.quantized_matmul(
+                    h.reshape(B, H), lw["qkv"][0], scales=lw["qkv"][1], biases=lw["qkv"][2],
+                    transpose=True, group_size=64, bits=4, mode="affine",
+                )
+                win = window if l in local else 0
+                if fuse_sdpa_qkv:
+                    o = sdpa_draft_qkv_gpu(
+                        qkv, lw["q_norm"], lw["k_norm"], cks[l], cvs[l], pos_arr,
+                        nh=nh, nkv=nkv, hd=hd, theta=theta, scale=scale, window=win,
+                    )
+                else:
+                    q, k, v = qkv_norm_rope_f16(qkv, lw["q_norm"], lw["k_norm"], pos_arr, nh, nkv, hd, theta)
+                    o = sdpa_draft_gpu(q, cks[l], cvs[l], k, v, pos_arr, scale=scale, window=win)
+                o = mx.quantized_matmul(
+                    o, lw["o"][0], scales=lw["o"][1], biases=lw["o"][2],
+                    transpose=True, group_size=64, bits=4, mode="affine",
+                ).reshape(1, B, H)
+                res, h2 = _add_rms_c(res, o, lw["post_ln"])
+                act = qmv4_fp16_swiglu_rows(h2.reshape(B, H), *lw["gu"])
+                down = mx.quantized_matmul(
+                    act, lw["down"][0], scales=lw["down"][1], biases=lw["down"][2],
+                    transpose=True, group_size=64, bits=4, mode="affine",
+                ).reshape(1, B, H)
+                if l + 1 == nl:
+                    _, h_final = _add_rms_c(res, down, final_norm)
+                    hid = h_final[0, 1:]
+                else:
+                    res, h = _add_rms_c(res, down, qlw[l + 1]["in_ln"])
+            if use_lm_qmm:
+                base = mx.quantized_matmul(
+                    hid, lm_w, scales=lm_s, biases=lm_b,
+                    transpose=True, group_size=64, bits=4, mode="affine",
+                )
+            else:
+                base = qmv4_fp16_rows(hid, lm_w, lm_s, lm_b)
+            ctx = _ctx_all_f16_c(hid, f_feat, alpha_mk, mk_dnorm, w_ctx_h_f16, w_ctx_f_f16, rnn_bias_f16)
+            st0, lat0 = _rnn_step_c(ctx[0:1], z_st, w1[anchor.reshape(1)], w_recT_f32)
+            top_val, top_idx = topk2_chunks_f16(base, fold_b_f16, sp=sl_sp)
+            tok0, prob0 = markov_shortlist_topk4_f16(lat0, top_val[0], top_idx[0], fold_w_f16, softcap, temp)
+            tok_f = tok0[0, :2]
+            jp_f = prob0[0, :2]
+            st_f = mx.broadcast_to(st0, (2, r))
+            pidx_f = pidx0
+            triples = []
+            for d in range(1, max_depth):
+                ctx_d = mx.broadcast_to(ctx[d : d + 1], (2, 3 * r))
+                st_d, lat_d = _rnn_step_c(ctx_d, st_f, w1[tok_f], w_recT_f32)
+                pool_base = 1 + 4 + (d - 1) * 8
+                ctok, cjp, cpar, tok_f, jp_f, st_f, pidx_f = markov_shortlist_topk4_beam_f16(
+                    lat_d, top_val[d], top_idx[d], fold_w_f16,
+                    jp_f, pidx_f, st_d, softcap, pool_base, temp,
+                )
+                triples.append((ctok, cjp, cpar))
+            return pack_tree_gpu_multi_dink(tok0[0], prob0[0], triples, anchor, W_max, cost_arr, dink_cfg)
+
+        self._dink_compiled[key] = _run
+        return _run
+
     def draft_and_pack_tree_dink(
         self, anchor, f_feat, cost_arr, dink_cfg, *, max_depth=3, W_max=4, beam_w=2, pos_arr=None
     ):
         """Zero-sync Beam-2 tree draft + on-GPU Dinkelbach verify-width selection `w_act in [2, W_max]`."""
+        if (
+            beam_w == 2
+            and max_depth >= 2
+            and os.environ.get("LOOPLING_MTP_SHORTLIST", "1") not in ("0", "")
+            and os.environ.get("LOOPLING_MTP_FUSE_QKV", "1") not in ("0", "")
+            and os.environ.get("LOOPLING_MTP_COMPILE", "1") not in ("0", "")
+        ):
+            if pos_arr is None:
+                P = self.n
+                self._ensure_cap(P + 1 + max_depth)
+                pos_arr = _pos_arr(P)
+            cap = int(self.ck[0].shape[2])
+            sl_sp = int(os.environ.get("LOOPLING_MTP_SL_SP", "256"))
+            temp = float(os.environ.get("LOOPLING_MTP_TEMP", "1.7"))
+            use_lm_qmm = max_depth <= 3 and os.environ.get("LOOPLING_MTP_LM_QMM", "1") not in ("0", "")
+            fuse_sdpa_qkv = os.environ.get("LOOPLING_MTP_FUSE_SDPA_QKV", "0") not in ("0", "")
+            fn = self._get_dink_compiled(max_depth, W_max, cap, sl_sp, temp, use_lm_qmm, fuse_sdpa_qkv)
+            return fn(anchor, f_feat, cost_arr, dink_cfg, pos_arr, *self.ck, *self.cv)
         t0, p0, triples = self._draft_candidates(
             anchor, f_feat, max_depth=max_depth, beam_w=beam_w, pos_arr=pos_arr
         )

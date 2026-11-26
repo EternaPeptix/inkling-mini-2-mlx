@@ -22,6 +22,7 @@ from mlx_lm.models.inkling2.rows import qmv4 as RQ4
 
 _USE_QMV4 = os.environ.get("LOOPLING_DFLASH2_QMV4", "0") not in ("0", "", "false", "False")
 _LOOKUP_BYPASS_MIN = int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_BYPASS", "6"))
+_LOOKUP_W = max(8, min(16, int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_W", "16"))))
 
 DFLASH2_DIR = os.environ.get(
     "LOOPLING_DFLASH2_DIR",
@@ -690,7 +691,7 @@ class DFlash2Drafter:
         n_tok = int(feats.shape[1])
         if n_tok == 0:
             return
-        if self._fused and n_tok <= 8 and self.ck[0] is not None:
+        if self._fused and n_tok <= 16 and self.ck[0] is not None:
             cap = int(self.ck[0].shape[2])
             fn = self._get_append_ctx_compiled(n_tok, cap)
             cks = self.ck
@@ -1620,7 +1621,8 @@ def dflash2_exact_generate_step(
             rem = max_tokens - n
             w_cur = max(1, min(W_cfg, dr.block, rem))
             l_len = lookup.match_len if lookup is not None else 0
-            l_props = lookup.proposals(w_cur - 1) if (lookup is not None and l_len >= LookupIndex.MIN_MATCH) else []
+            w_lkp = max(w_cur, min(_LOOKUP_W, rem)) if (_LOOKUP_BYPASS_MIN > 0 and l_len >= _LOOKUP_BYPASS_MIN) else w_cur
+            l_props = lookup.proposals(w_lkp - 1) if (lookup is not None and l_len >= LookupIndex.MIN_MATCH) else []
 
             in_cooldown = costs is not None and costs.ar_cooldown > 0 and l_len < 4
             if w_cur == 1 or in_cooldown:
@@ -1647,7 +1649,7 @@ def dflash2_exact_generate_step(
             prefetched_fwd = None
             if did_lookup_bypass:
                 anc_int = int(anchor.item())
-                toks_lp = [anc_int] + l_props[: w_cur - 1]
+                toks_lp = [anc_int] + l_props[: w_lkp - 1]
                 blk = mx.array(toks_lp, mx.int32)
                 parents = tuple(range(-1, len(toks_lp) - 1))
                 depths = tuple(range(len(toks_lp)))

@@ -572,8 +572,8 @@ def _k1_from_down_impl(
 ):
     """Fused MoE combine + short conv + K1 PRE (eliminates combine-conv launch + optional h DRAM roundtrip)."""
     B = int(down.shape[0])
-    if B < 1 or B > 8 or down.dtype != _BF or down.shape != (B, 8, D):
-        raise ValueError(f"down: expected bfloat16 (B<=8,8,{D}), got {down.dtype} {down.shape}")
+    if B < 1 or B > 16 or down.dtype != _BF or down.shape != (B, 8, D):
+        raise ValueError(f"down: expected bfloat16 (B<=16,8,{D}), got {down.dtype} {down.shape}")
     _check(wts, (8,), _F32, "wts")
     if wts.shape[0] != B:
         raise ValueError("wts batch mismatch")
@@ -670,7 +670,7 @@ def _k1_from_down_impl(
         ]
         if causal:
             s += [
-                "threadgroup float ww_s[64];",
+                f"threadgroup float ww_s[{max(64, B * 8)}];",
                 f"if (int(tid) < {B} * 8) ww_s[tid] = wts[tid];",
                 "threadgroup bfloat16_t h_s[RL_D];",
                 "threadgroup_barrier(mem_flags::mem_threadgroup);",

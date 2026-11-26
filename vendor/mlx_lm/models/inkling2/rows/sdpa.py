@@ -1347,7 +1347,7 @@ METAL_FUNC void sdpa1_head_v32_causal(
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = D / BD;
   typedef float U;
-  int anc[8];
+  int anc[16];
   for (int t = 0; t <= db; t++) anc[t] = anc_ptr[t];
   thread U q[qk_per_thread];
   thread U o[v_per_thread];
@@ -1459,7 +1459,7 @@ METAL_FUNC void sdpa2_block_causal(
   constexpr int v_per_thread = D / BD;
   constexpr int blocks = BLOCKS;
   typedef float U;
-  int anc[8];
+  int anc[16];
   for (int t = 0; t <= db; t++) anc[t] = anc_ptr[t];
   thread U q[qk_per_thread];
   thread U o[v_per_thread] = {0};
@@ -1601,7 +1601,8 @@ _CAUSAL_SHORT_SRC = r"""
     int kvh = h / GQA;
     const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
     const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
-    const int db = tree_meta[b * 9];
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    const int db = tree_meta[b * TMW];
     const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
     const int end_b = end0 + db + 1;
     const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
@@ -1615,7 +1616,7 @@ _CAUSAL_SHORT_SRC = r"""
     float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
     sdpa1_head_v32_causal<T, PBT, D, NS, true>(
         q + (size_t)bh * D, K, V, Knew, Vnew, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, out + (size_t)bh_l * D,
-        S_b, scale[0], sink, msk, db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT,
+        S_b, scale[0], sink, msk, db, tree_meta + b * TMW + 1, S0, slot0, max_size, ROT,
         nullptr, nullptr, 0, 0,
         outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
 """
@@ -1632,7 +1633,8 @@ _CAUSAL_2P1_SRC = r"""
     uint simd_lid = thread_index_in_simdgroup;
     const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
     const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
-    const int db = tree_meta[b * 9];
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    const int db = tree_meta[b * TMW];
     const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
     const int end_b = end0 + db + 1;
     const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
@@ -1655,7 +1657,7 @@ _CAUSAL_2P1_SRC = r"""
             partials + ((size_t)bh_l * BLOCKS + block) * D, sums + (size_t)bh_l * BLOCKS + block,
             maxs + (size_t)bh_l * BLOCKS + block, S_b, scale[0],
             float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])), msk,
-            db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT, nullptr, nullptr, 0, 0, block, simd_lid);
+            db, tree_meta + b * TMW + 1, S0, slot0, max_size, ROT, nullptr, nullptr, 0, 0, block, simd_lid);
     }
 """
 
@@ -1690,7 +1692,8 @@ _CAUSAL_SHORT_ST_SRC = r"""
     const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
     const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
     const int slot_main = meta[6], st_len = meta[7];
-    const int db = tree_meta[b * 9];
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    const int db = tree_meta[b * TMW];
     const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
     const int end_b = end0 + db + 1;
     const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
@@ -1706,7 +1709,7 @@ _CAUSAL_SHORT_ST_SRC = r"""
     float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
     sdpa1_head_v32_causal<T, PBT, D, NS, true, true>(
         q + (size_t)bh * D, K, V, Knew, Vnew, qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D, out + (size_t)bh_l * D,
-        S_b, scale[0], sink, msk, db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT,
+        S_b, scale[0], sink, msk, db, tree_meta + b * TMW + 1, S0, slot0, max_size, ROT,
         Kst, Vst, slot_main, st_len,
         outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
 """
@@ -1724,7 +1727,8 @@ _CAUSAL_2P1_ST_SRC = r"""
     const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
     const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
     const int slot_main = meta[6], st_len = meta[7];
-    const int db = tree_meta[b * 9];
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    const int db = tree_meta[b * TMW];
     const int S_b = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
     const int end_b = end0 + db + 1;
     const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
@@ -1749,7 +1753,7 @@ _CAUSAL_2P1_ST_SRC = r"""
             partials + ((size_t)bh_l * BLOCKS + block) * D, sums + (size_t)bh_l * BLOCKS + block,
             maxs + (size_t)bh_l * BLOCKS + block, S_b, scale[0],
             float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h])), msk,
-            db, tree_meta + b * 9 + 1, S0, slot0, max_size, ROT,
+            db, tree_meta + b * TMW + 1, S0, slot0, max_size, ROT,
             Kst, Vst, slot_main, st_len, block, simd_lid);
     }
 """
@@ -1764,7 +1768,8 @@ _CHAIN_TREE_META: dict = {}
 def _default_tree_meta(W):
     v = _CHAIN_TREE_META.get(W)
     if v is None:
-        rows = [[b] + list(range(b + 1)) + [0] * (8 - (b + 1)) for b in range(W)]
+        tm_w = 9 if W <= 8 else 17
+        rows = [[b] + list(range(b + 1)) + [0] * ((tm_w - 1) - (b + 1)) for b in range(W)]
         v = _CHAIN_TREE_META[W] = (tuple(range(W)), mx.array(rows, mx.int32))
     return v
 
@@ -1887,7 +1892,8 @@ def sdpa_causal_w_packed(
         if depths is not None:
             depths_t = tuple(int(d) for d in depths)
     else:
-        assert tree_meta.shape == (W, 9) and tree_meta.dtype == mx.int32
+        tm_w = 9 if W <= 8 else 17
+        assert tree_meta.shape == (W, tm_w) and tree_meta.dtype == mx.int32
         depths_t = tuple(int(d) for d in depths) if depths is not None else None
     R = pb.shape[-1]
     sck = float(scale)

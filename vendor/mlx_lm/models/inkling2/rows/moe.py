@@ -1386,8 +1386,8 @@ def _combine_conv_causal_src(dbg, scale_lit, has_w_act=False):
     s = r"""
     uint c = thread_position_in_grid.x;
     uint lid = thread_position_in_threadgroup.x;
-    threadgroup float ww[64];""" + w_decl + r"""
-    if ((int)lid < @WLIM@ * 8) ww[lid] = wts[lid];
+    threadgroup float ww[128];""" + w_decl + r"""
+    for (int i = (int)lid; i < @WLIM@ * 8; i += 64) ww[i] = wts[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if ((int)c >= CC) return;
     float w0c = float(cw[c * 4 + 0]);
@@ -1879,8 +1879,8 @@ def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, b
     route_group_rows or computes it in 1 launch).
     Returns [expert_inds (B,8) u32, expert_w (B,8) f32, swiglu (B,8,N/2) bf16 (, gate_up (B,8,N) bf16 if debug)]."""
     B, K = x.shape
-    if B > 8 or x.dtype != mx.bfloat16:
-        raise ValueError("gateup_rows: B <= 8, x bf16")
+    if B > 16 or x.dtype != mx.bfloat16:
+        raise ValueError("gateup_rows: B <= 16, x bf16")
     N, fast = _geom(w, scales, K, mode, group_size, bits)
     if route not in ("kernel", "launch", "group"):
         raise ValueError("route must be 'kernel', 'launch', or 'group'")
@@ -2007,7 +2007,7 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
     B, E, K = sw.shape
     C = w.shape[1]
     expected_cs_b = 1 if causal else B
-    if B > 8 or E != 8 or sw.dtype != mx.bfloat16 or residual.shape != (B, C) or cs3.shape != (expected_cs_b, 3, C):
+    if B > 16 or E != 8 or sw.dtype != mx.bfloat16 or residual.shape != (B, C) or cs3.shape != (expected_cs_b, 3, C):
         raise ValueError("down_rows: shapes / dtypes")
     if residual.dtype != mx.float32 or cs3.dtype != mx.float32 or conv_w.dtype != mx.bfloat16 or conv_w.size != C * 4:
         raise ValueError("down_rows: residual/cs3 f32, conv weight bf16 (C,4)")
@@ -2191,13 +2191,15 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
         gu, dn, act = ex.gate_up_proj, ex.down_proj, ex.act_fn
         cw = layer.post_mlp_convolution.conv1d.weight
     B = x.shape[0]
-    rows_gu = 2 if (2 <= B <= 8 and "MOE_ROWS_GU" not in os.environ) else None
-    rows_dn = 2 if (2 <= B <= 8 and "MOE_ROWS_DN" not in os.environ) else None
+    rows_gu = 2 if (2 <= B <= 16 and "MOE_ROWS_GU" not in os.environ) else None
+    rows_dn = 2 if (2 <= B <= 16 and "MOE_ROWS_DN" not in os.environ) else None
     if w_act is not None:
         assert causal and B > 1
         route = "launch"
     elif route == "auto":
         route = AUTO_ROUTE if (B > 1 or causal) else "kernel"
+    if B > 8 and route == "group":
+        route = "launch"
 
     w_gate = gate["weight"]
     bias = gate["e_score_correction_bias"]

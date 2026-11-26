@@ -64,7 +64,9 @@ def build_tree_tables(parents, depths):
     if res is not None:
         return res
     W = len(p_t)
-    assert 2 <= W <= 8 and p_t[0] == -1 and d_t[0] == 0
+    assert 2 <= W <= 16 and p_t[0] == -1 and d_t[0] == 0
+    assert max(d_t) < 16
+    tm_w = 9 if W <= 8 else 17
     conv_rows = []
     meta_rows = []
     paths = []
@@ -81,7 +83,7 @@ def build_tree_tables(parents, depths):
         a1 = path[db - 2] if db >= 2 else -(db + 2)
         a2 = pb if db >= 1 else -3
         conv_rows.append([a0, a1, a2])
-        meta_rows.append([db] + path + [0] * (8 - len(path)))
+        meta_rows.append([db] + path + [0] * ((tm_w - 1) - len(path)))
     if len(_tree_tbl_cache) >= 256:
         _tree_tbl_cache.clear()
     res = _tree_tbl_cache[key] = (d_t, mx.array(conv_rows, mx.int32), mx.array(meta_rows, mx.int32))
@@ -2719,7 +2721,7 @@ class BatchDecoder:
         if self._kv_st_len > 0:
             self.flush_kv_stage()
         W = int(tokens.shape[0])
-        assert 2 <= W <= 8
+        assert 2 <= W <= 16
         is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
         return_h_out = not is_greedy
         if conv_anc is None or tree_meta is None or (depths is None and depths_arr is None):

@@ -84,6 +84,30 @@ def _inkling2_bd_caches_ok(model: nn.Module, caches: List[List[Any]]) -> bool:
     if len(caches) == 1:
         return _L._FAST_ON and _L._use_kernels() and all(_b1_cache_ok(caches[0][v]) for v in range(nv))
     return _L._FAST_ON and _batch_cache_ok(caches, nv)
+
+
+def _df2_batch_enabled() -> bool:
+    return (
+        os.environ.get("LOOPLING_MTP") == "dflash2"
+        and os.environ.get("LOOPLING_DFLASH2_BATCH", "0") not in ("0", "", "false", "False")
+    )
+
+
+def _get_df2_batch_ctx(model: nn.Module):
+    from .models.inkling2 import dflash2 as DF2
+    from .models.inkling2.mtp import default_taps, parse_taps
+
+    tm = model.model.language_model
+    passes = tm.args.loop_config["num_passes"]
+    cfg = getattr(tm, "loopcd", None)
+    if cfg is not None and cfg.enabled_for(passes) and cfg.mode != "hidden":
+        return None
+    dr = DF2._get_drafter(model, DF2.DFLASH2_DIR)
+    taps = parse_taps(os.environ.get("LOOPLING_MTP_TAPS", default_taps(passes)), passes)
+    tap_keys = [t if t in ("F", "f", "o") else int(t[1:]) for t in taps]
+    tap_set = {k for k in tap_keys if isinstance(k, int)}
+    max_c = int(os.environ.get("LOOPLING_DFLASH2_BATCH_MAX_C", str(DF2._DFLASH2_BATCH_MAX_C)))
+    return dr, tm, tap_keys, tap_set, max(1, min(8, max_c))
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
@@ -1245,6 +1269,7 @@ class PromptProcessingBatch:
         stop_sequences: Optional[List[StopSequences]] = None,
         max_tokens: Optional[List[int]] = None,
         need_logprobs: Optional[List[bool]] = None,
+        df2_states: Optional[List[Any]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1270,6 +1295,9 @@ class PromptProcessingBatch:
         self.need_logprobs = (
             list(need_logprobs) if need_logprobs is not None else [True] * len(self.uids)
         )
+        self._df2_states = (
+            list(df2_states) if df2_states is not None else [None] * len(self.uids)
+        )
 
     def __len__(self):
         return len(self.uids)
@@ -1289,6 +1317,7 @@ class PromptProcessingBatch:
         self.max_tokens.extend(batch.max_tokens)
         self.stop_sequences.extend(batch.stop_sequences)
         self.need_logprobs.extend(batch.need_logprobs)
+        self._df2_states.extend(batch._df2_states)
 
     def _copy(self):
         new_batch = self.__class__.__new__(self.__class__)
@@ -1303,6 +1332,7 @@ class PromptProcessingBatch:
         new_batch.stop_sequences = list(self.stop_sequences)
         new_batch.max_tokens = list(self.max_tokens)
         new_batch.need_logprobs = list(self.need_logprobs)
+        new_batch._df2_states = [None if s is None else s.clone() for s in self._df2_states]
         return new_batch
 
     def split(self, indices: List[int]):
@@ -1322,6 +1352,7 @@ class PromptProcessingBatch:
             new_batch.stop_sequences = list(self.stop_sequences)
             new_batch.max_tokens = list(self.max_tokens)
             new_batch.need_logprobs = list(self.need_logprobs)
+            new_batch._df2_states = list(self._df2_states)
             self.filter([])
             if indices != list(range(len(new_batch.uids))):
                 new_batch.filter(indices)
@@ -1345,6 +1376,7 @@ class PromptProcessingBatch:
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
         self.need_logprobs = [self.need_logprobs[idx] for idx in keep]
+        self._df2_states = [self._df2_states[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
         """
@@ -1358,6 +1390,18 @@ class PromptProcessingBatch:
 
         if not tokens:
             return
+
+        df2_ctx = None
+        if _df2_batch_enabled() and _is_inkling2_model(self.model):
+            df2_ctx = _get_df2_batch_ctx(self.model)
+            if df2_ctx is not None:
+                dr = df2_ctx[0]
+                for i, ti in enumerate(tokens):
+                    st = self._df2_states[i]
+                    if st is None:
+                        st = self._df2_states[i] = dr.new_stream_state(allocate=True)
+                        st.lookup.append(self.tokens[i])
+                    st.lookup.append(ti)
 
         # Add the tokens to the self.tokens so they represent the tokens
         # contained in the KV Cache.
@@ -1380,11 +1424,43 @@ class PromptProcessingBatch:
             tokens = mx.array(tokens)
 
         # Actual prompt processing loop
+        chunk_off = 0
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
-            self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
-            mx.eval([c.state for c in self.prompt_cache])
+            if df2_ctx is not None:
+                dr, tm, tap_keys, tap_set, _ = df2_ctx
+                tm.tap_visits = tap_set
+                tm.tap_buf = {}
+                try:
+                    self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+                finally:
+                    tm.tap_visits = None
+                    tb = tm.tap_buf
+                    tm.tap_buf = {}
+                v_states, v_feats = [], []
+                for i, l_i in enumerate(lengths):
+                    valid_i = max(0, min(n_to_process, l_i - chunk_off))
+                    if valid_i > 0:
+                        v_states.append(self._df2_states[i])
+                        v_feats.append(
+                            mx.concatenate(
+                                [tb[k][i, :valid_i].reshape(valid_i, 1, dr.H) for k in tap_keys],
+                                axis=1,
+                            )[None]
+                        )
+                if v_states:
+                    dr.append_ctx_batch(v_states, v_feats)
+                    mx.eval(
+                        [c.state for c in self.prompt_cache],
+                        *[x for st in v_states for x in st.ck + st.cv],
+                    )
+                else:
+                    mx.eval([c.state for c in self.prompt_cache])
+            else:
+                self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+                mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
+            chunk_off += n_to_process
             tokens = tokens[:, n_to_process:]
 
         # Finalize the cache if there was any padding
@@ -1420,6 +1496,7 @@ class PromptProcessingBatch:
             self.stop_sequences,
             self.max_tokens,
             self.need_logprobs,
+            df2_states=self._df2_states,
         )
 
         self.uids = []
@@ -1429,6 +1506,7 @@ class PromptProcessingBatch:
         self.logits_processors = []
         self.max_tokens = []
         self.need_logprobs = []
+        self._df2_states = []
 
         return generation
 
@@ -1484,6 +1562,7 @@ class GenerationBatch:
         stop_sequences: List[StopSequences],
         max_tokens: List[int],
         need_logprobs: Optional[List[bool]] = None,
+        df2_states: Optional[List[Any]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1498,6 +1577,10 @@ class GenerationBatch:
         self.need_logprobs = (
             list(need_logprobs) if need_logprobs is not None else [True] * len(self.uids)
         )
+        self._df2_states = (
+            list(df2_states) if df2_states is not None else [None] * len(self.uids)
+        )
+        self._df2_ctx = None
 
         if self.samplers and len(self.samplers) != len(self.uids):
             raise ValueError("Insufficient number of samplers provided")
@@ -1603,6 +1686,7 @@ class GenerationBatch:
         self.max_tokens.extend(batch.max_tokens)
         self.stop_sequences.extend(batch.stop_sequences)
         self.need_logprobs.extend(batch.need_logprobs)
+        self._df2_states.extend(batch._df2_states)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1765,6 +1849,144 @@ class GenerationBatch:
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matchers = [self._matchers[idx] for idx in keep]
+        self._df2_states = [self._df2_states[idx] for idx in keep]
+
+    def _df2_eligible(self) -> Optional[Tuple[Any, ...]]:
+        if self._bd is None or len(self.uids) < 2:
+            return None
+        if not _df2_batch_enabled() or not _is_inkling2_model(self.model):
+            return None
+        if any(self.need_logprobs) or any(self.logits_processors):
+            return None
+        samplers = [
+            self.fallback_sampler if s is None else s
+            for s in (self.samplers or [None] * len(self.uids))
+        ]
+        if not all(
+            s is greedy_sampler or getattr(s, "_sampler_key", None) == ("greedy",)
+            for s in samplers
+        ):
+            return None
+        if self._df2_ctx is None:
+            self._df2_ctx = _get_df2_batch_ctx(self.model)
+            if self._df2_ctx is None:
+                return None
+        max_c = self._df2_ctx[4]
+        if len(self.uids) > max_c:
+            return None
+        return self._df2_ctx
+
+    def _next_df2_batch(self, df2_ctx) -> List["GenerationBatch.Response"]:
+        from .models.inkling2 import dflash2 as DF2
+
+        dr, _tm, tap_keys, tap_set, _ = df2_ctx
+        C = len(self.uids)
+        W = min(dr.block, DF2._default_batch_w(C))
+
+        anc_arr = self._next_tokens
+        mx.eval(anc_arr)
+        anc_list = [int(a) for a in anc_arr.tolist()]
+
+        for c in range(C):
+            st = self._df2_states[c]
+            if st is None:
+                st = self._df2_states[c] = dr.new_stream_state(allocate=True)
+            n_toks = len(self.tokens[c])
+            n_lp = len(st.lookup.tokens)
+            if n_lp < n_toks:
+                st.lookup.append(self.tokens[c][n_lp:])
+            if len(st.lookup.tokens) == n_toks:
+                st.lookup.append_one(anc_list[c])
+
+        blk = dr.draft_batch_chains(self._df2_states, anc_list, W)
+        t_cw, kv_news, conv_ws, tap_buf = self._bd.verify_batch_w(blk, W, tap_visits=tap_set)
+        mx.eval(t_cw)
+        tl = t_cw.tolist()
+        bl = blk.tolist()
+
+        keeps_eff = [1] * C
+        next_anc = [0] * C
+        emitted: List[List[Tuple[int, Optional[str]]]] = [[] for _ in range(C)]
+        keep: List[int] = []
+        any_finished = False
+
+        for c in range(C):
+            row = bl[c]
+            t_row = tl[c]
+            k_raw = 1
+            while k_raw < W and t_row[k_raw - 1] == row[k_raw]:
+                k_raw += 1
+
+            finished_c = False
+            for j in range(k_raw):
+                tok = int(row[j])
+                self._num_tokens[c] += 1
+                finish_reason = None
+                if self._num_tokens[c] >= self.max_tokens[c]:
+                    finish_reason = "length"
+                if self._matchers[c].advance(tok):
+                    finish_reason = "stop"
+                self.tokens[c].append(tok)
+                emitted[c].append((tok, finish_reason))
+                if j > 0:
+                    self._df2_states[c].lookup.append_one(tok)
+                if finish_reason is not None:
+                    keeps_eff[c] = j + 1
+                    finished_c = True
+                    any_finished = True
+                    break
+            if not finished_c:
+                keeps_eff[c] = k_raw
+                next_anc[c] = int(t_row[k_raw - 1])
+                keep.append(c)
+
+        self._bd.commit_batch_w(kv_news, conv_ws, keeps_eff, W)
+        if any_finished:
+            self._bd.flush()
+
+        responses = []
+        for c in range(C):
+            for tok, finish_reason in emitted[c]:
+                if finish_reason is not None:
+                    responses.append(
+                        self.Response(
+                            uid=self.uids[c],
+                            token=tok,
+                            logprobs=None,
+                            finish_reason=finish_reason,
+                            prompt_cache=self._bd.caches[c],
+                            all_tokens=self.tokens[c],
+                        )
+                    )
+                else:
+                    responses.append(
+                        self.Response(
+                            uid=self.uids[c],
+                            token=tok,
+                            logprobs=None,
+                            finish_reason=None,
+                            prompt_cache=None,
+                            all_tokens=None,
+                        )
+                    )
+
+        if keep:
+            fw = mx.concatenate([tap_buf[k].reshape(C * W, 1, dr.H) for k in tap_keys], axis=1)
+            k_states = [self._df2_states[c] for c in keep]
+            k_feats = [fw[c * W : c * W + keeps_eff[c]][None] for c in keep]
+            dr.append_ctx_batch(k_states, k_feats)
+            mx.async_eval(*[x for st in k_states for x in st.ck + st.cv])
+
+        self._next_tokens = mx.array(next_anc, dtype=mx.uint32)
+        self._next_logprobs = [None] * C
+
+        if len(keep) < C:
+            if not keep and self._bd is not None:
+                self._bd = None
+                self.prompt_cache = []
+            self.filter(keep)
+
+        return responses
 
     def next(self) -> List[Response]:
         """
@@ -1775,6 +1997,10 @@ class GenerationBatch:
         """
         if not self.uids:
             return []
+
+        df2_ctx = self._df2_eligible()
+        if df2_ctx is not None:
+            return self._next_df2_batch(df2_ctx)
 
         tokens, logprobs = self._step()
 
@@ -2328,7 +2554,12 @@ def batch_generate(
     if isinstance(max_tokens, int):
         max_tokens = [max_tokens] * len(prompts)
 
-    uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
+    uids = gen.insert(
+        prompts,
+        max_tokens,
+        caches=prompt_caches,
+        need_logprobs=[return_logprobs] * len(prompts),
+    )
     results = {uid: [] for uid in uids}
     logprob_results = {uid: [] for uid in uids} if return_logprobs else None
     prompt_caches = {}

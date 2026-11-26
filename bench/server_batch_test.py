@@ -55,9 +55,10 @@ def run_static(model, encoded, C, max_tokens=64, *, b1_prefill=False):
             max_tokens=[max_tokens] * C,
             caches=caches,
             all_tokens=[p[:-1] for p in encoded[:C]],
+            need_logprobs=[False] * C,
         )
     else:
-        uids = bg.insert(encoded[:C], max_tokens=[max_tokens] * C)
+        uids = bg.insert(encoded[:C], max_tokens=[max_tokens] * C, need_logprobs=[False] * C)
     toks = {u: [] for u in uids}
     done = 0
     t_dec0 = None
@@ -79,7 +80,7 @@ def run_dynamic(model, encoded):
     """Start C=4 (max_tokens 20,24,48,52), insert 2 more after 8 steps (C=4->6->4->3->1), resume from final cache."""
     bg = BatchGenerator(model, prefill_step_size=2048, completion_batch_size=32, prefill_batch_size=8)
     c0 = [_prefill_b1(model, p) for p in encoded[:4]]
-    u0 = bg.insert([[p[-1]] for p in encoded[:4]], max_tokens=[20, 24, 48, 52], caches=c0, all_tokens=[p[:-1] for p in encoded[:4]])
+    u0 = bg.insert([[p[-1]] for p in encoded[:4]], max_tokens=[20, 24, 48, 52], caches=c0, all_tokens=[p[:-1] for p in encoded[:4]], need_logprobs=[False] * 4)
     toks = {u: [] for u in u0}
     caches_out = {}
     steps = 0
@@ -97,7 +98,7 @@ def run_dynamic(model, encoded):
         if steps == 8 and not added:
             added = True
             c1 = [_prefill_b1(model, p) for p in encoded[4:6]]
-            u1 = bg.insert([[p[-1]] for p in encoded[4:6]], max_tokens=[18, 30], caches=c1, all_tokens=[p[:-1] for p in encoded[4:6]])
+            u1 = bg.insert([[p[-1]] for p in encoded[4:6]], max_tokens=[18, 30], caches=c1, all_tokens=[p[:-1] for p in encoded[4:6]], need_logprobs=[False] * 2)
             for u in u1:
                 toks[u] = []
             active += 2
@@ -105,7 +106,7 @@ def run_dynamic(model, encoded):
     # Verify resuming stream u1[0] on a multi-turn continuation from its extracted cache is bit-exact
     prev_toks, prev_cache = caches_out[u1[0]]
     suffix = [1234, 5678, 9101]
-    (u_res,) = bg.insert([suffix], max_tokens=[12], caches=[prev_cache], all_tokens=[prev_toks])
+    (u_res,) = bg.insert([suffix], max_tokens=[12], caches=[prev_cache], all_tokens=[prev_toks], need_logprobs=[False])
     res_toks = []
     while True:
         grs = bg.next_generated()
@@ -115,7 +116,7 @@ def run_dynamic(model, encoded):
                 bg.close()
                 # Cold reference of exact same full token sequence (prompt + turn1 + turn2 suffix)
                 bg_cold = BatchGenerator(model, prefill_step_size=2048, completion_batch_size=32, prefill_batch_size=8)
-                (u_c,) = bg_cold.insert([encoded[4] + toks[u1[0]] + suffix], max_tokens=[12])
+                (u_c,) = bg_cold.insert([encoded[4] + toks[u1[0]] + suffix], max_tokens=[12], need_logprobs=[False])
                 cold_toks = []
                 while True:
                     cgrs = bg_cold.next_generated()

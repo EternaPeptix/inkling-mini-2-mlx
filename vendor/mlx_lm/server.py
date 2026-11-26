@@ -1083,7 +1083,9 @@ class ResponseGenerator:
                     uids_to_finish = []
                     gen_ckpt_ids = []
                     for r in gen_responses:
-                        result = batch_results[r.uid]
+                        result = batch_results.get(r.uid)
+                        if result is None:
+                            continue
 
                         # Don't decode the final stop token
                         if r.finish_reason == "stop":

@@ -1280,6 +1280,12 @@ def sdpa_b1_packed(
         (kv_buf.ndim == 4 and kv_buf.shape == (2, Hkv, cap, 128) and kv_layer_idx == 0)
         or (kv_buf.ndim == 5 and kv_buf.shape[1:] == (2, Hkv, cap, 128) and 0 <= kv_layer_idx < kv_buf.shape[0])
     )
+    if _LONG_SDPA and int(window) == 0 and int(rot) == 0 and int(S) >= _LONG_SDPA_MIN_S:
+        return sdpa_long_full_packed(
+            q, kv_buf, None, pb, qkv_flat, gate_off, sink_off, S, S, cap, 1,
+            scale=scale, Hq=Hq, Hkv=Hkv, kv_layer_idx=kv_layer_idx,
+            gate_stride=gate_stride, sink_stride=sink_stride,
+        )
     R = pb.shape[-1]
     sck = float(scale)
     sc = _SCALE_CACHE.get(sck)
@@ -1764,6 +1770,331 @@ _causal_w_stage_kernels = None
 _CW_META_CACHE: dict = {}
 _CHAIN_TREE_META: dict = {}
 
+_LONG_SDPA = os.environ.get("LOOPLING_LONG_SDPA", "1") not in ("0", "", "false", "False")
+_LONG_SDPA_MIN_S = int(os.environ.get("LOOPLING_LONG_SDPA_MIN_S", "32768"))
+_LONG_SPLIT_K = 256
+_long_full_kernels = None
+_DUMMY_LONG_BF = mx.zeros((512,), mx.bfloat16)
+_DUMMY_LONG_I32 = mx.zeros((256,), mx.int32)
+
+_LONG_FULL_P1_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TK = 4;
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    int tg_id = (int)threadgroup_position_in_grid.x;
+    int sp = tg_id % N_SPLITS;
+    int tmp = tg_id / N_SPLITS;
+    int kvh = tmp % HKV;
+    int rtile = tmp / HKV;
+    int r0 = rtile * BW;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int b_loc = (int)sg / GQA;
+    int g = (int)sg % GQA;
+    int b = r0 + b_loc;
+    if (b >= WW) return;
+    if constexpr (HAS_WA) {
+        if (b >= w_act[0]) return;
+    }
+    int h = kvh * GQA + g;
+    const int S0 = meta[0];
+    const int cap = HAS_NEW ? meta[3] : meta[4];
+    const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
+    const int slot_main = HAS_STAGE ? meta[6] : 0;
+    const int st_len = HAS_STAGE ? meta[7] : 0;
+    const int sp_start = sp * SPLIT_K;
+
+    int db = 0;
+    int anc[16];
+    if constexpr (HAS_NEW && WW > 1) {
+        db = tree_meta[b * TMW];
+        const device int* ap = tree_meta + b * TMW + 1;
+        for (int d = 0; d <= db; d++) anc[d] = ap[d];
+    }
+    const int S_b = S0 + (HAS_NEW ? (db + 1) : 0);
+    const int sp_end_b = min(sp_start + SPLIT_K, S_b);
+    if (sp_start >= sp_end_b) return;
+
+    const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+    const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+    const device T* Kst = HAS_STAGE ? (kv_st + ((size_t)lidx * 2 * HKV + kvh) * SCAP * D) : K;
+    const device T* Vst = HAS_STAGE ? (kv_st + ((size_t)lidx * 2 * HKV + HKV + kvh) * SCAP * D) : V;
+    const device T* Knew = HAS_NEW ? (kv_new + (size_t)kvh * WW * D) : K;
+    const device T* Vnew = HAS_NEW ? (kv_new + (size_t)(HKV + kvh) * WW * D) : V;
+
+    int bh = b * HQ + h;
+    const device PBT* pb_bh = pb + (size_t)bh * R;
+    float sc = scale[0];
+    bfloat4 qb = as_type<bfloat4>(((const device uint2*)(q + (size_t)bh * D))[lane]);
+    float q0 = sc * float(qb.x), q1 = sc * float(qb.y), q2 = sc * float(qb.z), q3 = sc * float(qb.w);
+    float max_score = Limits<float>::finite_min;
+    float sum_exp_score = 0.0f;
+    if (sp == 0) {
+        max_score = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h]));
+        sum_exp_score = 1.0f;
+    }
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    int t0 = sp_start;
+    const int fast_end = min(sp_end_b, min(S0, S_b - R));
+    for (; t0 + TK <= fast_end; t0 += TK) {
+        bfloat4 k_reg[TK];
+        bfloat4 v_reg[TK];
+        for (int t = 0; t < TK; t++) {
+            int ii = t0 + t;
+            const device T* kp;
+            if constexpr (HAS_STAGE) {
+                int ds = ii - slot_main;
+                kp = (ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D) : (K + (size_t)ii * D);
+            } else {
+                kp = K + (size_t)ii * D;
+            }
+            k_reg[t] = as_type<bfloat4>(((const device uint2*)kp)[lane]);
+        }
+        for (int t = 0; t < TK; t++) {
+            int ii = t0 + t;
+            const device T* vp;
+            if constexpr (HAS_STAGE) {
+                int ds = ii - slot_main;
+                vp = (ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D) : (V + (size_t)ii * D);
+            } else {
+                vp = V + (size_t)ii * D;
+            }
+            v_reg[t] = as_type<bfloat4>(((const device uint2*)vp)[lane]);
+        }
+        for (int t = 0; t < TK; t++) {
+            float score = q0 * float(k_reg[t].x) + q1 * float(k_reg[t].y) + q2 * float(k_reg[t].z) + q3 * float(k_reg[t].w);
+            score = simd_sum(score);
+            float new_max = max(max_score, score);
+            float factor = fast::exp(max_score - new_max);
+            float exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            o0 = o0 * factor + exp_score * float(v_reg[t].x);
+            o1 = o1 * factor + exp_score * float(v_reg[t].y);
+            o2 = o2 * factor + exp_score * float(v_reg[t].z);
+            o3 = o3 * factor + exp_score * float(v_reg[t].w);
+        }
+    }
+    for (int ii = t0; ii < sp_end_b; ii++) {
+        int dist = (S_b - 1) - ii;
+        T mv = (dist < R) ? static_cast<T>(pb_bh[dist]) : static_cast<T>(0.0f);
+        if (mv >= Limits<T>::finite_min) {
+            const device T* kp;
+            const device T* vp;
+            if (ii < S0) {
+                if constexpr (HAS_STAGE) {
+                    int ds = ii - slot_main;
+                    if (ds >= 0 && ds < st_len) {
+                        kp = Kst + (size_t)ds * D; vp = Vst + (size_t)ds * D;
+                    } else {
+                        kp = K + (size_t)ii * D; vp = V + (size_t)ii * D;
+                    }
+                } else {
+                    kp = K + (size_t)ii * D; vp = V + (size_t)ii * D;
+                }
+            } else {
+                int nd = HAS_NEW ? anc[ii - S0] : 0;
+                kp = Knew + (size_t)nd * D; vp = Vnew + (size_t)nd * D;
+            }
+            bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[lane]);
+            float score = q0 * float(kb.x) + q1 * float(kb.y) + q2 * float(kb.z) + q3 * float(kb.w);
+            score = simd_sum(score) + float(mv);
+            float new_max = max(max_score, score);
+            float factor = fast::exp(max_score - new_max);
+            float exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[lane]);
+            o0 = o0 * factor + exp_score * float(vb.x);
+            o1 = o1 * factor + exp_score * float(vb.y);
+            o2 = o2 * factor + exp_score * float(vb.z);
+            o3 = o3 * factor + exp_score * float(vb.w);
+        }
+    }
+    size_t bh_sp = ((size_t)b * HQ + h) * N_SPLITS + sp;
+    if (lane == 0) {
+        sums[bh_sp] = sum_exp_score;
+        maxs[bh_sp] = max_score;
+    }
+    bfloat4 ob = bfloat4(static_cast<T>(o0), static_cast<T>(o1), static_cast<T>(o2), static_cast<T>(o3));
+    ((device uint2*)(partials + bh_sp * D))[lane] = as_type<uint2>(ob);
+"""
+
+_LONG_FULL_P2_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    threadgroup float outputs[4 * 1024];
+    int bh = (int)threadgroup_position_in_grid.x;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int b = bh / HQ;
+    int h = bh % HQ;
+    if constexpr (HAS_WA) {
+        if (b >= w_act[0]) return;
+    }
+    const int S0 = meta[0];
+    const int db = (HAS_NEW && WW > 1) ? tree_meta[b * TMW] : 0;
+    const int S_b = S0 + (HAS_NEW ? (db + 1) : 0);
+    const int n_act = min(N_SPLITS, (S_b + SPLIT_K - 1) / SPLIT_K);
+    size_t base = (size_t)bh * N_SPLITS;
+
+    float gmax = Limits<float>::finite_min;
+    for (int s0 = 0; s0 < n_act; s0 += 32) {
+        int sp = s0 + (int)lane;
+        float m = (sp < n_act) ? maxs[base + sp] : Limits<float>::finite_min;
+        gmax = max(gmax, simd_max(m));
+    }
+
+    float sum_exp = 0.0f;
+    for (int s0 = 0; s0 < n_act; s0 += 32) {
+        int sp = s0 + (int)lane;
+        float term = (sp < n_act) ? (fast::exp(maxs[base + sp] - gmax) * sums[base + sp]) : 0.0f;
+        sum_exp += simd_sum(term);
+    }
+
+    float4 o = float4(0.0f);
+    for (int s0 = 0; s0 < n_act; s0 += 32) {
+        int sp = s0 + (int)sg;
+        if (sp < n_act) {
+            float f = fast::exp(maxs[base + sp] - gmax);
+            bfloat4 pbv = as_type<bfloat4>(((const device uint2*)(partials + (base + sp) * D))[lane]);
+            o += f * float4(float(pbv.x), float(pbv.y), float(pbv.z), float(pbv.w));
+        }
+    }
+    outputs[(0 * 32 + (int)lane) * 32 + (int)sg] = o.x;
+    outputs[(1 * 32 + (int)lane) * 32 + (int)sg] = o.y;
+    outputs[(2 * 32 + (int)lane) * 32 + (int)sg] = o.z;
+    outputs[(3 * 32 + (int)lane) * 32 + (int)sg] = o.w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 red;
+    red.x = simd_sum(outputs[(0 * 32 + (int)sg) * 32 + (int)lane]);
+    red.y = simd_sum(outputs[(1 * 32 + (int)sg) * 32 + (int)lane]);
+    red.z = simd_sum(outputs[(2 * 32 + (int)sg) * 32 + (int)lane]);
+    red.w = simd_sum(outputs[(3 * 32 + (int)sg) * 32 + (int)lane]);
+    if (lane == 0) {
+        if (sum_exp != 0.0f) red /= sum_exp;
+        int base_d = (int)sg * 4;
+        bfloat4 gb = as_type<bfloat4>(((const device uint2*)(qkv + GATE_OFF + (size_t)b * GATE_STRIDE + (size_t)h * D + base_d))[0]);
+        bfloat4 ob = bfloat4(
+            static_cast<T>(glue_gate(float(static_cast<T>(red.x)), float(gb.x))),
+            static_cast<T>(glue_gate(float(static_cast<T>(red.y)), float(gb.y))),
+            static_cast<T>(glue_gate(float(static_cast<T>(red.z)), float(gb.z))),
+            static_cast<T>(glue_gate(float(static_cast<T>(red.w)), float(gb.w))));
+        ((device uint2*)(out + (size_t)bh * D + base_d))[0] = as_type<uint2>(ob);
+    }
+"""
+
+
+def _get_long_full_kernels():
+    global _long_full_kernels
+    if _long_full_kernels is None:
+        p1 = mx.fast.metal_kernel(
+            name="sdpa_long_full_p1",
+            input_names=["q", "kv", "kv_st", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta", "w_act"],
+            output_names=["partials", "sums", "maxs"],
+            source=_LONG_FULL_P1_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        p2 = mx.fast.metal_kernel(
+            name="sdpa_long_full_p2",
+            input_names=["partials", "sums", "maxs", "qkv", "meta", "tree_meta", "w_act"],
+            output_names=["out"],
+            source=_LONG_FULL_P2_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        _long_full_kernels = (p1, p2)
+    return _long_full_kernels
+
+
+def sdpa_long_full_packed(
+    q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off, S_prefix, S_alloc, cap, W, *,
+    scale, Hq=24, Hkv=8, kv_layer_idx=0, tree_meta=None, meta_arr=None, kv_stage=None,
+    w_act=None, gate_stride=None, sink_stride=None,
+):
+    """Split-K full-attention (window==0, rot==0) sharing K/V loads across W rows and GQA heads."""
+    gqa = Hq // Hkv
+    R = int(pb.shape[-1])
+    g_str = int(gate_stride or (Hq * 128))
+    s_str = int(sink_stride or Hq)
+    sck = float(scale)
+    sc = _SCALE_CACHE.get(sck)
+    if sc is None:
+        sc = _SCALE_CACHE[sck] = mx.array([sck], mx.float32)
+
+    has_new = kv_new is not None
+    has_stage = kv_stage is not None
+    has_wa = w_act is not None
+    if meta_arr is not None:
+        mta = meta_arr
+        kv_lidx_t = int(kv_layer_idx)
+    else:
+        if has_new:
+            mkey = (int(S_prefix), int(S_prefix), 0, int(cap), 0, int(kv_layer_idx))
+            mta = _CW_META_CACHE.get(mkey)
+            if mta is None:
+                if len(_CW_META_CACHE) >= 256:
+                    _CW_META_CACHE.clear()
+                mta = _CW_META_CACHE[mkey] = mx.array(mkey, mx.int32)
+        else:
+            mkey = (int(S_prefix), int(S_prefix), 0, 0, int(cap), int(kv_layer_idx))
+            mta = _B1_META_CACHE.get(mkey)
+            if mta is None:
+                if len(_B1_META_CACHE) >= 256:
+                    _B1_META_CACHE.clear()
+                mta = _B1_META_CACHE[mkey] = mx.array(mkey, mx.int32)
+        kv_lidx_t = -1
+
+    if tree_meta is None:
+        _, tm_arg = _default_tree_meta(W)
+    else:
+        tm_arg = tree_meta
+
+    kv_st_arg = kv_stage if has_stage else _DUMMY_LONG_BF
+    scap = int(kv_stage.shape[3]) if has_stage else 0
+    kv_new_arg = kv_new if has_new else _DUMMY_LONG_BF
+    wa_arg = w_act.reshape(-1) if has_wa else _DUMMY_LONG_I32
+
+    n_splits = max(1, (int(S_alloc) + _LONG_SPLIT_K - 1) // _LONG_SPLIT_K)
+    bw = min(W, 8)
+    ns = gqa * bw
+    n_rtiles = (W + bw - 1) // bw
+    ntg = n_splits * Hkv * n_rtiles
+
+    p1, p2 = _get_long_full_kernels()
+    partials, sums, maxs = p1(
+        inputs=[q, kv_buf, kv_st_arg, kv_new_arg, pb, qkv_flat, mta, sc, tm_arg, wa_arg],
+        template=[
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
+            ("R", R), ("WW", int(W)), ("BW", int(bw)), ("NS", int(ns)),
+            ("SPLIT_K", _LONG_SPLIT_K), ("N_SPLITS", int(n_splits)),
+            ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
+            ("KV_LIDX", kv_lidx_t), ("SCAP", scap),
+            ("HAS_NEW", has_new), ("HAS_STAGE", has_stage), ("HAS_WA", has_wa),
+        ],
+        grid=(ntg * 32 * ns, 1, 1),
+        threadgroup=(32 * ns, 1, 1),
+        output_shapes=[(W * Hq * n_splits * 128,), (W * Hq * n_splits,), (W * Hq * n_splits,)],
+        output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+    )
+    (out,) = p2(
+        inputs=[partials, sums, maxs, qkv_flat, mta, tm_arg, wa_arg],
+        template=[
+            ("T", mx.bfloat16), ("HQ", Hq), ("WW", int(W)),
+            ("SPLIT_K", _LONG_SPLIT_K), ("N_SPLITS", int(n_splits)),
+            ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", g_str),
+            ("HAS_NEW", has_new), ("HAS_WA", has_wa),
+        ],
+        grid=(W * Hq * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(W, Hq * 128)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out
+
 
 def _default_tree_meta(W):
     v = _CHAIN_TREE_META.get(W)
@@ -1912,6 +2243,25 @@ def sdpa_causal_w_packed(
             mta = _CW_META_CACHE[mkey] = mx.array(mkey, mx.int32)
         kv_lidx_t = -1
     has_wa = (w_act is not None)
+    if s_bounds is not None:
+        s_min_b, s_max_b = int(s_bounds[0]), int(s_bounds[1])
+        if _LONG_SDPA and int(window) == 0 and int(rot) == 0 and s_min_b >= _LONG_SDPA_MIN_S:
+            return sdpa_long_full_packed(
+                q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off, S0, int(cap) + W, cap, W,
+                scale=scale, Hq=Hq, Hkv=Hkv, kv_layer_idx=kv_layer_idx, tree_meta=tree_meta,
+                meta_arr=meta_arr, kv_stage=kv_stage, w_act=w_act,
+                gate_stride=gate_stride, sink_stride=sink_stride,
+            )
+    else:
+        s_vals = [min(end0 + d + 1, max_size) if rot else (S0 + d + 1) for d in depths_t]
+        if _LONG_SDPA and int(window) == 0 and int(rot) == 0 and s_vals[0] >= _LONG_SDPA_MIN_S:
+            return sdpa_long_full_packed(
+                q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off, S0, s_vals[-1], cap, W,
+                scale=scale, Hq=Hq, Hkv=Hkv, kv_layer_idx=kv_layer_idx, tree_meta=tree_meta,
+                meta_arr=meta_arr, kv_stage=kv_stage, w_act=w_act,
+                gate_stride=gate_stride, sink_stride=sink_stride,
+            )
+
     wa_arg = [w_act.reshape(-1)] if has_wa else []
     if kv_stage is not None:
         assert not has_wa
@@ -1927,11 +2277,9 @@ def sdpa_causal_w_packed(
         s1_short, s1_2p, s2_2p = _get_causal_w_kernels()
 
     if s_bounds is not None:
-        s_min_b, s_max_b = int(s_bounds[0]), int(s_bounds[1])
         split = W if s_max_b < _TWO_PASS_N else 0
         s_vals = None
     else:
-        s_vals = [min(end0 + d + 1, max_size) if rot else (S0 + d + 1) for d in depths_t]
         split = 0
         while split < W and s_vals[split] < _TWO_PASS_N:
             split += 1

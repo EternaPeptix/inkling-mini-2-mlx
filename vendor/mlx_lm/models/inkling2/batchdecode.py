@@ -2125,6 +2125,10 @@ class BatchDecoder:
 
     @staticmethod
     def _regime_key(s_min: int, s_max: int):
+        if RS._LONG_SDPA and s_min < RS._LONG_SDPA_MIN_S <= s_max:
+            return None
+        if RS._LONG_SDPA and s_min >= RS._LONG_SDPA_MIN_S:
+            return ("long", 256)
         if s_max < RS._TWO_PASS_N:
             return (False, 32)
         blk_min = RS._blocks(s_min, 3)

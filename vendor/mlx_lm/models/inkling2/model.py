@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_linear
 from mlx_lm.layers.common import splice
 from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
 from mlx_lm.models.cache import ArraysCache, CacheList, Int8KVCache, KVCache, RotatingKVCache
-from mlx_lm.models.inkling2 import checkpoint, fastdecode, kernels, loopcd
+from mlx_lm.models.inkling2 import checkpoint, fastdecode, kernels, loopcd, prefill as P
 from mlx_lm.models.inkling2.config import ModelArgs, TextArgs
 from mlx_lm.models.inkling2.layers import (
     BlockAttentionResidual,
@@ -97,7 +97,10 @@ class TextModel(PipelineMixin, nn.Module):
             and fastdecode.eligible(hidden_states, cache[0], conv_mask)
             and fastdecode._fused_b1_ok(self.layers[0], hidden_states, cache[0][1])
         )
-        use_batch_msg = fast_b1 and getattr(self, "message_input", None) is not None
+        use_batch_msg = (
+            fast_b1
+            or (P.enabled(hidden_states) and hidden_states.shape[0] * hidden_states.shape[1] >= 64)
+        ) and getattr(self, "message_input", None) is not None
 
         def run(
             layers,

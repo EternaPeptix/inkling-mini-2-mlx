@@ -310,6 +310,27 @@ class Attention(nn.Module):
         )
         self.eps = args.rms_norm_eps
 
+    def _rel_proj_bf16(self, dt: mx.Dtype) -> mx.array:
+        p = self.rel_logits_proj.proj
+        c = getattr(self.rel_logits_proj, "_proj_cache", None)
+        if c is None or c[0] is not p or c[1] != dt:
+            p_dt = mx.contiguous(p.astype(dt) if p.dtype != dt else p)
+            c = (p, dt, p_dt)
+            self.rel_logits_proj._proj_cache = c
+        return c[2]
+
+    def _otf_rel_ok(self, hidden_states: mx.array) -> bool:
+        return (
+            hidden_states.shape[1] > 1
+            and P._PF_OTF_REL
+            and _use_kernels()
+            and not _REF_ATTN
+            and hidden_states.dtype == mx.bfloat16
+            and self.rel_l2_clip.scale.dtype == mx.bfloat16
+            and self.rel_logits_proj.proj.shape[0] == 16
+            and self.rel_logits_proj.proj.shape[1] >= 24
+        )
+
     def _attend_pre(
         self,
         hidden_states: mx.array,
@@ -321,6 +342,7 @@ class Attention(nn.Module):
         gate: mx.array | None = None,
         sinks: mx.array | None = None,
         max_dist: int | None = None,
+        otf_rel: bool = False,
     ):
         B, L, _ = hidden_states.shape
         if gate is None:
@@ -336,6 +358,23 @@ class Attention(nn.Module):
             and value_states.dtype == mx.bfloat16
             and self.q_l2_clip.scale.dtype == mx.bfloat16
         ):
+            if otf_rel and self.rel_l2_clip.scale.dtype == mx.bfloat16 and relative_states.shape[-1] == 16 * self.num_heads:
+                query_states, key_states, value_states, position_bias = P.qkv_clip_rms(
+                    query_states,
+                    key_states,
+                    value_states,
+                    self.q_l2_clip.scale,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_key_value_heads,
+                    thr_q=self.q_l2_clip.threshold,
+                    thr_k=self.k_l2_clip.threshold,
+                    eps=self.eps,
+                    tau=tau,
+                    r=relative_states,
+                    r_scale=self.rel_l2_clip.scale,
+                    thr_r=self.rel_l2_clip.threshold,
+                )
+                return query_states, key_states, value_states, position_bias, sinks, gate
             query_states, key_states, value_states = P.qkv_clip_rms(
                 query_states,
                 key_states,
@@ -353,16 +392,11 @@ class Attention(nn.Module):
                 relative_states = (relative_states.astype(mx.float32) * tau).astype(
                     relative_states.dtype
                 )
+            if otf_rel:
+                return query_states, key_states, value_states, relative_states, sinks, gate
             md = ((max_dist + 63) // 64) * 64 if max_dist is not None else None
             if md is not None and 0 < md < self.rel_logits_proj.proj.shape[1]:
-                p = self.rel_logits_proj.proj
-                dt = relative_states.dtype
-                if p.dtype != dt:
-                    c = getattr(self.rel_logits_proj, "_proj_cache", None)
-                    if c is None or c[0] is not p or c[1] != dt:
-                        c = (p, dt, p.astype(dt))
-                        self.rel_logits_proj._proj_cache = c
-                    p = c[2]
+                p = self._rel_proj_bf16(relative_states.dtype)
                 position_bias = relative_states @ p[:, :md]
             else:
                 position_bias = self.rel_logits_proj(relative_states)
@@ -416,6 +450,7 @@ class Attention(nn.Module):
             max_dist = hidden_states.shape[1]
         elif isinstance(cache.offset, int):
             max_dist = cache.offset + hidden_states.shape[1]
+        otf_rel = self._otf_rel_ok(hidden_states)
         query_states, key_states, value_states, position_bias, sinks, gate = (
             self._attend_pre(
                 hidden_states,
@@ -425,16 +460,18 @@ class Attention(nn.Module):
                 relative_states,
                 tau,
                 max_dist=max_dist,
+                otf_rel=otf_rel,
             )
         )
         if cache is not None:
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
+        rel_proj = self._rel_proj_bf16(hidden_states.dtype) if otf_rel else None
         attn_output = self._attention(
-            query_states, key_states, value_states, position_bias, sinks, cache
+            query_states, key_states, value_states, position_bias, sinks, cache, rel_proj=rel_proj
         )
         return self._attend_post(attn_output, gate)
 
-    def _attention(self, query, key, value, position_bias, sinks, cache) -> mx.array:
+    def _attention(self, query, key, value, position_bias, sinks, cache, rel_proj=None) -> mx.array:
         B, _, L, _ = query.shape
         S = key.shape[2]
         end = cache.offset if cache is not None else L
@@ -450,6 +487,7 @@ class Attention(nn.Module):
                 scale=self.scaling,
                 window=self.sliding_window,
                 key_start=key_start,
+                rel_proj=rel_proj,
             )
 
         query_positions = _positions(end - L, L)
@@ -528,40 +566,55 @@ class SlidingAttention(Attention):
             r_raw = P.aff8_linear(self.r_proj, hidden_states) if use_a8 else self.r_proj(hidden_states)
             gate = P.aff8_linear(self.gate_proj, hidden_states) if use_a8 else self.gate_proj(hidden_states)
             sinks = self.sink_proj(hidden_states)
-            query_states, key_states, value_states, conv_states[0], conv_states[1] = P.swa_qkv_conv_clip(
-                q_raw,
-                k_raw,
-                v_raw,
-                self.q_l2_clip.scale,
-                self.k_sconv.conv1d.weight,
-                self.v_sconv.conv1d.weight,
-                conv_states[0],
-                conv_states[1],
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_key_value_heads,
-                thr_q=self.q_l2_clip.threshold,
-                thr_k=self.k_l2_clip.threshold,
-                eps=self.eps,
-            )
-            relative_states = self.rel_l2_clip(r_raw.reshape(B, L, self.num_heads, -1))
-            max_dist = L if kv_cache is None else (kv_cache.offset + L if isinstance(kv_cache.offset, int) else None)
-            md = ((max_dist + 63) // 64) * 64 if max_dist is not None else None
-            if md is not None and 0 < md < self.rel_logits_proj.proj.shape[1]:
-                p = self.rel_logits_proj.proj
-                dt = relative_states.dtype
-                if p.dtype != dt:
-                    c = getattr(self.rel_logits_proj, "_proj_cache", None)
-                    if c is None or c[0] is not p or c[1] != dt:
-                        c = (p, dt, p.astype(dt))
-                        self.rel_logits_proj._proj_cache = c
-                    p = c[2]
-                position_bias = relative_states @ p[:, :md]
+            if self._otf_rel_ok(hidden_states):
+                query_states, key_states, value_states, conv_states[0], conv_states[1], position_bias = P.swa_qkv_conv_clip(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    self.q_l2_clip.scale,
+                    self.k_sconv.conv1d.weight,
+                    self.v_sconv.conv1d.weight,
+                    conv_states[0],
+                    conv_states[1],
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_key_value_heads,
+                    thr_q=self.q_l2_clip.threshold,
+                    thr_k=self.k_l2_clip.threshold,
+                    eps=self.eps,
+                    r=r_raw,
+                    r_scale=self.rel_l2_clip.scale,
+                    thr_r=self.rel_l2_clip.threshold,
+                )
+                rel_proj = self._rel_proj_bf16(hidden_states.dtype)
             else:
-                position_bias = self.rel_logits_proj(relative_states)
+                query_states, key_states, value_states, conv_states[0], conv_states[1] = P.swa_qkv_conv_clip(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    self.q_l2_clip.scale,
+                    self.k_sconv.conv1d.weight,
+                    self.v_sconv.conv1d.weight,
+                    conv_states[0],
+                    conv_states[1],
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_key_value_heads,
+                    thr_q=self.q_l2_clip.threshold,
+                    thr_k=self.k_l2_clip.threshold,
+                    eps=self.eps,
+                )
+                relative_states = self.rel_l2_clip(r_raw.reshape(B, L, self.num_heads, -1))
+                max_dist = L if kv_cache is None else (kv_cache.offset + L if isinstance(kv_cache.offset, int) else None)
+                md = ((max_dist + 63) // 64) * 64 if max_dist is not None else None
+                if md is not None and 0 < md < self.rel_logits_proj.proj.shape[1]:
+                    p = self._rel_proj_bf16(relative_states.dtype)
+                    position_bias = relative_states @ p[:, :md]
+                else:
+                    position_bias = self.rel_logits_proj(relative_states)
+                rel_proj = None
             if kv_cache is not None:
                 key_states, value_states = kv_cache.update_and_fetch(key_states, value_states)
             attn_output = self._attention(
-                query_states, key_states, value_states, position_bias, sinks, kv_cache
+                query_states, key_states, value_states, position_bias, sinks, kv_cache, rel_proj=rel_proj
             )
             return self._attend_post(attn_output, gate)
         key_states, conv_states[0] = self.k_sconv(
@@ -685,7 +738,18 @@ class TopKRouter(nn.Module):
         self.e_score_correction_bias = mx.zeros((num_experts,), dtype=mx.float32)
 
     def __call__(self, hidden_states: mx.array) -> tuple[mx.array, mx.array]:
-        logits = hidden_states.astype(mx.float32) @ self.weight.T
+        if (
+            P._PF_ROUTER
+            and P.enabled(hidden_states)
+            and hidden_states.dtype == mx.bfloat16
+            and self.weight.dtype == mx.float32
+            and hidden_states.shape[-1] == P._D
+            and self.weight.shape == (128, P._D)
+            and hidden_states.shape[0] * hidden_states.shape[1] >= 4096
+        ):
+            logits = P.router_logits_bf16(hidden_states, self.weight)
+        else:
+            logits = hidden_states.astype(mx.float32) @ self.weight.T
         if _use_kernels():
             return expert_routing(
                 logits,
@@ -856,11 +920,28 @@ class DecoderLayer(nn.Module):
             and (conv is None or (conv.lengths is None and not getattr(conv, "record", False)))
         )
         block_residual = hidden_states
-        normed_residual = unweighted_rms_norm(block_residual.astype(mx.float32))
-
-        attention_inputs = None
-        if self.attention_input is not None:
-            attention_inputs = self.attention_input(block_states, normed_residual)
+        dtype = hidden_states.dtype
+        use_fused_attn_in = (
+            P._PF_DEPTH_RMS
+            and P.active(dtype, hidden_states)
+            and messages is None
+            and isinstance(self, SlidingDecoderLayer)
+            and self.attention_input is not None
+            and block_states is not None
+            and hidden_states.shape[-1] == P._D
+            and self.input_layernorm.weight.dtype == mx.bfloat16
+            and self.attention_input.query.dtype == mx.float32
+        )
+        if use_fused_attn_in:
+            attention_inputs, normed_residual = P.unw_rms_depth_attn_rms_bf16(
+                block_residual, block_states, self.attention_input.query,
+                self.input_layernorm, need_nr=self.is_block_boundary,
+            )
+        else:
+            normed_residual = unweighted_rms_norm(block_residual.astype(mx.float32))
+            attention_inputs = None
+            if self.attention_input is not None:
+                attention_inputs = self.attention_input(block_states, normed_residual)
         hidden_states = self._self_attention(
             hidden_states, attention_inputs, cache, conv_states, conv_mask, messages, fast_conv=fast_conv
         )
@@ -899,27 +980,41 @@ class DecoderLayer(nn.Module):
                 residual = hidden_states = block_residual.astype(mx.float32) + hidden_states
 
             normed_states = unweighted_rms_norm(hidden_states)
-        hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
         if (
-            messages is not None
-            and P.active(dtype, block_residual)
-            and P.msg_gate_ok(self.mlp_message_gate, hidden_states, messages, self.post_attention_layernorm)
-        ):
-            mlp_in = P.msg_gate_norm_single(
-                self.mlp_message_gate, hidden_states, messages, 3, self.post_attention_layernorm
-            )
-        elif (
             messages is None
+            and P._PF_DEPTH_RMS
             and P.active(dtype, block_residual)
-            and hidden_states.dtype == mx.float32
-            and hidden_states.shape[-1] == P._D
+            and block_states is not None
+            and normed_states.dtype == mx.float32
+            and normed_states.shape[-1] == P._D
             and self.post_attention_layernorm.weight.dtype == mx.bfloat16
+            and self.mlp_input.query.dtype == mx.float32
         ):
-            mlp_in = P.rms_norm_f32_bf16(hidden_states, self.post_attention_layernorm)
+            mlp_in = P.depth_attn_rms_bf16(
+                block_states, normed_states, self.mlp_input.query, self.post_attention_layernorm
+            )
         else:
-            if messages is not None:
-                hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
-            mlp_in = self.post_attention_layernorm(hidden_states).astype(dtype)
+            hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
+            if (
+                messages is not None
+                and P.active(dtype, block_residual)
+                and P.msg_gate_ok(self.mlp_message_gate, hidden_states, messages, self.post_attention_layernorm)
+            ):
+                mlp_in = P.msg_gate_norm_single(
+                    self.mlp_message_gate, hidden_states, messages, 3, self.post_attention_layernorm
+                )
+            elif (
+                messages is None
+                and P.active(dtype, block_residual)
+                and hidden_states.dtype == mx.float32
+                and hidden_states.shape[-1] == P._D
+                and self.post_attention_layernorm.weight.dtype == mx.bfloat16
+            ):
+                mlp_in = P.rms_norm_f32_bf16(hidden_states, self.post_attention_layernorm)
+            else:
+                if messages is not None:
+                    hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
+                mlp_in = self.post_attention_layernorm(hidden_states).astype(dtype)
         hidden_states = self.mlp(mlp_in)
         fused_mlp_post = (
             fast_conv
@@ -967,35 +1062,38 @@ class SlidingDecoderLayer(DecoderLayer):
         self, hidden_states, attention_inputs, cache, conv_states, conv_mask, messages, *, fast_conv=False
     ):
         dtype = hidden_states.dtype
-        if attention_inputs is not None:
-            hidden_states = attention_inputs[..., 0, :]
-        if messages is None:
-            if (
-                P.active(dtype, hidden_states)
-                and hidden_states.dtype == mx.float32
-                and hidden_states.shape[-1] == P._D
-                and self.input_layernorm.weight.dtype == mx.bfloat16
-            ):
-                states = (P.rms_norm_f32_bf16(hidden_states, self.input_layernorm),) * 3
-            else:
-                states = (self.input_layernorm(hidden_states).astype(dtype),) * 3
-        elif (
-            P.active(dtype, hidden_states)
-            and P.msg_gate_ok(self.q_message_gate, hidden_states, messages, self.input_layernorm)
-            and P.msg_gate_ok(self.k_message_gate, hidden_states, messages, self.input_layernorm)
-            and P.msg_gate_ok(self.v_message_gate, hidden_states, messages, self.input_layernorm)
-        ):
-            states = P.msg_gate_norm_qkv(
-                (self.q_message_gate, self.k_message_gate, self.v_message_gate),
-                hidden_states,
-                messages,
-                (self.input_layernorm,) * 3,
-                shared_h=True,
-                shared_ln=True,
-            )
+        if attention_inputs is not None and attention_inputs.dtype == dtype and attention_inputs.ndim == 3:
+            states = (attention_inputs,) * 3
         else:
-            states = self._mix_messages((hidden_states,) * 3, messages)
-            states = [self.input_layernorm(s).astype(dtype) for s in states]
+            if attention_inputs is not None:
+                hidden_states = attention_inputs[..., 0, :]
+            if messages is None:
+                if (
+                    P.active(dtype, hidden_states)
+                    and hidden_states.dtype == mx.float32
+                    and hidden_states.shape[-1] == P._D
+                    and self.input_layernorm.weight.dtype == mx.bfloat16
+                ):
+                    states = (P.rms_norm_f32_bf16(hidden_states, self.input_layernorm),) * 3
+                else:
+                    states = (self.input_layernorm(hidden_states).astype(dtype),) * 3
+            elif (
+                P.active(dtype, hidden_states)
+                and P.msg_gate_ok(self.q_message_gate, hidden_states, messages, self.input_layernorm)
+                and P.msg_gate_ok(self.k_message_gate, hidden_states, messages, self.input_layernorm)
+                and P.msg_gate_ok(self.v_message_gate, hidden_states, messages, self.input_layernorm)
+            ):
+                states = P.msg_gate_norm_qkv(
+                    (self.q_message_gate, self.k_message_gate, self.v_message_gate),
+                    hidden_states,
+                    messages,
+                    (self.input_layernorm,) * 3,
+                    shared_h=True,
+                    shared_ln=True,
+                )
+            else:
+                states = self._mix_messages((hidden_states,) * 3, messages)
+                states = [self.input_layernorm(s).astype(dtype) for s in states]
         return self.self_attn(
             *states,
             cache=cache,

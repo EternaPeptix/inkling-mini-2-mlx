@@ -134,6 +134,70 @@ _depth_attention_batch_kernel = mx.fast.metal_kernel(
     source=_DEPTH_ATTENTION_BATCH_SOURCE,
 )
 
+_DEPTH_ATTENTION_BATCH_NL_SOURCE = """
+    constexpr int N = K + 1;
+    constexpr int MAX_IT = (D + TG - 1) / TG;
+    uint row = threadgroup_position_in_grid.x;
+    uint rows = threadgroups_per_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+
+    float xc[MAX_IT][N];
+    int it_idx = 0;
+    for (int d = tid; d < D; d += TG, it_idx++) {
+        for (int i = 0; i < K; i++) xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
+        xc[it_idx][K] = partial[size_t(row) * D + d];
+    }
+
+    threadgroup float buf[N * Q][TG / 32];
+    for (int ly = 0; ly < NL; ly++) {
+        float acc[N * Q];
+        for (int i = 0; i < N * Q; i++) acc[i] = 0.0f;
+        it_idx = 0;
+        for (int d = tid; d < D; d += TG, it_idx++) {
+            for (int j = 0; j < Q; j++) {
+                float qv = queries[((size_t)ly * Q + j) * D + d];
+                for (int i = 0; i < N; i++) acc[i * Q + j] += xc[it_idx][i] * qv;
+            }
+        }
+        for (int i = 0; i < N * Q; i++) {
+            float v = simd_sum(acc[i]);
+            if (lane == 0) buf[i][sg] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float w[N * Q];
+        for (int i = 0; i < N * Q; i++) {
+            float t = 0.0f;
+            for (int s = 0; s < TG / 32; s++) t += buf[i][s];
+            w[i] = t * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < Q; j++) {
+            float m = -INFINITY;
+            for (int i = 0; i < N; i++) m = max(m, w[i * Q + j]);
+            float z = 0.0f;
+            for (int i = 0; i < N; i++) { w[i * Q + j] = metal::exp(w[i * Q + j] - m); z += w[i * Q + j]; }
+            for (int i = 0; i < N; i++) w[i * Q + j] /= z;
+        }
+        it_idx = 0;
+        for (int d = tid; d < D; d += TG, it_idx++) {
+            for (int j = 0; j < Q; j++) {
+                float o = 0.0f;
+                for (int i = 0; i < N; i++) o += w[i * Q + j] * xc[it_idx][i];
+                out[(((size_t)ly * rows + row) * Q + j) * D + d] = o;
+            }
+        }
+    }
+"""
+
+_depth_attention_batch_nl_kernel = mx.fast.metal_kernel(
+    name="depth_attention_batch_nl",
+    input_names=["blocks", "partial", "queries", "scale"],
+    output_names=["out"],
+    source=_DEPTH_ATTENTION_BATCH_NL_SOURCE,
+)
+
 
 def depth_attention_batch(
     blocks: mx.array, partial: mx.array, queries: mx.array, *, scale: float
@@ -142,10 +206,20 @@ def depth_attention_batch(
     D = partial.shape[-1]
     L, Q = queries.shape[0], queries.shape[1]
     TG = row_threads(D)
+    rows = partial.size // D
+    if rows >= 64:
+        return _depth_attention_batch_nl_kernel(
+            inputs=[blocks, partial, queries, scalar(scale)],
+            template=[("K", blocks.shape[0]), ("D", D), ("Q", Q), ("TG", TG), ("NL", L)],
+            grid=(rows * TG, 1, 1),
+            threadgroup=(TG, 1, 1),
+            output_shapes=[(L,) + partial.shape[:-1] + (Q, D)],
+            output_dtypes=[mx.float32],
+        )[0]
     return _depth_attention_batch_kernel(
         inputs=[blocks, partial, queries, scalar(scale)],
         template=[("K", blocks.shape[0]), ("D", D), ("Q", Q), ("TG", TG)],
-        grid=(partial.size // D * TG, L, 1),
+        grid=(rows * TG, L, 1),
         threadgroup=(TG, 1, 1),
         output_shapes=[(L,) + partial.shape[:-1] + (Q, D)],
         output_dtypes=[mx.float32],
@@ -317,12 +391,10 @@ _relative_attention_kernel = mx.fast.metal_kernel(
 )
 
 _FAST_REL_ATTN = os.environ.get("LOOPLING_FAST_REL_ATTN", "1") not in ("0", "")
-_REL_CFG_ENV = os.environ.get("LOOPLING_REL_ATTN_CFG", "")
-_REL_GQA_BLK, _REL_QSG, _REL_TRANS_K, _REL_DBUF = (
-    (int(x) for x in _REL_CFG_ENV.split(",")) if _REL_CFG_ENV else (1, 0, 1, 0)
-)
+_REL_QSG = int(os.environ.get("LOOPLING_REL_QSG", "0"))
+_REL_BK_LOAD = int(os.environ.get("LOOPLING_REL_BK_LOAD", "0"))
+_REL_TRANS_K = int(os.environ.get("LOOPLING_REL_TRANS_K", "0"))
 _REL_VEC_BIAS = int(os.environ.get("LOOPLING_REL_VEC_BIAS", "1"))
-_REL_BK_LOAD = int(os.environ.get("LOOPLING_REL_BK_LOAD", "32"))
 
 _RELATIVE_ATTENTION_FAST_SOURCE = """
     constexpr float LOG2E = 1.4426950408889634f;
@@ -330,37 +402,32 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
     constexpr int LDK = BK_LOAD + 8;
     constexpr int LDV = D + 8;
     constexpr int BQ = QSG * 8;
-    constexpr int TG = GQA_BLK * QSG * 32;
-    constexpr int GQA = HQ / HKV;
-    constexpr int KS_STRIDE = TRANS_K ? (BK_LOAD * LDV) : (D * LDK);
-    constexpr int NBUF = DBUF ? 2 : 1;
+    constexpr int TG = QSG * 32;
+    constexpr int SMEM_ELEMS = (D * LDK > BK_LOAD * LDV) ? (D * LDK) : (BK_LOAD * LDV);
     const int L = sizes[0];
     const int S = sizes[1];
     const uint tid = thread_position_in_threadgroup.x;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const int batch = threadgroup_position_in_grid.z;
-    const int gy = threadgroup_position_in_grid.y;
-    const int kv_head = gy / (GQA / GQA_BLK);
-    const int g_in_blk = int(sg) / QSG;
-    const int q_sg = int(sg) % QSG;
-    const int head = gy * GQA_BLK + g_in_blk;
+    const int head = threadgroup_position_in_grid.y;
+    const int kv_head = head / (HQ / HKV);
     const int q0 = (sizes[2] - 1 - int(threadgroup_position_in_grid.x)) * BQ;
     const int start = key_start[batch];
     const float qscale = scale * LOG2E;
 
-    // The lane holds row fm and columns fn, fn + 1 of each 8x8 fragment.
     const short fm = ((lane / 4) & 4) + (lane / 2) % 4;
     const short fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
-    const int sg_first_row = q0 + q_sg * 8;
+    const int sg_first_row = q0 + int(sg) * 8;
     const int row = sg_first_row + fm;
     const bool row_ok = row < L;
     const int diag = S - L + row;
 
-    threadgroup half Ks[NBUF * KS_STRIDE];
-    threadgroup half Vs[NBUF * BK_LOAD * LDV];
+    threadgroup half KV_smem[SMEM_ELEMS];
+    threadgroup bfloat16_t rel_smem[OTF ? (QSG * 8 * 24) : 1];
 
     simdgroup_half8x8 q_frag[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         half2 qv = half2(0.0h);
         if (row_ok) {
@@ -371,7 +438,19 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
         q_frag[db].thread_elements()[0] = qv.x;
         q_frag[db].thread_elements()[1] = qv.y;
     }
+
+    simdgroup_bfloat8x8 r_frag0, r_frag1;
+    if constexpr (OTF) {
+        const int r_safe = max(0, min(sg_first_row + int(fm), L - 1));
+        const device bfloat16_t* rp0 = rel + (size_t(batch * L + r_safe) * HQ + head) * 16 + fn;
+        r_frag0.thread_elements()[0] = rp0[0];
+        r_frag0.thread_elements()[1] = rp0[1];
+        r_frag1.thread_elements()[0] = rp0[8];
+        r_frag1.thread_elements()[1] = rp0[9];
+    }
+
     simdgroup_float8x8 acc[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         acc[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
@@ -393,149 +472,171 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
     const bool all_rows_ok = (sg_first_row + 7 < L);
 
     const int k_start_blk = (first_key / BK) * BK;
-    for (int k_blk = k_start_blk, tile = 0; k_blk <= last_diag; k_blk += BK_LOAD, ++tile) {
-        if constexpr (!DBUF) {
-            if (tile > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        const int buf = DBUF ? (tile & 1) : 0;
-        threadgroup half* Kc_base = Ks + buf * KS_STRIDE;
-        threadgroup half* Vc_base = Vs + buf * BK_LOAD * LDV;
+    for (int k_blk = k_start_blk; k_blk <= last_diag; k_blk += BK_LOAD) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int c = tid; c < BK_LOAD * D / 8; c += TG) {
             const int r = c / (D / 8);
             const int col = (c % (D / 8)) * 8;
             const int key = k_blk + r;
-            vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
-            vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            half4 h0 = half4(0), h1 = half4(0);
             if (key < S) {
                 auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
-                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
-                kv[0] = kp[0];
-                kv[1] = kp[1];
-                vv[0] = vp[0];
-                vv[1] = vp[1];
+                h0 = half4(float4(kp[0]));
+                h1 = half4(float4(kp[1]));
             }
             if constexpr (TRANS_K) {
-                ((threadgroup half4*)(Kc_base + r * LDV + col))[0] = half4(float4(kv[0]));
-                ((threadgroup half4*)(Kc_base + r * LDV + col))[1] = half4(float4(kv[1]));
-                ((threadgroup half4*)(Vc_base + r * LDV + col))[0] = half4(float4(vv[0]));
-                ((threadgroup half4*)(Vc_base + r * LDV + col))[1] = half4(float4(vv[1]));
+                ((threadgroup half4*)(KV_smem + r * LDV + col))[0] = h0;
+                ((threadgroup half4*)(KV_smem + r * LDV + col))[1] = h1;
             } else {
-                for (int j = 0; j < 8; ++j) {
-                    Kc_base[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
-                    Vc_base[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
-                }
+                KV_smem[(col + 0) * LDK + r] = h0.x;
+                KV_smem[(col + 1) * LDK + r] = h0.y;
+                KV_smem[(col + 2) * LDK + r] = h0.z;
+                KV_smem[(col + 3) * LDK + r] = h0.w;
+                KV_smem[(col + 4) * LDK + r] = h1.x;
+                KV_smem[(col + 5) * LDK + r] = h1.y;
+                KV_smem[(col + 6) * LDK + r] = h1.z;
+                KV_smem[(col + 7) * LDK + r] = h1.w;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_first_row >= L || k_blk > sg_last_diag
-            || (WINDOW > 0 && (sg_first_diag - (k_blk + BK_LOAD - 1)) >= WINDOW)) {
-            continue;
-        }
 
-        for (int sub = 0; sub < BK_LOAD; sub += BK) {
-            const int k0 = k_blk + sub;
-            if (k0 > sg_last_diag || (WINDOW > 0 && (sg_first_diag - (k0 + BK - 1)) >= WINDOW)) {
-                continue;
-            }
-            threadgroup half* Kc = Kc_base + (TRANS_K ? (sub * LDV) : sub);
-            threadgroup half* Vc = Vc_base + sub * LDV;
+        const bool sg_active = !(sg_first_row >= L || k_blk > sg_last_diag
+            || (WINDOW > 0 && (sg_first_diag - (k_blk + BK_LOAD - 1)) >= WINDOW));
 
-            simdgroup_float8x8 scores[BK / 8];
-            for (int kb = 0; kb < BK / 8; ++kb) {
+        simdgroup_float8x8 scores[BK_LOAD / 8];
+        if (sg_active) {
+            #pragma clang loop unroll(full)
+            for (int kb = 0; kb < BK_LOAD / 8; ++kb) {
                 scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             }
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
-                for (int kb = 0; kb < BK / 8; ++kb) {
-                    simdgroup_half8x8 k_frag;
+                simdgroup_half8x8 kf[BK_LOAD / 8];
+                simdgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < BK_LOAD / 8; ++kb) {
                     if constexpr (TRANS_K) {
-                        simdgroup_load(k_frag, Kc + kb * 8 * LDV + db * 8, LDV, ulong2(0, 0), true);
+                        const threadgroup half* kp = KV_smem + (kb * 8 + fn) * LDV + db * 8 + fm;
+                        kf[kb].thread_elements()[0] = kp[0];
+                        kf[kb].thread_elements()[1] = kp[LDV];
                     } else {
-                        simdgroup_load(k_frag, Kc + db * 8 * LDK + kb * 8, LDK);
+                        const half2 kv = *((const threadgroup half2*)(KV_smem + (db * 8 + fm) * LDK + kb * 8 + fn));
+                        kf[kb].thread_elements()[0] = kv.x;
+                        kf[kb].thread_elements()[1] = kv.y;
                     }
-                    simdgroup_multiply_accumulate(scores[kb], q_frag[db], k_frag, scores[kb]);
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < BK_LOAD / 8; ++kb) {
+                    simdgroup_multiply_accumulate(scores[kb], q_frag[db], kf[kb], scores[kb]);
                 }
             }
+        }
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int c = tid; c < BK_LOAD * D / 8; c += TG) {
+            const int r = c / (D / 8);
+            const int col = (c % (D / 8)) * 8;
+            const int key = k_blk + r;
+            half4 h0 = half4(0), h1 = half4(0);
+            if (key < S) {
+                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
+                h0 = half4(float4(vp[0]));
+                h1 = half4(float4(vp[1]));
+            }
+            ((threadgroup half4*)(KV_smem + r * LDV + col))[0] = h0;
+            ((threadgroup half4*)(KV_smem + r * LDV + col))[1] = h1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!sg_active) continue;
+
+        #pragma clang loop unroll(full)
+        for (int sub_i = 0; sub_i < BK_LOAD / BK; ++sub_i) {
+            const int sub = sub_i * BK;
+            const int k0 = k_blk + sub;
+            if (k0 > sg_last_diag || (WINDOW > 0 && (sg_first_diag - (k0 + BK - 1)) >= WINDOW)) continue;
+            const int kb0 = sub_i * 2;
+            const int d_lo = sg_first_diag - (k0 + BK - 1);
+            const int d_hi = sg_last_diag - k0;
+            int d_base = 0;
+            if constexpr (OTF) {
+                if (d_lo < R && d_hi >= 0) {
+                    d_base = max(0, min(R - 24, d_lo));
+                    threadgroup bfloat16_t* rbp = rel_smem + sg * (8 * 24);
+                    #pragma clang loop unroll(full)
+                    for (int cb = 0; cb < 3; ++cb) {
+                        const int col = d_base + cb * 8 + fn;
+                        simdgroup_bfloat8x8 p0, p1;
+                        p0.thread_elements()[0] = rel_proj[(fm + 0) * R + col];
+                        p0.thread_elements()[1] = rel_proj[(fm + 0) * R + col + 1];
+                        p1.thread_elements()[0] = rel_proj[(fm + 8) * R + col];
+                        p1.thread_elements()[1] = rel_proj[(fm + 8) * R + col + 1];
+                        simdgroup_float8x8 bc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                        simdgroup_multiply_accumulate(bc, r_frag0, p0, bc);
+                        simdgroup_multiply_accumulate(bc, r_frag1, p1, bc);
+                        rbp[fm * 24 + cb * 8 + fn] = bfloat16_t(bc.thread_elements()[0]);
+                        rbp[fm * 24 + cb * 8 + fn + 1] = bfloat16_t(bc.thread_elements()[1]);
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
             float tile_max = -INFINITY;
             const bool full_visible = all_rows_ok && (k0 >= start) && (k0 + BK - 1 <= sg_first_diag)
                 && (WINDOW == 0 || (sg_last_diag - k0) < WINDOW);
-            if (full_visible) {
-                if ((sg_first_diag - (k0 + BK - 1)) >= R) {
-                    for (int kb = 0; kb < BK / 8; ++kb) {
-                        for (int e = 0; e < 2; ++e) {
-                            float s = scores[kb].thread_elements()[e] * qscale;
-                            scores[kb].thread_elements()[e] = s;
-                            tile_max = max(tile_max, s);
-                        }
-                    }
-                } else if (VEC_BIAS && (sg_last_diag - k0) < R) {
-                    if constexpr (sizeof(T) == 2) {
-                        for (int kb = 0; kb < BK / 8; ++kb) {
-                            const int d0 = diag - (k0 + kb * 8 + fn);
-                            const packed_ushort2 raw = *(const device packed_ushort2*)(bias + d0 - 1);
-                            float s0 = scores[kb].thread_elements()[0] * qscale;
-                            s0 += float(as_type<T>(raw.y)) * LOG2E;
-                            float s1 = scores[kb].thread_elements()[1] * qscale;
-                            s1 += float(as_type<T>(raw.x)) * LOG2E;
-                            scores[kb].thread_elements()[0] = s0;
-                            scores[kb].thread_elements()[1] = s1;
-                            tile_max = max(tile_max, s0);
-                            tile_max = max(tile_max, s1);
-                        }
-                    } else {
-                        for (int kb = 0; kb < BK / 8; ++kb) {
-                            for (int e = 0; e < 2; ++e) {
-                                const int d = diag - (k0 + kb * 8 + fn + e);
-                                float s = scores[kb].thread_elements()[e] * qscale;
-                                s += float(bias[d]) * LOG2E;
-                                scores[kb].thread_elements()[e] = s;
-                                tile_max = max(tile_max, s);
-                            }
-                        }
-                    }
-                } else {
-                    for (int kb = 0; kb < BK / 8; ++kb) {
-                        for (int e = 0; e < 2; ++e) {
-                            const int d = diag - (k0 + kb * 8 + fn + e);
-                            float s = scores[kb].thread_elements()[e] * qscale;
-                            if (d < R) {
-                                s += float(bias[d]) * LOG2E;
-                            }
-                            scores[kb].thread_elements()[e] = s;
-                            tile_max = max(tile_max, s);
-                        }
+            const threadgroup bfloat16_t* rbp_row = rel_smem + sg * (8 * 24) + fm * 24 - d_base;
+            if (full_visible && d_lo >= R) {
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < 2; ++kb) {
+                    for (int e = 0; e < 2; ++e) {
+                        float s = scores[kb0 + kb].thread_elements()[e] * qscale;
+                        scores[kb0 + kb].thread_elements()[e] = s;
+                        tile_max = max(tile_max, s);
                     }
                 }
+            } else if (!OTF && VEC_BIAS && full_visible && d_hi < R) {
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < 2; ++kb) {
+                    const int d0 = diag - (k0 + kb * 8 + fn);
+                    const packed_ushort2 raw = *(const device packed_ushort2*)(bias + d0 - 1);
+                    float s0 = scores[kb0 + kb].thread_elements()[0] * qscale;
+                    s0 += float(as_type<T>(raw.y)) * LOG2E;
+                    float s1 = scores[kb0 + kb].thread_elements()[1] * qscale;
+                    s1 += float(as_type<T>(raw.x)) * LOG2E;
+                    scores[kb0 + kb].thread_elements()[0] = s0;
+                    scores[kb0 + kb].thread_elements()[1] = s1;
+                    tile_max = max(tile_max, s0);
+                    tile_max = max(tile_max, s1);
+                }
             } else {
-                for (int kb = 0; kb < BK / 8; ++kb) {
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < 2; ++kb) {
                     for (int e = 0; e < 2; ++e) {
                         const int key = k0 + kb * 8 + fn + e;
                         const int d = diag - key;
-                        const bool visible = row_ok && d >= 0 && key >= start
-                            && (WINDOW == 0 || d < WINDOW);
+                        const bool vis = row_ok && d >= 0 && key >= start && (WINDOW == 0 || d < WINDOW);
                         float s = -INFINITY;
-                        if (visible) {
-                            s = scores[kb].thread_elements()[e] * qscale;
+                        if (vis) {
+                            s = scores[kb0 + kb].thread_elements()[e] * qscale;
                             if (d < R) {
-                                s += float(bias[d]) * LOG2E;
+                                s += (OTF ? float(rbp_row[d]) : float(bias[d])) * LOG2E;
                             }
                         }
-                        scores[kb].thread_elements()[e] = s;
+                        scores[kb0 + kb].thread_elements()[e] = s;
                         tile_max = max(tile_max, s);
                     }
                 }
             }
-            // The 4 lanes of a row are lane ^ 1 and lane ^ 8 apart.
             tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
             tile_max = max(tile_max, simd_shuffle_xor(tile_max, 8));
             const float new_max = max(row_max, tile_max);
             const float factor = fast::exp2(row_max - new_max);
             const bool skip_pv = simd_all(tile_max - new_max < -25.0f);
             float tile_sum = 0.0f;
-            simdgroup_half8x8 probs[BK / 8];
-            for (int kb = 0; kb < BK / 8; ++kb) {
+            simdgroup_half8x8 probs[2];
+            #pragma clang loop unroll(full)
+            for (int kb = 0; kb < 2; ++kb) {
                 for (int e = 0; e < 2; ++e) {
-                    const float p = fast::exp2(scores[kb].thread_elements()[e] - new_max);
+                    const float p = fast::exp2(scores[kb0 + kb].thread_elements()[e] - new_max);
                     probs[kb].thread_elements()[e] = half(p);
                     tile_sum += p;
                 }
@@ -545,17 +646,31 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
             row_sum = row_sum * factor + tile_sum;
             row_max = new_max;
             if (factor != 1.0f) {
+                #pragma clang loop unroll(full)
                 for (int db = 0; db < D / 8; ++db) {
                     acc[db].thread_elements()[0] *= factor;
                     acc[db].thread_elements()[1] *= factor;
                 }
             }
             if (!skip_pv) {
-                for (int db = 0; db < D / 8; ++db) {
-                    for (int kb = 0; kb < BK / 8; ++kb) {
-                        simdgroup_half8x8 v_frag;
-                        simdgroup_load(v_frag, Vc + kb * 8 * LDV + db * 8, LDV);
-                        simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+                const threadgroup half* Vc = KV_smem + sub * LDV;
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < 2; ++kb) {
+                    #pragma clang loop unroll(full)
+                    for (int db0 = 0; db0 < D / 8; db0 += 4) {
+                        simdgroup_half8x8 vf[4];
+                        simdgroup_barrier(mem_flags::mem_none);
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            const half2 vv = *((const threadgroup half2*)(Vc + (kb * 8 + fm) * LDV + (db0 + j) * 8 + fn));
+                            vf[j].thread_elements()[0] = vv.x;
+                            vf[j].thread_elements()[1] = vv.y;
+                        }
+                        simdgroup_barrier(mem_flags::mem_none);
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            simdgroup_multiply_accumulate(acc[db0 + j], probs[kb], vf[j], acc[db0 + j]);
+                        }
                     }
                 }
             }
@@ -564,6 +679,7 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
 
     if (row_ok) {
         device T* op = out + (size_t(batch * L + row) * HQ + head) * D;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             op[db * 8 + fn] = T(acc[db].thread_elements()[0] / row_sum);
             op[db * 8 + fn + 1] = T(acc[db].thread_elements()[1] / row_sum);
@@ -573,11 +689,12 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
 
 _relative_attention_fast_kernel = mx.fast.metal_kernel(
     name="relative_attention_fast",
-    input_names=["q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale"],
+    input_names=["q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale", "rel_proj"],
     output_names=["out"],
     source=_RELATIVE_ATTENTION_FAST_SOURCE,
     ensure_row_contiguous=False,
 )
+_DUMMY_REL_PROJ = mx.zeros((16, 24), dtype=mx.bfloat16)
 
 
 def relative_attention(
@@ -590,19 +707,22 @@ def relative_attention(
     scale: float,
     window: int,
     key_start: mx.array,
+    rel_proj: mx.array | None = None,
 ) -> mx.array:
     """q: (B, Hq, L, D), k and v: (B, Hkv, S, D), all bfloat16, with the queries
-    at the last L keys. rel: (B, L, Hq, R), the bias at distances below R.
-    sinks: (B, L, Hq). key_start: (B,), the first key of each row. Returns
-    (B, L, Hq, D)."""
+    at the last L keys. rel: (B, L, Hq, R) position bias, OR when rel_proj is passed
+    (B, L, Hq, 16) clipped relative_states with rel_proj (16, R) bf16 for OTF bias."""
     B, Hq, L, D = q.shape
     Hkv, S = k.shape[1], k.shape[2]
-    if _FAST_REL_ATTN and Hq % Hkv == 0 and (Hq // Hkv) % _REL_GQA_BLK == 0:
-        qsg = _REL_QSG if _REL_QSG > 0 else (8 if (L >= 1024 or (S >= 4096 and L >= 256)) else 4)
+    otf = rel_proj is not None and rel.shape[-1] == 16 and rel_proj.shape[1] >= 24
+    if _FAST_REL_ATTN and Hq % Hkv == 0:
+        qsg = _REL_QSG if _REL_QSG > 0 else (8 if L >= 768 else 4)
+        bkl = _REL_BK_LOAD if _REL_BK_LOAD > 0 else (64 if L >= 768 else 16)
         bq = qsg * 8
         nq_tiles = (L + bq - 1) // bq
-        tg = _REL_GQA_BLK * qsg * 32
-        ny = Hkv * ((Hq // Hkv) // _REL_GQA_BLK)
+        tg = qsg * 32
+        r_ext = rel_proj.shape[1] if otf else rel.shape[-1]
+        r_proj_in = rel_proj if otf else _DUMMY_REL_PROJ
         return _relative_attention_fast_kernel(
             inputs=[
                 q,
@@ -613,26 +733,28 @@ def relative_attention(
                 mx.contiguous(key_start.astype(mx.int32)),
                 mx.array([L, S, nq_tiles], dtype=mx.int32),
                 scalar(scale),
+                r_proj_in,
             ],
             template=[
                 ("T", q.dtype),
                 ("D", D),
                 ("HQ", Hq),
                 ("HKV", Hkv),
-                ("R", rel.shape[-1]),
+                ("R", r_ext),
                 ("WINDOW", window),
-                ("GQA_BLK", _REL_GQA_BLK),
                 ("QSG", qsg),
+                ("BK_LOAD", bkl),
                 ("TRANS_K", _REL_TRANS_K),
-                ("DBUF", _REL_DBUF),
                 ("VEC_BIAS", _REL_VEC_BIAS),
-                ("BK_LOAD", _REL_BK_LOAD),
+                ("OTF", int(otf)),
             ],
-            grid=(nq_tiles * tg, ny, B),
+            grid=(nq_tiles * tg, Hq, B),
             threadgroup=(tg, 1, 1),
             output_shapes=[(B, L, Hq, D)],
             output_dtypes=[q.dtype],
         )[0]
+    if otf:
+        rel = rel @ rel_proj
     return _relative_attention_kernel(
         inputs=[
             q,

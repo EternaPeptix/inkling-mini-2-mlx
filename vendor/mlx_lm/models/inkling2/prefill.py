@@ -71,6 +71,109 @@ def _k(name, ins, outs, src):
     return k
 
 
+def _k_mma(name, ins, outs, src, extra_hdr=""):
+    k = _kernels.get(name)
+    if k is None:
+        k = _kernels[name] = mx.fast.metal_kernel(
+            name=name,
+            input_names=list(ins),
+            output_names=list(outs),
+            source=src,
+            header="#include <metal_simdgroup_matrix>\n" + GLUE_HEADER + extra_hdr,
+            ensure_row_contiguous=True,
+        )
+    return k
+
+
+# ---------------------------------------------------------------------------------------------------- Fused bf16 -> f32 Router GEMM
+_ROUTER_BF16_SRC = r"""
+    constexpr int BM = 32, BN = 64, BK = 32, LDX = 40, TG = 128, TM = 2, TN = 4;
+    const uint tgn = threadgroup_position_in_grid.x;
+    const uint tgm = threadgroup_position_in_grid.y;
+    const uint m0 = tgm * BM, n0 = tgn * BN;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint sg_m = (sg / 2) * 16, sg_n = (sg % 2) * 32;
+    const ushort fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
+    const ushort fn = ((lane >> 2) & 2) * 2 | ((lane & 1) * 2);
+
+    threadgroup float Xs[BM * LDX];
+    threadgroup float Ws[BN * LDX];
+    const uint x_mr = tid / 4, x_mk = (tid % 4) * 8;
+    const bool x_ok = (m0 + x_mr) < uint(MM);
+    const device bfloat16_t* x_ptr = x + (size_t)(m0 + x_mr) * KK + x_mk;
+    const uint w_nr = tid / 2, w_koff = (tid % 2) * 16;
+    const device float* w_ptr = w + (size_t)(n0 + w_nr) * KK + w_koff;
+
+    simdgroup_float8x8 C[TM][TN];
+    for (int tm = 0; tm < TM; ++tm)
+        for (int tn = 0; tn < TN; ++tn)
+            C[tm][tn] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k = 0; k < KK; k += BK) {
+        if (x_ok) {
+            uint4 raw = ((const device uint4*)(x_ptr + k))[0];
+            ((threadgroup float4*)(Xs + x_mr * LDX + x_mk))[0] = float4(as_type<bfloat4>(raw.xy));
+            ((threadgroup float4*)(Xs + x_mr * LDX + x_mk))[1] = float4(as_type<bfloat4>(raw.zw));
+        } else {
+            ((threadgroup float4*)(Xs + x_mr * LDX + x_mk))[0] = float4(0);
+            ((threadgroup float4*)(Xs + x_mr * LDX + x_mk))[1] = float4(0);
+        }
+        const device float4* wp4 = (const device float4*)(w_ptr + k);
+        threadgroup float4* wdp = (threadgroup float4*)(Ws + w_nr * LDX + w_koff);
+        wdp[0] = wp4[0]; wdp[1] = wp4[1]; wdp[2] = wp4[2]; wdp[3] = wp4[3];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (int ks = 0; ks < BK; ks += 8) {
+            simdgroup_float8x8 A[TM], B[TN];
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (int tm = 0; tm < TM; ++tm) {
+                const float2 av = *((const threadgroup float2*)(Xs + (sg_m + tm * 8 + fm) * LDX + ks + fn));
+                A[tm].thread_elements()[0] = av.x; A[tm].thread_elements()[1] = av.y;
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (int tn = 0; tn < TN; ++tn) {
+                const threadgroup float* bp = Ws + (sg_n + tn * 8 + fn) * LDX + ks + fm;
+                B[tn].thread_elements()[0] = bp[0]; B[tn].thread_elements()[1] = bp[LDX];
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (int tm = 0; tm < TM; ++tm)
+                for (int tn = 0; tn < TN; ++tn)
+                    simdgroup_multiply_accumulate(C[tm][tn], A[tm], B[tn], C[tm][tn]);
+        }
+        if (k + BK < KK) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int tm = 0; tm < TM; ++tm) {
+        const uint mr_o = m0 + sg_m + uint(tm) * 8u + fm;
+        if (mr_o < uint(MM)) {
+            device float* dst = out + (size_t)mr_o * 128;
+            for (int tn = 0; tn < TN; ++tn) {
+                const uint nc_o = n0 + sg_n + uint(tn) * 8u + fn;
+                ((device float2*)(dst + nc_o))[0] = float2(C[tm][tn].thread_elements()[0], C[tm][tn].thread_elements()[1]);
+            }
+        }
+    }
+"""
+
+
+def router_logits_bf16(x: mx.array, w: mx.array) -> mx.array:
+    """Bit-exact fused bf16->f32 router GEMM: (B, L, 2304) bf16 @ (128, 2304).T f32 -> (B, L, 128) f32."""
+    M = x.size // 2304
+    k = _k_mma("pf_router_bf16", ("x", "w"), ("out",), _ROUTER_BF16_SRC)
+    return k(
+        inputs=[x, w],
+        template=[("MM", M), ("KK", 2304)],
+        grid=(128 * 2, (M + 31) // 32, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[x.shape[:-1] + (128,)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 # ---------------------------------------------------------------------------------------------------- Wave 6B: Custom BMx64x32 Grouped-GEMM MoE (NVFP4 & MXFP8)
 _MOE_CSORT_TILES_SRC = r"""
     constexpr uint NSG = 32;
@@ -176,8 +279,8 @@ _MOE_GMM_SRC = r"""
     constexpr int W_ROW_BYTES = KK * BITS / 8;
     constexpr int S_ROW_BYTES = KK / GS;
 
-    const uint tgn = threadgroup_position_in_grid.x;
-    const uint tgm = threadgroup_position_in_grid.y;
+    const uint tgm = threadgroup_position_in_grid.x;
+    const uint tgn = threadgroup_position_in_grid.y;
     const uint meta = tile_meta[tgm];
     if (meta == 0xFFFFFFFFu) return;
 
@@ -667,7 +770,7 @@ def moe_gmm_forward(ex, hidden_states: mx.array, selected_experts: mx.array, rou
             ("BITS", gu.bits), ("GS", gu.group_size), ("HGS", hgs_gu),
             ("KK", K_gu), ("NN", N_gu), ("USE_LHS", 1), ("FUSED_SWIGLU", 1),
         ],
-        grid=(tg * (N_gu // bn), max_tiles, 1),
+        grid=(tg * max_tiles, N_gu // bn, 1),
         threadgroup=(tg, 1, 1),
         output_shapes=[(P, N_gu // 2)],
         output_dtypes=[mx.bfloat16],
@@ -684,7 +787,7 @@ def moe_gmm_forward(ex, hidden_states: mx.array, selected_experts: mx.array, rou
             ("BITS", dn.bits), ("GS", dn.group_size), ("HGS", hgs_dn),
             ("KK", K_dn), ("NN", N_dn), ("USE_LHS", 0), ("FUSED_SWIGLU", 0),
         ],
-        grid=(tg * (N_dn // bn), max_tiles, 1),
+        grid=(tg * max_tiles, N_dn // bn, 1),
         threadgroup=(tg, 1, 1),
         output_shapes=[(P, N_dn)],
         output_dtypes=[mx.bfloat16],
@@ -984,6 +1087,12 @@ def _get_eps(eps: float) -> mx.array:
 
 
 _PF_ATTEND_PRE = os.environ.get("LOOPLING_PF_ATTEND_PRE", "1") not in ("0", "")
+_PF_OTF_REL = os.environ.get("LOOPLING_PF_OTF_REL", "1") not in ("0", "")
+_PF_FG_MIX = os.environ.get("LOOPLING_PF_FG_MIX", "1") not in ("0", "")
+_PF_MGIN_DOWN = os.environ.get("LOOPLING_PF_MGIN_DOWN", "1") not in ("0", "")
+_MGIN_DOWN_SPK = {1024: 4, 2048: 2, 4096: 2, 8192: 1, 16384: 1}
+_PF_ROUTER = os.environ.get("LOOPLING_PF_ROUTER", "1") not in ("0", "")
+_PF_DEPTH_RMS = os.environ.get("LOOPLING_PF_DEPTH_RMS", "1") not in ("0", "")
 
 _QKV_CLIP_RMS_SRC = r"""
     GL_NOFMA
@@ -1042,6 +1151,42 @@ _QKV_CLIP_RMS_SRC = r"""
             glue_rms_apply_nw<bfloat16_t>(sv[2], inv),
             glue_rms_apply_nw<bfloat16_t>(sv[3], inv));
         ((device uint2*)(v_out + voff))[0] = as_type<uint2>(ov);
+    } else if (HAS_REL && s == HQ + 2 * HKV) {
+        if (lane < HQ) {
+            uint h = lane;
+            size_t roff = (size_t)tok * HQ * 16 + h * 16;
+            const device uint2* rp = (const device uint2*)(r + roff);
+            const device uint2* rsp = (const device uint2*)(r_scale + h * 16);
+            float sv[16];
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < 4; ++c) {
+                bfloat4 rv = as_type<bfloat4>(rp[c]);
+                bfloat4 rsc = as_type<bfloat4>(rsp[c]);
+                sv[c * 4 + 0] = float(rv.x) * float(rsc.x);
+                sv[c * 4 + 1] = float(rv.y) * float(rsc.y);
+                sv[c * 4 + 2] = float(rv.z) * float(rsc.z);
+                sv[c * 4 + 3] = float(rv.w) * float(rsc.w);
+            }
+            glue_l2_clip_row16(sv, params[3]);
+            device uint2* rop = (device uint2*)(r_out + roff);
+            float tau_v = HAS_TAU ? tau[tok] : 1.0f;
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < 4; ++c) {
+                bfloat4 ov = bfloat4(
+                    bfloat16_t(sv[c * 4 + 0]),
+                    bfloat16_t(sv[c * 4 + 1]),
+                    bfloat16_t(sv[c * 4 + 2]),
+                    bfloat16_t(sv[c * 4 + 3]));
+                if (HAS_TAU) {
+                    ov = bfloat4(
+                        bfloat16_t(glue_tau(float(ov.x), tau_v)),
+                        bfloat16_t(glue_tau(float(ov.y), tau_v)),
+                        bfloat16_t(glue_tau(float(ov.z), tau_v)),
+                        bfloat16_t(glue_tau(float(ov.w), tau_v)));
+                }
+                rop[c] = as_type<uint2>(ov);
+            }
+        }
     }
 """
 
@@ -1058,33 +1203,46 @@ def qkv_clip_rms(
     thr_k: float,
     eps: float,
     tau: mx.array | None = None,
-) -> tuple[mx.array, mx.array, mx.array]:
-    """Lean zero-spill fused q_l2_clip (+tau) + k_l2_clip + v_rms_norm -> transposed views (B,H,L,128)."""
+    r: mx.array | None = None,
+    r_scale: mx.array | None = None,
+    thr_r: float = 8.0,
+):
+    """Lean zero-spill fused q_l2_clip (+tau) + k_l2_clip + v_rms_norm [+ rel_l2_clip (+tau)] -> transposed views."""
     B, L, _ = q.shape
     has_tau = int(tau is not None)
+    has_rel = int(r is not None)
     if tau is not None:
         tau_in = mx.broadcast_to(tau.reshape(-1, L), (B, L)).astype(mx.float32)
     else:
         tau_in = _DUMMY_F32
-    pkey = ("qkv_cr", thr_q, thr_k, eps)
+    r_in = r if has_rel else _DUMMY_BF16
+    rs_in = r_scale if has_rel else _DUMMY_BF16
+    pkey = ("qkv_cr4", thr_q, thr_k, eps, thr_r)
     params = _PARAMS_CACHE.get(pkey)
     if params is None:
-        params = _PARAMS_CACHE[pkey] = mx.array([thr_q, thr_k, eps], dtype=mx.float32)
-    ntg_x = (num_heads + 2 * num_kv_heads + 7) // 8
+        params = _PARAMS_CACHE[pkey] = mx.array([thr_q, thr_k, eps, thr_r], dtype=mx.float32)
+    ntg_x = (num_heads + 2 * num_kv_heads + (1 if has_rel else 0) + 7) // 8
     k_fn = _k(
-        "pf_qkv_clip_rms",
-        ("q", "k", "v", "q_scale", "tau", "params"),
-        ("q_out", "k_out", "v_out"),
+        "pf_qkv_clip_rms_r",
+        ("q", "k", "v", "q_scale", "tau", "params", "r", "r_scale"),
+        ("q_out", "k_out", "v_out", "r_out"),
         _QKV_CLIP_RMS_SRC,
     )
-    qo, ko, vo = k_fn(
-        inputs=[q, k, v, q_scale, tau_in, params],
-        template=[("HQ", num_heads), ("HKV", num_kv_heads), ("HAS_TAU", has_tau)],
+    qo, ko, vo, ro = k_fn(
+        inputs=[q, k, v, q_scale, tau_in, params, r_in, rs_in],
+        template=[("HQ", num_heads), ("HKV", num_kv_heads), ("HAS_TAU", has_tau), ("HAS_REL", has_rel)],
         grid=(ntg_x * 256, B * L, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(B, L, num_heads, 128), (B, L, num_kv_heads, 128), (B, L, num_kv_heads, 128)],
-        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16],
+        output_shapes=[
+            (B, L, num_heads, 128),
+            (B, L, num_kv_heads, 128),
+            (B, L, num_kv_heads, 128),
+            (B, L, num_heads, 16) if has_rel else (1,),
+        ],
+        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.bfloat16],
     )
+    if has_rel:
+        return qo.transpose(0, 2, 1, 3), ko.transpose(0, 2, 1, 3), vo.transpose(0, 2, 1, 3), ro
     return qo.transpose(0, 2, 1, 3), ko.transpose(0, 2, 1, 3), vo.transpose(0, 2, 1, 3)
 
 
@@ -1224,6 +1382,43 @@ _SWA_QKV_CONV_CLIP_SRC = f"""
                 ((device float4*)(nvcs + ((size_t)b * 3 + r) * DD + c))[0] = fv;
             }}
         }}
+    }} else if (HAS_REL && s == HQ + 2 * HKV) {{
+        if (lane < HQ) {{
+            uint h = lane;
+            const device uint2* rsp = (const device uint2*)(r_scale + h * 16);
+            float4 scf[4];
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < 4; ++c) {{
+                scf[c] = float4(as_type<bfloat4>(rsp[c]));
+            }}
+            float thr_r = params[3];
+            for (uint tk = 0; tk < TT; tk++) {{
+                uint t = t0 + tk;
+                if (t >= uint(LL)) break;
+                size_t roff = ((size_t)b * LL + t) * HQ * 16 + h * 16;
+                const device uint2* rp = (const device uint2*)(r + roff);
+                float sv[16];
+                #pragma clang loop unroll(full)
+                for (int c = 0; c < 4; ++c) {{
+                    bfloat4 rv = as_type<bfloat4>(rp[c]);
+                    sv[c * 4 + 0] = float(rv.x) * scf[c].x;
+                    sv[c * 4 + 1] = float(rv.y) * scf[c].y;
+                    sv[c * 4 + 2] = float(rv.z) * scf[c].z;
+                    sv[c * 4 + 3] = float(rv.w) * scf[c].w;
+                }}
+                glue_l2_clip_row16(sv, thr_r);
+                device uint2* rop = (device uint2*)(r_out + roff);
+                #pragma clang loop unroll(full)
+                for (int c = 0; c < 4; ++c) {{
+                    bfloat4 ov = bfloat4(
+                        bfloat16_t(sv[c * 4 + 0]),
+                        bfloat16_t(sv[c * 4 + 1]),
+                        bfloat16_t(sv[c * 4 + 2]),
+                        bfloat16_t(sv[c * 4 + 3]));
+                    rop[c] = as_type<uint2>(ov);
+                }}
+            }}
+        }}
     }}
 """
 
@@ -1243,38 +1438,49 @@ def swa_qkv_conv_clip(
     thr_q: float,
     thr_k: float,
     eps: float,
-) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
-    """1-launch SlidingAttention fusion: q_l2_clip + (k_sconv->k_l2_clip) + (v_sconv->v_rms_norm)."""
+    r: mx.array | None = None,
+    r_scale: mx.array | None = None,
+    thr_r: float = 8.0,
+):
+    """1-launch SlidingAttention fusion: q_l2_clip + (k_sconv->k_l2_clip) + (v_sconv->v_rms_norm) [+ rel_l2_clip]."""
     B, L, _ = q.shape
     Dkv = num_kv_heads * 128
     has_kcs = int(k_cs is not None)
     has_vcs = int(v_cs is not None)
+    has_rel = int(r is not None)
     kcs_in = k_cs if k_cs is not None else _DUMMY_F32
     vcs_in = v_cs if v_cs is not None else _DUMMY_F32
-    pkey = ("qkv_cr", thr_q, thr_k, eps)
+    r_in = r if has_rel else _DUMMY_BF16
+    rs_in = r_scale if has_rel else _DUMMY_BF16
+    pkey = ("qkv_cr4", thr_q, thr_k, eps, thr_r)
     params = _PARAMS_CACHE.get(pkey)
     if params is None:
-        params = _PARAMS_CACHE[pkey] = mx.array([thr_q, thr_k, eps], dtype=mx.float32)
+        params = _PARAMS_CACHE[pkey] = mx.array([thr_q, thr_k, eps, thr_r], dtype=mx.float32)
     tt = 16
     ntiles = (L + tt - 1) // tt
-    ntg_x = (num_heads + 2 * num_kv_heads + 7) // 8
+    ntg_x = (num_heads + 2 * num_kv_heads + (1 if has_rel else 0) + 7) // 8
     k_fn = _k(
-        "pf_swa_qkv_cc",
-        ("q", "k", "v", "q_scale", "kcw", "vcw", "kcs", "vcs", "params"),
-        ("q_out", "k_out", "v_out", "nkcs", "nvcs"),
+        "pf_swa_qkv_cc_r",
+        ("q", "k", "v", "q_scale", "kcw", "vcw", "kcs", "vcs", "params", "r", "r_scale"),
+        ("q_out", "k_out", "v_out", "nkcs", "nvcs", "r_out"),
         _SWA_QKV_CONV_CLIP_SRC,
     )
-    qo, ko, vo, nkcs, nvcs = k_fn(
-        inputs=[q, k, v, q_scale, k_cw, v_cw, kcs_in, vcs_in, params],
+    qo, ko, vo, nkcs, nvcs, ro = k_fn(
+        inputs=[q, k, v, q_scale, k_cw, v_cw, kcs_in, vcs_in, params, r_in, rs_in],
         template=[
             ("HQ", num_heads), ("HKV", num_kv_heads), ("LL", L),
-            ("TT", tt), ("HAS_KCS", has_kcs), ("HAS_VCS", has_vcs),
+            ("TT", tt), ("HAS_KCS", has_kcs), ("HAS_VCS", has_vcs), ("HAS_REL", has_rel),
         ],
         grid=(ntg_x * 256, B * ntiles, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(B, L, num_heads, 128), (B, L, num_kv_heads, 128), (B, L, num_kv_heads, 128), (B, 3, Dkv), (B, 3, Dkv)],
-        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
+        output_shapes=[
+            (B, L, num_heads, 128), (B, L, num_kv_heads, 128), (B, L, num_kv_heads, 128),
+            (B, 3, Dkv), (B, 3, Dkv), (B, L, num_heads, 16) if has_rel else (1,),
+        ],
+        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.float32, mx.float32, mx.bfloat16],
     )
+    if has_rel:
+        return qo.transpose(0, 2, 1, 3), ko.transpose(0, 2, 1, 3), vo.transpose(0, 2, 1, 3), nkcs, nvcs, ro
     return qo.transpose(0, 2, 1, 3), ko.transpose(0, 2, 1, 3), vo.transpose(0, 2, 1, 3), nkcs, nvcs
 
 
@@ -1383,6 +1589,137 @@ _RMS_F32_BF16_QKV_SRC = r"""
 """
 
 
+_DEPTH_ATTN_RMS_SRC = r"""
+    constexpr int N = K + 1;
+    uint row = threadgroup_position_in_grid.x;
+    uint rows = threadgroups_per_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint lane = lid & 31;
+    uint sg = lid >> 5;
+    uint c = lid * 4;
+    threadgroup float buf[N][32];
+    threadgroup float nr_s[D];
+    if (PRE_UNW_RMS) {
+        GL_NOFMA
+        bfloat4 hv = as_type<bfloat4>(((const device uint2*)(h + (size_t)row * D + c))[0]);
+        float h0 = float(hv.x), h1 = float(hv.y), h2 = float(hv.z), h3 = float(hv.w);
+        float racc = 0.0f;
+        racc = fma(h0, h0, racc); racc = fma(h1, h1, racc);
+        racc = fma(h2, h2, racc); racc = fma(h3, h3, racc);
+        racc = simd_sum(racc);
+        if (lane == 0) buf[0][sg] = racc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv0 = metal::precise::rsqrt(simd_sum(lane < 18u ? buf[0][lane] : 0.0f) / float(D) + 1e-6f);
+        float4 p(h0 * inv0, h1 * inv0, h2 * inv0, h3 * inv0);
+        ((threadgroup float4*)(nr_s + c))[0] = p;
+        if (OUT_NR) ((device float4*)(nr_out + (size_t)row * D + c))[0] = p;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float xc[8][N];
+    if (lid < 288) {
+        float acc[N];
+        for (int i = 0; i < N; i++) acc[i] = 0.0f;
+        int it_idx = 0;
+        for (int d = lid; d < D; d += 288, it_idx++) {
+            for (int i = 0; i < K; i++) xc[it_idx][i] = blocks[(size_t(i) * rows + row) * D + d];
+            xc[it_idx][K] = PRE_UNW_RMS ? nr_s[d] : part_in[size_t(row) * D + d];
+            float qv = queries[d];
+            for (int i = 0; i < N; i++) acc[i] = fma(xc[it_idx][i], qv, acc[i]);
+        }
+        for (int i = 0; i < N; i++) {
+            float v = simd_sum(acc[i]);
+            if (lane == 0) buf[i][sg] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 288) {
+        float w[N];
+        for (int i = 0; i < N; i++) {
+            float t = 0.0f;
+            for (int s = 0; s < 9; s++) t += buf[i][s];
+            w[i] = t * scale[0];
+        }
+        float m = -INFINITY;
+        for (int i = 0; i < N; i++) m = max(m, w[i]);
+        float z = 0.0f;
+        for (int i = 0; i < N; i++) { w[i] = metal::exp(w[i] - m); z += w[i]; }
+        for (int i = 0; i < N; i++) w[i] /= z;
+        int it_idx = 0;
+        for (int d = lid; d < D; d += 288, it_idx++) {
+            float o = 0.0f;
+            for (int i = 0; i < N; i++) o = fma(w[i], xc[it_idx][i], o);
+            nr_s[d] = o;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        GL_NOFMA
+        float4 xv = ((threadgroup float4*)(nr_s + c))[0];
+        float acc2 = 0.0f;
+        acc2 = fma(xv.x, xv.x, acc2); acc2 = fma(xv.y, xv.y, acc2);
+        acc2 = fma(xv.z, xv.z, acc2); acc2 = fma(xv.w, xv.w, acc2);
+        acc2 = simd_sum(acc2);
+        if (lane == 0) buf[0][sg] = acc2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv2 = metal::precise::rsqrt(simd_sum(lane < 18u ? buf[0][lane] : 0.0f) / float(D) + eps[0]);
+        bfloat4 wv = as_type<bfloat4>(((const device uint2*)(nw + c))[0]);
+        bfloat4 ov = bfloat4(
+            bfloat16_t(glue_rms_apply<float>(xv.x, inv2, wv.x)),
+            bfloat16_t(glue_rms_apply<float>(xv.y, inv2, wv.y)),
+            bfloat16_t(glue_rms_apply<float>(xv.z, inv2, wv.z)),
+            bfloat16_t(glue_rms_apply<float>(xv.w, inv2, wv.w)));
+        ((device uint2*)(out + (size_t)row * D + c))[0] = as_type<uint2>(ov);
+    }
+"""
+
+
+def unw_rms_depth_attn_rms_bf16(h: mx.array, blocks: mx.array, query: mx.array, ln, *, need_nr: bool):
+    """Fused unweighted_rms_norm(h.f32) + attention_input(blocks, nr) + rms_norm_f32_bf16."""
+    B, L, D = h.shape
+    assert D == _D
+    sc = _PARAMS_CACHE.get(("da_sc", D))
+    if sc is None:
+        sc = _PARAMS_CACHE[("da_sc", D)] = mx.array([D ** -0.5], dtype=mx.float32)
+    k = _k(
+        "pf_urms_da_rms",
+        ("h", "part_in", "blocks", "queries", "scale", "nw", "eps"),
+        ("out", "nr_out"),
+        _DEPTH_ATTN_RMS_SRC,
+    )
+    out, nr_out = k(
+        inputs=[h, _DUMMY_F32, blocks, query.reshape(-1), sc, ln.weight, _get_eps(ln.eps)],
+        template=[("K", blocks.shape[0]), ("D", D), ("PRE_UNW_RMS", 1), ("OUT_NR", int(need_nr))],
+        grid=(B * L * _TG_RMS, 1, 1),
+        threadgroup=(_TG_RMS, 1, 1),
+        output_shapes=[(B, L, D), (B, L, D) if need_nr else (1,)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+    return out, (nr_out if need_nr else None)
+
+
+def depth_attn_rms_bf16(blocks: mx.array, partial: mx.array, query: mx.array, ln) -> mx.array:
+    """Fused mlp_input(blocks, partial) + rms_norm_f32_bf16 -> (B, L, D) bf16."""
+    B, L, D = partial.shape
+    assert D == _D
+    sc = _PARAMS_CACHE.get(("da_sc", D))
+    if sc is None:
+        sc = _PARAMS_CACHE[("da_sc", D)] = mx.array([D ** -0.5], dtype=mx.float32)
+    k = _k(
+        "pf_urms_da_rms",
+        ("h", "part_in", "blocks", "queries", "scale", "nw", "eps"),
+        ("out", "nr_out"),
+        _DEPTH_ATTN_RMS_SRC,
+    )
+    return k(
+        inputs=[_DUMMY_BF16, partial, blocks, query.reshape(-1), sc, ln.weight, _get_eps(ln.eps)],
+        template=[("K", blocks.shape[0]), ("D", D), ("PRE_UNW_RMS", 0), ("OUT_NR", 0)],
+        grid=(B * L * _TG_RMS, 1, 1),
+        threadgroup=(_TG_RMS, 1, 1),
+        output_shapes=[(B, L, D), (1,)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )[0]
+
+
 def rms_norm_f32_bf16(x: mx.array, ln) -> mx.array:
     """1-pass exact f32 -> bf16 nn.RMSNorm for D=2304 (avoids f32 DRAM write + cast)."""
     B, L, D = x.shape
@@ -1406,6 +1743,60 @@ def rms_norm_f32_bf16_qkv(ai: mx.array, lns) -> tuple[mx.array, mx.array, mx.arr
     return k(
         inputs=[ai, lns[0].weight, lns[1].weight, lns[2].weight, _get_eps(lns[0].eps)],
         template=[("DD", D)],
+        grid=(B * L * _TG_RMS, 3, 1),
+        threadgroup=(_TG_RMS, 1, 1),
+        output_shapes=[(B, L, D), (B, L, D), (B, L, D)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16],
+    )
+
+
+_RMS_F32_BF16_QKV_SEP_SRC = r"""
+    GL_NOFMA
+    uint row = threadgroup_position_in_grid.x;
+    uint g = threadgroup_position_in_grid.y;
+    uint lid = thread_position_in_threadgroup.x;
+    uint lane = lid & 31;
+    uint sg = lid >> 5;
+    uint c = lid * 4;
+    threadgroup float part[32];
+    size_t xoff = (size_t)row * DD + c;
+    const device float* xp = (g == 0 ? x0 : (g == 1 ? x1 : x2)) + xoff;
+    float4 xv = ((const device float4*)xp)[0];
+    float racc = 0.0f;
+    racc = fma(xv.x, xv.x, racc);
+    racc = fma(xv.y, xv.y, racc);
+    racc = fma(xv.z, xv.z, racc);
+    racc = fma(xv.w, xv.w, racc);
+    racc = simd_sum(racc);
+    if (lane == 0) part[sg] = racc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = simd_sum(lane < 18u ? part[lane] : 0.0f);
+    float inv = metal::precise::rsqrt(tot / float(DD) + eps[0]);
+    const device bfloat16_t* nwp = SHARED_LN ? nw0 : (g == 0 ? nw0 : (g == 1 ? nw1 : nw2));
+    bfloat4 wv = as_type<bfloat4>(((const device uint2*)(nwp + c))[0]);
+    bfloat4 ov = bfloat4(
+        bfloat16_t(glue_rms_apply<float>(xv.x, inv, wv.x)),
+        bfloat16_t(glue_rms_apply<float>(xv.y, inv, wv.y)),
+        bfloat16_t(glue_rms_apply<float>(xv.z, inv, wv.z)),
+        bfloat16_t(glue_rms_apply<float>(xv.w, inv, wv.w)));
+    device bfloat16_t* dst = (g == 0 ? o0 : (g == 1 ? o1 : o2)) + xoff;
+    ((device uint2*)dst)[0] = as_type<uint2>(ov);
+"""
+
+
+def rms_norm_f32_bf16_qkv_sep(x0: mx.array, x1: mx.array, x2: mx.array, lns, *, shared_ln: bool):
+    """1-launch batched f32 -> bf16 RMSNorm over 3 separate (B, L, D) arrays."""
+    B, L, D = x0.shape
+    assert D == _D
+    k = _k(
+        "pf_rms_f32_bf16_qkv_sep",
+        ("x0", "x1", "x2", "nw0", "nw1", "nw2", "eps"),
+        ("o0", "o1", "o2"),
+        _RMS_F32_BF16_QKV_SEP_SRC,
+    )
+    return k(
+        inputs=[x0, x1, x2, lns[0].weight, lns[1].weight, lns[2].weight, _get_eps(lns[0].eps)],
+        template=[("DD", D), ("SHARED_LN", int(shared_ln))],
         grid=(B * L * _TG_RMS, 3, 1),
         threadgroup=(_TG_RMS, 1, 1),
         output_shapes=[(B, L, D), (B, L, D), (B, L, D)],
@@ -2133,6 +2524,228 @@ def _gate_logits(gate_mod, x_bf16):
     return gate_mod.forget_gate_proj(st), gate_mod.message_gate_proj(st)
 
 
+_MGIN_DOWN_QKV_SRC = r"""
+    GL_NOFMA
+    const uint g = threadgroup_position_in_grid.y;
+    const device bfloat16_t* w = (g == 0 ? w0 : (g == 1 ? w1 : w2));
+    device float* out_p = (g == 0 ? o0 : (g == 1 ? o1 : o2));
+    auto h_row = [&](uint mr) { return (SHARED_H ? size_t(mr) : size_t(mr) * 3 + g) * DD; };
+    auto msg_row = [&](uint mr) { return (size_t(mr) * 4 + g) * DD; };
+    constexpr int BM = 32, BN = 64, BK = 32, LDX = 40, TG = 128, TM = 2, TN = 4;
+    const uint tgm = threadgroup_position_in_grid.x;
+    const uint m0 = tgm * BM;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg_m = (sg / 2) * 16, sg_n = (sg % 2) * 32;
+    const ushort fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
+    const ushort fn = ((lane >> 2) & 2) * 2 | ((lane & 1) * 2);
+
+    threadgroup float invh_s[BM], invm_s[BM];
+    for (uint r = sg; r < BM; r += 4) {
+        uint mr = m0 + r;
+        if (mr < uint(NN)) {
+            size_t hb = h_row(mr);
+            size_t mb = msg_row(mr);
+            float bh = 0.0f, bm_ = 0.0f;
+            for (uint s = 0; s < 18; ++s) {
+                uint c = (s * 32 + lane) * 4;
+                float4 hv = ((const device float4*)(h + hb + c))[0];
+                float4 mv = ((const device float4*)(msg + mb + c))[0];
+                float sh = 0.0f, sm = 0.0f;
+                sh = fma(hv.x, hv.x, sh); sh = fma(hv.y, hv.y, sh); sh = fma(hv.z, hv.z, sh); sh = fma(hv.w, hv.w, sh);
+                sm = fma(mv.x, mv.x, sm); sm = fma(mv.y, mv.y, sm); sm = fma(mv.z, mv.z, sm); sm = fma(mv.w, mv.w, sm);
+                sh = simd_sum(sh); sm = simd_sum(sm);
+                if (lane == s) { bh = sh; bm_ = sm; }
+            }
+            float ah = simd_sum(bh), am = simd_sum(bm_);
+            if (lane == 0) {
+                invh_s[r] = metal::precise::rsqrt(ah / float(DD) + 1e-6f);
+                invm_s[r] = metal::precise::rsqrt(am / float(DD) + 1e-6f);
+            }
+        } else if (lane == 0) {
+            invh_s[r] = 0.0f; invm_s[r] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup bfloat16_t Xs[BM * LDX];
+    threadgroup bfloat16_t Ws[BN * LDX];
+
+    const uint x_mr = tid / 4, x_mk = (tid % 4) * 8;
+    const bool x_ok = (m0 + x_mr) < uint(NN);
+    const float my_invh = invh_s[x_mr], my_invm = invm_s[x_mr];
+    const device float* hx_ptr = h + h_row(m0 + x_mr) + x_mk;
+    const device float* mx_ptr = msg + msg_row(m0 + x_mr) + x_mk;
+
+    const uint w_nr = tid / 2, w_koff = (tid % 2) * 16;
+    const device bfloat16_t* w_ptr = w + (size_t)w_nr * (2 * DD) + w_koff;
+
+    simdgroup_float8x8 Ctot[TM][TN];
+    for (int tm = 0; tm < TM; ++tm)
+        for (int tn = 0; tn < TN; ++tn)
+            Ctot[tm][tn] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const int part_k = (2 * DD) / SPK;
+    threadgroup uint2* xd2 = (threadgroup uint2*)(Xs + x_mr * LDX + x_mk);
+    threadgroup uint4* wd4 = (threadgroup uint4*)(Ws + w_nr * LDX + w_koff);
+    const threadgroup bfloat16_t* as_base = Xs + (sg_m + fm) * LDX + fn;
+    const threadgroup bfloat16_t* bs_base = Ws + (sg_n + fn) * LDX + fm;
+
+    for (int p = 0; p < SPK; ++p) {
+        simdgroup_float8x8 C[TM][TN];
+        for (int tm = 0; tm < TM; ++tm)
+            for (int tn = 0; tn < TN; ++tn)
+                C[tm][tn] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        const int k0 = p * part_k, k1 = k0 + part_k;
+        for (int k = k0; k < k1; k += BK) {
+            if (x_ok) {
+                const bool is_h = (k < DD);
+                const device float4* xp4 = (const device float4*)(is_h ? (hx_ptr + k) : (mx_ptr + (k - DD)));
+                const float sc = is_h ? my_invh : my_invm;
+                xd2[0] = as_type<uint2>(bfloat4(xp4[0] * sc));
+                xd2[1] = as_type<uint2>(bfloat4(xp4[1] * sc));
+            } else {
+                xd2[0] = uint2(0); xd2[1] = uint2(0);
+            }
+            const device uint4* wp4 = (const device uint4*)(w_ptr + k);
+            wd4[0] = wp4[0]; wd4[1] = wp4[1];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (int ks = 0; ks < BK; ks += 8) {
+                simdgroup_bfloat8x8 A[TM], B[TN];
+                simdgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < TM; ++tm) {
+                    const bfloat2 av = *((const threadgroup bfloat2*)(as_base + (tm * 8) * LDX + ks));
+                    A[tm].thread_elements()[0] = av.x; A[tm].thread_elements()[1] = av.y;
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int tn = 0; tn < TN; ++tn) {
+                    const threadgroup bfloat16_t* bp = bs_base + (tn * 8) * LDX + ks;
+                    B[tn].thread_elements()[0] = bp[0]; B[tn].thread_elements()[1] = bp[LDX];
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < TM; ++tm)
+                    for (int tn = 0; tn < TN; ++tn)
+                        simdgroup_multiply_accumulate(C[tm][tn], A[tm], B[tn], C[tm][tn]);
+            }
+            if (p + 1 < SPK || k + BK < k1) threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (int tm = 0; tm < TM; ++tm)
+            for (int tn = 0; tn < TN; ++tn) {
+                Ctot[tm][tn].thread_elements()[0] += C[tm][tn].thread_elements()[0];
+                Ctot[tm][tn].thread_elements()[1] += C[tm][tn].thread_elements()[1];
+            }
+    }
+
+    for (int tm = 0; tm < TM; ++tm) {
+        const uint mr_o = m0 + sg_m + uint(tm) * 8u + fm;
+        if (mr_o < uint(NN)) {
+            device float* dst = out_p + (size_t)mr_o * 64;
+            for (int tn = 0; tn < TN; ++tn) {
+                const uint nc_o = sg_n + uint(tn) * 8u + fn;
+                dst[nc_o] = float(bfloat16_t(Ctot[tm][tn].thread_elements()[0]));
+                dst[nc_o + 1] = float(bfloat16_t(Ctot[tm][tn].thread_elements()[1]));
+            }
+        }
+    }
+"""
+
+
+def _fg_mix_src(is_qkv: bool) -> str:
+    if is_qkv:
+        setup = (
+            "    const uint c0 = (threadgroup_position_in_grid.x % (DD / 64)) * 64;\n"
+            "    const uint g = threadgroup_position_in_grid.x / (DD / 64);\n"
+            "    const device float* stp = (g == 0 ? st0 : (g == 1 ? st1 : st2));\n"
+            "    const device float* wfp_base = (g == 0 ? wf0 : (g == 1 ? wf1 : wf2));\n"
+            "    const device float* wmp_base = (g == 0 ? wm0 : (g == 1 ? wm1 : wm2));\n"
+            "    device float* out_p = (g == 0 ? o0 : (g == 1 ? o1 : o2));\n"
+            "    auto hoff_fn = [&](uint mr) { return (SHARED_H ? size_t(mr) : (size_t(mr) * 3 + g)) * DD; };\n"
+            "    auto moff_fn = [&](uint mr) { return (size_t(mr) * 4 + g) * DD; };\n"
+        )
+    else:
+        setup = (
+            "    const uint c0 = threadgroup_position_in_grid.x * 64;\n"
+            "    const device float* stp = st;\n"
+            "    const device float* wfp_base = wf;\n"
+            "    const device float* wmp_base = wm;\n"
+            "    device float* out_p = mixed;\n"
+            "    auto hoff_fn = [&](uint mr) { return size_t(mr) * DD; };\n"
+            "    auto moff_fn = [&](uint mr) { return (size_t(mr) * 4 + SLOT) * DD; };\n"
+        )
+    return (
+        "    GL_NOFMA\n"
+        "    constexpr int BM = 32, TM = 4;\n"
+        "    const uint m0 = threadgroup_position_in_grid.y * BM;\n"
+        + setup
+        + r"""
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const short fm = ((lane / 4) & 4) + (lane / 2) % 4;
+    const short fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const uint col = c0 + sg * 8 + fn;
+
+    threadgroup float Ss[BM * 72];
+    const uint tid = thread_position_in_threadgroup.x;
+    for (uint i = tid; i < BM * 32; i += 256) {
+        uint r = i >> 5;
+        uint k2 = (i & 31) * 2;
+        uint rr = min(m0 + r, uint(NN - 1));
+        ((threadgroup float2*)(Ss + r * 72 + k2))[0] = ((const device float2*)(stp + (size_t)rr * 64 + k2))[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 cf[TM], cm[TM];
+    #pragma clang loop unroll(full)
+    for (int tm = 0; tm < TM; ++tm) {
+        cf[tm] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        cm[tm] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const device float* wfp0 = wfp_base + (size_t)col * 64;
+    const device float* wfp1 = wfp_base + (size_t)(col + 1) * 64;
+    const device float* wmp0 = wmp_base + (size_t)col * 64;
+    const device float* wmp1 = wmp_base + (size_t)(col + 1) * 64;
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 64; k += 8) {
+        simdgroup_float8x8 Bf, Bm;
+        Bf.thread_elements()[0] = wfp0[k + fm]; Bf.thread_elements()[1] = wfp1[k + fm];
+        Bm.thread_elements()[0] = wmp0[k + fm]; Bm.thread_elements()[1] = wmp1[k + fm];
+        #pragma clang loop unroll(full)
+        for (int tm = 0; tm < TM; ++tm) {
+            simdgroup_float8x8 A;
+            const float2 av = *((const threadgroup float2*)(Ss + (tm * 8 + fm) * 72 + k + fn));
+            A.thread_elements()[0] = av.x; A.thread_elements()[1] = av.y;
+            simdgroup_multiply_accumulate(cf[tm], A, Bf, cf[tm]);
+            simdgroup_multiply_accumulate(cm[tm], A, Bm, cm[tm]);
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int tm = 0; tm < TM; ++tm) {
+        const uint mr = m0 + uint(tm) * 8u + fm;
+        if (mr < uint(NN)) {
+            size_t off = (size_t)mr * DD + col;
+            size_t hoff = hoff_fn(mr) + col;
+            size_t moff = moff_fn(mr) + col;
+            float2 hv = ((const device float2*)(h + hoff))[0];
+            float2 mv = ((const device float2*)(msg + moff))[0];
+            float v0 = glue_msg_combine<0>(cf[tm].thread_elements()[0], cm[tm].thread_elements()[0], hv.x, mv.x);
+            float v1 = glue_msg_combine<0>(cf[tm].thread_elements()[1], cm[tm].thread_elements()[1], hv.y, mv.y);
+            ((device float2*)(out_p + off))[0] = float2(v0, v1);
+        }
+    }
+"""
+    )
+
+
+_FG_MIX_SINGLE_SRC = _fg_mix_src(False)
+_FG_MIX_QKV_SRC = _fg_mix_src(True)
+
+
 def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) -> mx.array:
     """Single MessageGate + downstream RMSNorm -> (B, L, D) bf16."""
     B, L, D = h.shape
@@ -2166,6 +2779,18 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
         output_shapes=[(B, L, 2 * D)],
         output_dtypes=[mx.bfloat16],
     )[0]
+    if _PF_FG_MIX and N >= 256:
+        st = gate_mod.down_proj(g_in).astype(mx.float32)
+        k_fg = _k_mma("pf_fg_mix_s", ("st", "wf", "wm", "h", "msg"), ("mixed",), _FG_MIX_SINGLE_SRC)
+        mixed = k_fg(
+            inputs=[st, gate_mod.forget_gate_proj.weight, gate_mod.message_gate_proj.weight, h, msg],
+            template=[("DD", D), ("NN", N), ("SLOT", slot)],
+            grid=((D // 64) * 256, (N + 31) // 32, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(B, L, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+        return rms_norm_f32_bf16(mixed, ln)
     fl, ml = _gate_logits(gate_mod, g_in)
     k_mn = _k("pf_mn_s", ("fl", "ml", "h", "msg", "nw", "eps"), ("out",), _MIXNORM_SINGLE_SRC)
     return k_mn(
@@ -2207,6 +2832,60 @@ def msg_gate_norm_qkv(gates, h_or_ai: mx.array, msg: mx.array, lns, *, shared_h:
             output_dtypes=[mx.bfloat16, mx.bfloat16, mx.bfloat16, mx.float32],
         )
         return (o0, o1, o2)
+    if _PF_FG_MIX and N >= 256:
+        spk = (
+            _MGIN_DOWN_SPK.get(N)
+            if (_PF_MGIN_DOWN and all(g.down_proj.weight.shape == (64, 2 * D) for g in gates))
+            else None
+        )
+        if spk is not None:
+            k_md = _k_mma(
+                "pf_mgin_down_qkv",
+                ("h", "msg", "w0", "w1", "w2"),
+                ("o0", "o1", "o2"),
+                _MGIN_DOWN_QKV_SRC,
+            )
+            st0, st1, st2 = k_md(
+                inputs=[h_or_ai, msg, gates[0].down_proj.weight, gates[1].down_proj.weight, gates[2].down_proj.weight],
+                template=[("DD", D), ("NN", N), ("SPK", spk), ("SHARED_H", int(shared_h))],
+                grid=(128 * ((N + 31) // 32), 3, 1),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(B, L, 64)] * 3,
+                output_dtypes=[mx.float32] * 3,
+            )
+        else:
+            k_in = _k("pf_mgin_qkv", ("h", "msg"), ("o0", "o1", "o2"), _MGIN_QKV_SRC)
+            in0, in1, in2 = k_in(
+                inputs=[h_or_ai, msg],
+                template=[("DD", D), ("TG", _TG_RMS), ("SHARED_H", int(shared_h))],
+                grid=(N * _TG_RMS, 3, 1),
+                threadgroup=(_TG_RMS, 1, 1),
+                output_shapes=[(B, L, 2 * D)] * 3,
+                output_dtypes=[mx.bfloat16] * 3,
+            )
+            st0 = gates[0].down_proj(in0).astype(mx.float32)
+            st1 = gates[1].down_proj(in1).astype(mx.float32)
+            st2 = gates[2].down_proj(in2).astype(mx.float32)
+        k_fg = _k_mma(
+            "pf_fg_mix_qkv",
+            ("st0", "st1", "st2", "wf0", "wf1", "wf2", "wm0", "wm1", "wm2", "h", "msg"),
+            ("o0", "o1", "o2"),
+            _FG_MIX_QKV_SRC,
+        )
+        mx0, mx1, mx2 = k_fg(
+            inputs=[
+                st0, st1, st2,
+                gates[0].forget_gate_proj.weight, gates[1].forget_gate_proj.weight, gates[2].forget_gate_proj.weight,
+                gates[0].message_gate_proj.weight, gates[1].message_gate_proj.weight, gates[2].message_gate_proj.weight,
+                h_or_ai, msg,
+            ],
+            template=[("DD", D), ("NN", N), ("SHARED_H", int(shared_h))],
+            grid=(3 * (D // 64) * 256, (N + 31) // 32, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(B, L, D)] * 3,
+            output_dtypes=[mx.float32] * 3,
+        )
+        return rms_norm_f32_bf16_qkv_sep(mx0, mx1, mx2, lns, shared_ln=shared_ln)
     k_in = _k("pf_mgin_qkv", ("h", "msg"), ("o0", "o1", "o2"), _MGIN_QKV_SRC)
     in0, in1, in2 = k_in(
         inputs=[h_or_ai, msg],

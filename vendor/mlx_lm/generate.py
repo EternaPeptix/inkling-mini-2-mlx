@@ -387,6 +387,7 @@ def generate_step(
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    thinking_tracker: Optional[Any] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -434,6 +435,13 @@ def generate_step(
         )
 
     tokens = None
+    _cd_cfg = getattr(model, "loopcd", None)
+    _track_thinking = thinking_tracker is not None and bool(getattr(_cd_cfg, "exclude_thinking", False))
+    _prompt_ids = (
+        [int(t) for t in prompt.tolist()]
+        if (_track_thinking and input_embeddings is None and len(prompt) > 0)
+        else []
+    )
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -541,24 +549,49 @@ def generate_step(
             )
             mx.clear_cache()
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
-        mx.async_eval(y, logprobs)
+        if _track_thinking:
+            from .models.inkling2 import loopcd as _loopcd
 
-        n = 0
-        while True:
-            if n != max_tokens:
-                next_y, next_logprobs = _step(y)
-                mx.async_eval(next_y, next_logprobs)
-            if n == 0:
-                mx.eval(y)
-                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-            if n == max_tokens:
-                break
-            yield y.item(), logprobs
-            if n % 256 == 0:
-                mx.clear_cache()
-            y, logprobs = next_y, next_logprobs
-            n += 1
+            thinking_tracker.reset(_prompt_ids)
+            _loopcd.set_cache_skip(prompt_cache, thinking_tracker.in_thinking)
+
+        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        if _track_thinking:
+            n = 0
+            while True:
+                mx.eval(y, logprobs)
+                if n == 0:
+                    prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+                if n == max_tokens:
+                    break
+                tok_id = y.item()
+                thinking_tracker.update(tok_id)
+                _loopcd.set_cache_skip(prompt_cache, thinking_tracker.in_thinking)
+                yield tok_id, logprobs
+                if n % 256 == 0:
+                    mx.clear_cache()
+                if n + 1 == max_tokens:
+                    break
+                y, logprobs = _step(y)
+                n += 1
+        else:
+            mx.async_eval(y, logprobs)
+
+            n = 0
+            while True:
+                if n != max_tokens:
+                    next_y, next_logprobs = _step(y)
+                    mx.async_eval(next_y, next_logprobs)
+                if n == 0:
+                    mx.eval(y)
+                    prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+                if n == max_tokens:
+                    break
+                yield y.item(), logprobs
+                if n % 256 == 0:
+                    mx.clear_cache()
+                y, logprobs = next_y, next_logprobs
+                n += 1
 
 
 def speculative_generate_step(
@@ -822,6 +855,12 @@ def stream_generate(
     elif draft_model is None:
         for _k in ("num_draft_tokens", "full_prompt", "checkpoint_callback", "segment_ends", "cache_state"):
             kwargs.pop(_k, None)
+        if kwargs.get("thinking_tracker") is None and getattr(getattr(model, "loopcd", None), "exclude_thinking", False):
+            from mlx_lm.models.inkling2.loopcd import ThinkingTracker
+
+            _tt = ThinkingTracker.from_tokenizer(tokenizer)
+            if _tt is not None:
+                kwargs["thinking_tracker"] = _tt
         token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (

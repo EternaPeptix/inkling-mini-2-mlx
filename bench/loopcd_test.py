@@ -419,10 +419,183 @@ def test_p1_noop(p1_dir):
         check(f"p1 graceful no-op [{kw['mode']}]", d == 0.0 and t == t0 and tb == t0)
 
 
+def test_exclude_thinking(p3_dir):
+    # 1. ThinkingTracker single- and multi-token delimiters + env flag
+    t1 = loopcd.ThinkingTracker((10,), (11,))
+    check("tracker starts outside thinking", not t1.in_thinking)
+    t1.update(1)
+    check("tracker ignores normal tok", not t1.in_thinking)
+    t1.update(10)
+    check("tracker enters on start tok", t1.in_thinking)
+    t1.update(42)
+    check("tracker stays inside", t1.in_thinking)
+    t1.update(11)
+    check("tracker exits on end tok", not t1.in_thinking)
+    t1.reset([5, 10, 6])
+    check("tracker prompt with unclosed think -> True", t1.in_thinking)
+    t1.reset([5, 10, 6, 11, 7])
+    check("tracker prompt with closed think -> False", not t1.in_thinking)
+
+    t2 = loopcd.ThinkingTracker((100, 101), (200, 201))
+    check("multi-tok step1 False", not t2.update(100))
+    check("multi-tok step2 True", t2.update(101))
+    check("multi-tok half-end True", t2.update(200))
+    check("multi-tok broken end True", t2.update(99))
+    check("multi-tok exit 200", t2.update(200))
+    check("multi-tok exit 201 False", not t2.update(201))
+
+    class _DummyTok:
+        has_thinking = True
+        think_start_tokens = (300,)
+        think_end_tokens = (301,)
+
+    check("from_tokenizer has_thinking", loopcd.ThinkingTracker.from_tokenizer(_DummyTok()) is not None)
+
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("LOOPLING_LOOPCD")}
+    try:
+        os.environ["LOOPLING_LOOPCD"] = "logits:0.4"
+        os.environ["LOOPLING_LOOPCD_EXCLUDE_THINKING"] = "1"
+        cfg_e = loopcd.from_env()
+        check("from_env exclude_thinking=1", cfg_e.exclude_thinking is True and cfg_e.mode == "logits")
+    finally:
+        for k in list(os.environ):
+            if k.startswith("LOOPLING_LOOPCD"):
+                del os.environ[k]
+        os.environ.update(saved)
+
+    # Mixed skip_mask unit parity on apply_hidden and combine_logits
+    rng = np.random.default_rng(7)
+    hf = mx.array(rng.standard_normal((2, 1, 16)).astype(np.float32)).astype(mx.bfloat16)
+    hr = mx.array(rng.standard_normal((2, 1, 16)).astype(np.float32)).astype(mx.bfloat16)
+    bsf = [mx.array(rng.standard_normal((2, 16)).astype(np.float32)) for _ in range(3)]
+    bsr = [mx.array(rng.standard_normal((2, 16)).astype(np.float32)) for _ in range(3)]
+    cfg_h = loopcd.LoopCDConfig(mode="hidden", omega=0.6, blend_bs=True, exclude_thinking=True)
+    sm = mx.array([True, False], dtype=mx.bool_)
+    ho_m, bso_m = loopcd.apply_hidden(hf, bsf, hr, bsr, 1, cfg_h, skip_mask=sm)
+    ho_n, bso_n = loopcd.apply_hidden(hf, bsf, hr, bsr, 1, cfg_h, skip_mask=None)
+    mx.eval(ho_m, ho_n, *bso_m, *bso_n)
+    check(
+        "apply_hidden mixed skip_mask",
+        float(mx.max(mx.abs(ho_m[0] - hf[0])).item()) == 0.0
+        and float(mx.max(mx.abs(ho_m[1] - ho_n[1])).item()) == 0.0
+        and float(mx.max(mx.abs(bso_m[2][0] - bsf[2][0])).item()) == 0.0
+        and float(mx.max(mx.abs(bso_m[2][1] - bso_n[2][1])).item()) == 0.0,
+    )
+    zf = mx.array(rng.standard_normal((2, 32)).astype(np.float32))
+    zr = mx.array(rng.standard_normal((2, 32)).astype(np.float32))
+    cfg_l = loopcd.LoopCDConfig(mode="logits", omega=0.4, exclude_thinking=True)
+    zm = loopcd.combine_logits(zf, zr, cfg_l, skip_mask=sm)
+    zn = loopcd.combine_logits(zf, zr, cfg_l, skip_mask=None)
+    mx.eval(zm, zn)
+    check(
+        "combine_logits mixed skip_mask",
+        float(mx.max(mx.abs(zm[0] - zf[0])).item()) == 0.0
+        and float(mx.max(mx.abs(zm[1] - zn[1])).item()) == 0.0,
+    )
+
+    # 2. Model tests on loopling-p3 (hidden + logits modes + generate_step + BatchDecoder C=2)
+    model, tok = load(p3_dir)
+    mx.eval(model.parameters())
+    prompts = [
+        "Solve step by step: what is 17 * 24 + 19?",
+        "Name three properties of prime numbers.",
+    ]
+    ids_list = [
+        tok.encode(
+            tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=False)
+            + "<|message_model|><|content_text|>",
+            add_special_tokens=False,
+        )
+        for p in prompts
+    ]
+    prompt0 = mx.array(ids_list[0])
+    model.set_loopcd("off")
+    off_steps = [(int(t), lp) for t, lp in generate_step(prompt0, model, max_tokens=6, sampler=GREEDY)]
+    mx.eval([lp for _, lp in off_steps])
+    off_toks = [t for t, _ in off_steps]
+    # Trigger thinking on the last prompt token and end it on generated token #2 -> steps 0,1,2 skip; steps 3,4,5 active!
+    tr_start = (ids_list[0][-1],)
+    tr_end = (off_toks[2],)
+
+    for mode, kw in (
+        ("hidden", dict(mode="hidden", omega=0.6, blend_bs=True, exclude_thinking=True)),
+        ("logits", dict(mode="logits", omega=0.4, exclude_thinking=True)),
+    ):
+        model.set_loopcd(**kw)
+        tr = loopcd.ThinkingTracker(tr_start, tr_end)
+        if mode == "hidden":
+            c_pre = prefill_cache(model, ids_list[0])
+            c_off = copy.deepcopy(c_pre)
+            c_ex = copy.deepcopy(c_pre)
+            model.set_loopcd("off")
+            base_steps = [(int(t), lp) for t, lp in generate_step(prompt0[-1:], model, prompt_cache=c_off, max_tokens=6, sampler=GREEDY)]
+            mx.eval([lp for _, lp in base_steps])
+            model.set_loopcd(**kw)
+            got = [(int(t), lp) for t, lp in generate_step(prompt0[-1:], model, prompt_cache=c_ex, max_tokens=6, sampler=GREEDY, thinking_tracker=tr)]
+            mx.eval([lp for _, lp in got])
+            base_toks = [t for t, _ in base_steps]
+        else:
+            got = [(int(t), lp) for t, lp in generate_step(prompt0, model, max_tokens=6, sampler=GREEDY, thinking_tracker=tr)]
+            mx.eval([lp for _, lp in got])
+            base_steps = off_steps
+            base_toks = off_toks
+
+        max_skip_d = max(float(mx.max(mx.abs(got[i][1] - base_steps[i][1])).item()) for i in range(3))
+        max_act_d = float(mx.max(mx.abs(got[3][1] - base_steps[3][1])).item())
+        extra_ok = True
+        extra_msg = ""
+        if mode == "logits":
+            model.set_loopcd(**{**kw, "exclude_thinking": False})
+            c_sync = prefill_cache(model, ids_list[0])
+            for t in (ids_list[0][-1], got[0][0], got[1][0]):
+                _ = model(mx.array([[t]]), cache=c_sync)
+                mx.eval([c.state for c in c_sync])
+            z_sync = model(mx.array([[got[2][0]]]), cache=c_sync)[0, -1]
+            sync_lp = z_sync - mx.logsumexp(z_sync, keepdims=True)
+            mx.eval(sync_lp)
+            sync_d = float(mx.max(mx.abs(got[3][1] - sync_lp)).item())
+            extra_ok = int(mx.argmax(sync_lp).item()) == got[3][0] and sync_d < 1e-5
+            extra_msg = f" ref_coda_sync_d={sync_d:.2e}"
+        check(
+            f"exclude_thinking generate_step [{mode}] skip=0.0 & active>0",
+            max_skip_d == 0.0 and [t for t, _ in got[:3]] == base_toks[:3] and max_act_d > 0.0 and extra_ok,
+            f"skip_d={max_skip_d:.2e} act_d={max_act_d:.2e}{extra_msg}",
+        )
+
+        # Mixed C=2 BatchDecoder check (seq 0 skips, seq 1 active) with identical prefilled caches
+        model.set_loopcd(**kw)
+        c_a = prefill_cache(model, ids_list[0])
+        c_b = prefill_cache(model, ids_list[1])
+        c_a_ref = copy.deepcopy(c_a)
+        c_b_ref = copy.deepcopy(c_b)
+        loopcd.set_cache_skip(c_a, True)
+        loopcd.set_cache_skip(c_b, False)
+        dec = BD.BatchDecoder(model, [c_a, c_b])
+        y = mx.array([ids_list[0][-1], ids_list[1][-1]])
+        lp_b = dec.logprobs(dec._hidden_pair(y))
+        mx.eval(lp_b)
+
+        model.set_loopcd("off")
+        lp_ref0 = model(mx.array([[ids_list[0][-1]]]), cache=c_a_ref)[0, -1]
+        lp_ref0 = lp_ref0 - mx.logsumexp(lp_ref0, keepdims=True)
+        model.set_loopcd(**{**kw, "exclude_thinking": False})
+        lp_act1 = model(mx.array([[ids_list[1][-1]]]), cache=c_b_ref)[0, -1]
+        lp_act1 = lp_act1 - mx.logsumexp(lp_act1, keepdims=True)
+        mx.eval(lp_ref0, lp_act1)
+        d0 = float(mx.max(mx.abs(lp_b[0] - lp_ref0)).item())
+        d1 = float(mx.max(mx.abs(lp_b[1] - lp_act1)).item())
+        check(f"exclude_thinking BatchDecoder C=2 mixed [{mode}]", d0 < 1e-5 and d1 < 1e-5, f"d0={d0:.2e} d1={d1:.2e}")
+
+    model.set_loopcd("off")
+    del model
+    mx.clear_cache()
+
+
 def main():
     models_root = os.path.expanduser("~/loopling/models")
     test_math_and_config()
     test_p3_omega_zero_and_two_pass_and_batch(os.path.join(models_root, "loopling-p3"))
+    test_exclude_thinking(os.path.join(models_root, "loopling-p3"))
     test_p1_noop(os.path.join(models_root, "loopling-p1"))
     print("ALL LOOPCD TESTS PASS", flush=True)
 

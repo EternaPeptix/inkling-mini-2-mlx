@@ -30,6 +30,7 @@ class LoopCDConfig:
     omega_max: float = 0.5
     ref_pass: int = 0
     blend_bs: bool = False
+    exclude_thinking: bool = False
 
     def __post_init__(self) -> None:
         self.mode = str(self.mode).strip().lower()
@@ -40,6 +41,7 @@ class LoopCDConfig:
         self.omega_max = float(self.omega_max)
         self.ref_pass = int(self.ref_pass)
         self.blend_bs = bool(self.blend_bs)
+        self.exclude_thinking = bool(self.exclude_thinking)
         if self.adaptive and self.mode == "hidden":
             raise ValueError("Adaptive margin-gated strength requires mode='logits', not 'hidden'.")
 
@@ -102,6 +104,7 @@ def from_env() -> LoopCDConfig:
         omega_max = float(os.environ["LOOPLING_LOOPCD_OMEGA_MAX"])
     ref_pass = int(os.environ.get("LOOPLING_LOOPCD_REF", "0"))
     blend_bs = _parse_bool(os.environ.get("LOOPLING_LOOPCD_BLEND_BS", "0"))
+    exclude_thinking = _parse_bool(os.environ.get("LOOPLING_LOOPCD_EXCLUDE_THINKING", "0"))
 
     return LoopCDConfig(
         mode=mode,
@@ -110,7 +113,79 @@ def from_env() -> LoopCDConfig:
         omega_max=omega_max,
         ref_pass=ref_pass,
         blend_bs=blend_bs,
+        exclude_thinking=exclude_thinking,
     )
+
+
+class ThinkingTracker:
+    """Streaming token-ID tracker for <think>...</think> spans across multi-token delimiters."""
+
+    def __init__(
+        self,
+        think_start_tokens: tuple[int, ...] | list[int],
+        think_end_tokens: tuple[int, ...] | list[int],
+    ) -> None:
+        self.think_start_tokens = tuple(int(t) for t in think_start_tokens)
+        self.think_end_tokens = tuple(int(t) for t in think_end_tokens)
+        if not self.think_start_tokens or not self.think_end_tokens:
+            raise ValueError("ThinkingTracker requires non-empty start and end delimiter token tuples.")
+        self._max_len = max(len(self.think_start_tokens), len(self.think_end_tokens))
+        self.in_thinking: bool = False
+        self._buf: list[int] = []
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer: Any) -> "ThinkingTracker | None":
+        if getattr(tokenizer, "has_thinking", False):
+            st = getattr(tokenizer, "think_start_tokens", None)
+            et = getattr(tokenizer, "think_end_tokens", None)
+            if st and et:
+                return cls(st, et)
+        raw = getattr(tokenizer, "_tokenizer", tokenizer)
+        if hasattr(raw, "convert_tokens_to_ids"):
+            unk = getattr(raw, "unk_token_id", None)
+            s_id = raw.convert_tokens_to_ids("<think>")
+            e_id = raw.convert_tokens_to_ids("</think>")
+            if isinstance(s_id, int) and isinstance(e_id, int) and s_id >= 0 and e_id >= 0 and s_id != unk and e_id != unk:
+                return cls((s_id,), (e_id,))
+        return None
+
+    def reset(self, prompt_tokens: Any = None) -> bool:
+        self.in_thinking = False
+        self._buf.clear()
+        if prompt_tokens is not None:
+            seq = prompt_tokens.tolist() if hasattr(prompt_tokens, "tolist") else prompt_tokens
+            for tid in seq:
+                self.update(int(tid))
+        return self.in_thinking
+
+    def update(self, token_id: int) -> bool:
+        self._buf.append(int(token_id))
+        if len(self._buf) > self._max_len:
+            del self._buf[: len(self._buf) - self._max_len]
+        if not self.in_thinking:
+            n = len(self.think_start_tokens)
+            if len(self._buf) >= n and tuple(self._buf[-n:]) == self.think_start_tokens:
+                self.in_thinking = True
+                self._buf.clear()
+        else:
+            n = len(self.think_end_tokens)
+            if len(self._buf) >= n and tuple(self._buf[-n:]) == self.think_end_tokens:
+                self.in_thinking = False
+                self._buf.clear()
+        return self.in_thinking
+
+
+def set_cache_skip(cache: list[Any] | None, skip: bool) -> None:
+    """Set per-cache thinking-skip flag used when cfg.exclude_thinking is enabled."""
+    if cache and cache[-1] is not None:
+        cache[-1]._loopcd_skip = bool(skip)
+
+
+def get_cache_skip(cache: list[Any] | None) -> bool:
+    """Read per-cache thinking-skip flag."""
+    if not cache or cache[-1] is None:
+        return False
+    return bool(getattr(cache[-1], "_loopcd_skip", False))
 
 
 from functools import partial
@@ -128,39 +203,61 @@ def apply_hidden(
     bs_ref: Any,
     pre_n: int,
     cfg: LoopCDConfig,
+    skip_mask: bool | mx.array | None = None,
 ) -> tuple[mx.array, Any]:
     """LoopCD-Hidden (Eq. 2): extrapolate final core hidden state away from ref_pass state."""
-    if cfg.omega == 0.0:
+    if cfg.omega == 0.0 or skip_mask is True:
         return h_final, bs_final
     w = float(cfg.omega)
     h_out = _extrapolate_hidden_bf(h_final, h_ref, mx.array(w, dtype=mx.float32))
+    is_mask = isinstance(skip_mask, mx.array)
+    m = skip_mask.astype(mx.bool_) if is_mask else None
+    if is_mask:
+        h_out = mx.where(m.reshape((-1,) + (1,) * (h_out.ndim - 1)), h_final, h_out)
 
     if cfg.blend_bs and bs_final is not None and bs_ref is not None:
         if isinstance(bs_final, list):
-            bs_out = list(bs_final[:pre_n]) + [r + w * (r - rf) for r, rf in zip(bs_final[pre_n:], bs_ref[pre_n:])]
+            if is_mask:
+                bs_out = list(bs_final[:pre_n]) + [
+                    mx.where(m.reshape((r.shape[0],) + (1,) * (r.ndim - 1)), r, r + w * (r - rf))
+                    for r, rf in zip(bs_final[pre_n:], bs_ref[pre_n:])
+                ]
+            else:
+                bs_out = list(bs_final[:pre_n]) + [r + w * (r - rf) for r, rf in zip(bs_final[pre_n:], bs_ref[pre_n:])]
         else:
             bs_core = bs_final[pre_n:] + w * (bs_final[pre_n:] - bs_ref[pre_n:])
+            if is_mask:
+                bs_core = mx.where(m.reshape((1, bs_final.shape[1]) + (1,) * (bs_final.ndim - 2)), bs_final[pre_n:], bs_core)
             bs_out = mx.concatenate([bs_final[:pre_n], bs_core], axis=0) if pre_n > 0 else bs_core
     else:
         bs_out = bs_final
     return h_out, bs_out
 
 
-def combine_logits(z_final: mx.array, z_ref: mx.array, cfg: LoopCDConfig) -> mx.array:
+def combine_logits(
+    z_final: mx.array,
+    z_ref: mx.array,
+    cfg: LoopCDConfig,
+    skip_mask: bool | mx.array | None = None,
+) -> mx.array:
     """LoopCD-Logits (Eq. 3 fixed, Eq. 4 adaptive margin-gated) on f32 post-softcap logits."""
-    if cfg.is_zero_strength:
+    if cfg.is_zero_strength or skip_mask is True:
         return z_final
     if not cfg.adaptive:
         w = float(cfg.omega)
-        return z_final + w * (z_final - z_ref)
-
-    # Numerically stable top-2 probabilities from log-softmax; abs() handles unsorted topk.
-    lp = z_final - mx.logsumexp(z_final, axis=-1, keepdims=True)
-    top2 = mx.topk(lp, 2, axis=-1)
-    p_top2 = mx.exp(top2)
-    margin = mx.abs(p_top2[..., 0] - p_top2[..., 1])
-    w = float(cfg.omega_max) * (1.0 - margin)
-    return z_final + w[..., None] * (z_final - z_ref)
+        out = z_final + w * (z_final - z_ref)
+    else:
+        # Numerically stable top-2 probabilities from log-softmax; abs() handles unsorted topk.
+        lp = z_final - mx.logsumexp(z_final, axis=-1, keepdims=True)
+        top2 = mx.topk(lp, 2, axis=-1)
+        p_top2 = mx.exp(top2)
+        margin = mx.abs(p_top2[..., 0] - p_top2[..., 1])
+        w = float(cfg.omega_max) * (1.0 - margin)
+        out = z_final + w[..., None] * (z_final - z_ref)
+    if isinstance(skip_mask, mx.array):
+        m = skip_mask.astype(mx.bool_).reshape((-1,) + (1,) * (z_final.ndim - 1))
+        return mx.where(m, z_final, out)
+    return out
 
 
 def _fresh_kv_like(kv: Any, is_sliding: bool, window: int) -> Any:

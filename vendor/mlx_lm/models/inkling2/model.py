@@ -165,8 +165,9 @@ class TextModel(PipelineMixin, nn.Module):
                 )
 
         if use_cd and cfg.mode == "hidden":
+            skip_mask = loopcd.get_cache_skip(cache) if cfg.exclude_thinking else None
             hidden_states, block_states = loopcd.apply_hidden(
-                hidden_states, block_states, ref_state[0], ref_state[1], pre_n, cfg
+                hidden_states, block_states, ref_state[0], ref_state[1], pre_n, cfg, skip_mask=skip_mask
             )
 
         coda_layers = self.layers[core.stop :]
@@ -367,6 +368,7 @@ class Model(nn.Module):
         omega_max: float = 0.5,
         ref_pass: int = 0,
         blend_bs: bool = False,
+        exclude_thinking: bool = False,
     ) -> loopcd.LoopCDConfig:
         """Configure LoopCD (mode='off'|'hidden'|'logits') on this model."""
         cfg = loopcd.LoopCDConfig(
@@ -376,6 +378,7 @@ class Model(nn.Module):
             omega_max=omega_max,
             ref_pass=ref_pass,
             blend_bs=blend_bs,
+            exclude_thinking=exclude_thinking,
         )
         self.model.language_model.loopcd = cfg
         return cfg
@@ -444,7 +447,8 @@ class Model(nn.Module):
                 inputs, cache=cache, input_embeddings=input_embeddings, return_ref=True
             )
             z_R, z_ref = self._logits_pair_softcap(h_R, h_ref)
-            return loopcd.combine_logits(z_R, z_ref, cfg)
+            skip_mask = loopcd.get_cache_skip(cache) if cfg.exclude_thinking else None
+            return loopcd.combine_logits(z_R, z_ref, cfg, skip_mask=skip_mask)
         hidden_states = self.model.language_model(
             inputs, cache=cache, input_embeddings=input_embeddings
         )
@@ -471,7 +475,8 @@ class Model(nn.Module):
         if lc is not None and cfg.mode == "logits" and cfg.enabled_for(lc["num_passes"]):
             h_R, h_ref = self.model.language_model(inputs, cache=cache, return_ref=True)
             z_R, z_ref = self._logits_pair_softcap(h_R, h_ref)
-            logits = loopcd.combine_logits(z_R.reshape(1, -1), z_ref.reshape(1, -1), cfg)
+            skip_mask = loopcd.get_cache_skip(cache) if cfg.exclude_thinking else None
+            logits = loopcd.combine_logits(z_R.reshape(1, -1), z_ref.reshape(1, -1), cfg, skip_mask=skip_mask)
             lp = logits - mx.logsumexp(logits, keepdims=True)
             return (mx.argmax(lp, axis=-1) if greedy else None), lp
         hidden_states = self.model.language_model(inputs, cache=cache)

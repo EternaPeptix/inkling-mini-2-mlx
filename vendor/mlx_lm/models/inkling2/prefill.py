@@ -7,13 +7,18 @@ import numpy as np
 
 from mlx_lm.models.inkling2.rows.gather import mlx_header as _fpq_mlx_header
 from mlx_lm.models.inkling2.rows.glue import GLUE_HEADER
+from mlx_lm.models.inkling2.rows.moe import _DOT_BF16
+from mlx_lm.models.inkling2.rows.proj import _maybe_bf16_w
 
 _FAST = os.environ.get("LOOPLING_FAST_PREFILL", "1") not in ("0", "")
 _PF_MOE_GMM = os.environ.get("LOOPLING_PF_MOE_GMM", "1") not in ("0", "")
+_PF_MOE_SHORT = os.environ.get("LOOPLING_PF_MOE_SHORT", "1") not in ("0", "")
+_PF_MOE_SHORT_NSG = int(os.environ.get("LOOPLING_PF_MOE_SHORT_NSG", "2"))
+_PF_MOE_SHORT_TMAX = int(os.environ.get("LOOPLING_PF_MOE_SHORT_TMAX", "4"))
 _PF_MOE_BM_ENV = int(os.environ.get("LOOPLING_PF_MOE_BM", "0"))
 _PF_MOE_CFG_ENV = os.environ.get("LOOPLING_PF_MOE_CFG", "")
 _PF_MOE_CFG = tuple(int(x) for x in _PF_MOE_CFG_ENV.split(",")) if _PF_MOE_CFG_ENV else None
-_PF_MOE_MIN_L = int(os.environ.get("LOOPLING_PF_MOE_MIN_L", "256"))
+_PF_MOE_MIN_L = int(os.environ.get("LOOPLING_PF_MOE_MIN_L", "64"))
 _PF_AFF8_QMM = os.environ.get("LOOPLING_PF_AFF8_QMM", "1") not in ("0", "")
 _PF_AFF8_CFG_ENV = os.environ.get("LOOPLING_PF_AFF8_CFG", "64,32,32,2,1")
 _PF_AFF8_CFG = tuple(int(x) for x in _PF_AFF8_CFG_ENV.split(","))
@@ -781,12 +786,10 @@ def aff8_linear(mod, x: mx.array) -> mx.array:
     )[0]
 
 
-def moe_gmm_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> bool:
+def _moe_fpq_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> bool:
     gu, dn = ex.gate_up_proj, ex.down_proj
     return (
-        _PF_MOE_GMM
-        and hidden_states.shape[0] * hidden_states.shape[1] >= _PF_MOE_MIN_L
-        and hidden_states.dtype == mx.bfloat16
+        hidden_states.dtype == mx.bfloat16
         and selected_experts.shape[-1] == 8
         and getattr(gu, "mode", None) in ("nvfp4", "mxfp8")
         and getattr(dn, "mode", None) in ("nvfp4", "mxfp8")
@@ -801,6 +804,487 @@ def moe_gmm_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> bool:
         and dn.input_dims % 32 == 0
         and dn.output_dims % 64 == 0
     )
+
+
+def moe_gmm_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> bool:
+    return (
+        _PF_MOE_GMM
+        and hidden_states.shape[0] * hidden_states.shape[1] >= _PF_MOE_MIN_L
+        and _moe_fpq_ok(ex, hidden_states, selected_experts)
+    )
+
+
+def moe_short_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> bool:
+    m = hidden_states.shape[0] * hidden_states.shape[1]
+    return (
+        _PF_MOE_SHORT
+        and 2 <= m < _PF_MOE_MIN_L
+        and _moe_fpq_ok(ex, hidden_states, selected_experts)
+    )
+
+
+_MOE_CSORT_SHORT_SRC = r"""
+    constexpr uint NSG = 8;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+
+    threadgroup atomic_uint hist[NSG][EE];
+    threadgroup uint exp_tot[EE];
+    threadgroup uint act_flg[EE];
+    threadgroup uint sg_sums[8];
+    threadgroup uint sg_asums[8];
+
+    for (uint i = tid; i < NSG * uint(EE); i += 256) {
+        atomic_store_explicit(&hist[i / uint(EE)][i % uint(EE)], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint chunk = (uint(PP) + NSG - 1) / NSG;
+    uint s0 = sg * chunk;
+    uint s1 = min(s0 + chunk, uint(PP));
+    for (uint p = s0 + lane; p < s1; p += 32) {
+        uint e = inds[p];
+        atomic_fetch_add_explicit(&hist[sg][e], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < uint(EE)) {
+        uint acc = 0;
+        for (uint s = 0; s < NSG; s++) {
+            uint c = atomic_load_explicit(&hist[s][tid], memory_order_relaxed);
+            atomic_store_explicit(&hist[s][tid], acc, memory_order_relaxed);
+            acc += c;
+        }
+        exp_tot[tid] = acc;
+        act_flg[tid] = (acc > 0u) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr uint NESG = uint(EE) / 32;
+    if (tid < uint(EE)) {
+        uint v = exp_tot[tid];
+        uint ex = simd_prefix_exclusive_sum(v);
+        if (lane == 31) sg_sums[sg] = ex + v;
+        exp_tot[tid] = ex;
+
+        uint av = act_flg[tid];
+        uint aex = simd_prefix_exclusive_sum(av);
+        if (lane == 31) sg_asums[sg] = aex + av;
+        act_flg[tid] = aex;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 32) {
+        uint sv = (tid < NESG) ? sg_sums[tid] : 0u;
+        uint sp = simd_prefix_exclusive_sum(sv);
+        if (tid < NESG) sg_sums[tid] = sp;
+
+        uint sav = (tid < NESG) ? sg_asums[tid] : 0u;
+        uint sap = simd_prefix_exclusive_sum(sav);
+        if (tid < NESG) sg_asums[tid] = sap;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < uint(EE)) {
+        uint base = exp_tot[tid] + sg_sums[sg];
+        exp_off[tid] = base;
+        for (uint s = 0; s < NSG; s++) {
+            uint off = atomic_load_explicit(&hist[s][tid], memory_order_relaxed);
+            atomic_store_explicit(&hist[s][tid], base + off, memory_order_relaxed);
+        }
+        uint nxt = (tid + 1u == uint(EE)) ? uint(PP) : (exp_tot[tid + 1u] + sg_sums[(tid + 1u) >> 5]);
+        if (nxt > base) {
+            act_e[act_flg[tid] + sg_asums[sg]] = tid;
+        }
+        if (tid == uint(EE) - 1u) {
+            exp_off[EE] = uint(PP);
+            act_e[EE] = act_flg[tid] + sg_asums[sg] + ((nxt > base) ? 1u : 0u);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint p = s0 + lane; p < s1; p += 32) {
+        uint e = inds[p];
+        uint pos = atomic_fetch_add_explicit(&hist[sg][e], 1u, memory_order_relaxed);
+        lhs_idx[pos] = p >> 3;
+        inv_order[p] = pos;
+    }
+"""
+
+_MOE_SHORT_QMV_SRC = r"""
+    constexpr int ROWS = 4;
+    constexpr int PF = 32 / BITS;
+    constexpr int PPT = ((BITS == 8) && (KK % 256 == 0)) ? 2 : 1;
+    constexpr int VPT = PF * PPT;
+    constexpr int BLOCK = VPT * 32;
+    constexpr int SSTEP = GS / VPT;
+    constexpr int NFULL = KK / BLOCK;
+    constexpr int TAILK = KK - NFULL * BLOCK;
+    constexpr bool HAS_TAIL = (TAILK > 0);
+    typedef float U;
+    typedef bfloat16_t T;
+
+    const uint u = threadgroup_position_in_grid.z;
+    const uint nact = act_e[EE];
+    if (u >= nact) return;
+    const uint e = act_e[u];
+    const uint m_base = exp_off[e];
+    const int cnt = (int)(exp_off[e + 1] - m_base);
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const int out_row = (int)threadgroup_position_in_grid.y * (ROWS * NSG) + (int)sg * ROWS;
+
+    const int in_w = KK * BITS / 8;
+    const int in_g = KK / GS;
+    const device uint8_t* ws0 = (const device uint8_t*)w
+        + (size_t)e * NN * in_w + (size_t)out_row * in_w + lane * PPT * 4;
+    const device uint8_t* sc0 = scales
+        + (size_t)e * NN * in_g + (size_t)out_row * in_g + lane / SSTEP;
+
+    float inv_scale_enc = 1.0f;
+    if constexpr (HGS) {
+        inv_scale_enc = gsc[e] / (F8E4M3_MAX * F4E2M1_MAX);
+    }
+    const bool tail_on = HAS_TAIL && ((int)lane * VPT < TAILK);
+
+    auto emit_one = [&](uint pos, const thread float* result) {
+        if constexpr (FUSED_SWIGLU) {
+            float gv[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                float v = simd_sum(result[r]);
+                gv[r] = HGS ? float(static_cast<T>(v * inv_scale_enc)) : float(static_cast<T>(v));
+            }
+            if (lane == 0) {
+                const float gc = caps[0], uc = caps[1];
+                #pragma unroll
+                for (int pair = 0; pair < ROWS / 2; pair++) {
+                    out[(size_t)pos * (NN / 2) + (size_t)(out_row / 2 + pair)] =
+                        static_cast<T>(glue_swiglu(gv[2 * pair], gv[2 * pair + 1], gc, uc));
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                float v = simd_sum(result[r]);
+                if (lane == 0) {
+                    out[(size_t)pos * NN + (size_t)(out_row + r)] =
+                        HGS ? static_cast<T>(v * inv_scale_enc) : static_cast<T>(v);
+                }
+            }
+        }
+    };
+
+    if (cnt == 1) {
+        const uint pos = m_base;
+        const uint tok = USE_LHS ? lhs_idx[pos] : pos;
+        const size_t xo = (size_t)tok * KK + (size_t)lane * VPT;
+        thread U result[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) result[r] = 0.0f;
+        const device uint8_t* ws = ws0;
+        const device uint8_t* sc = sc0;
+        for (int it = 0; it < NFULL; it++) {
+            const uint k_off = (uint)it * (uint)BLOCK;
+            if constexpr (VPT == 8) {
+                uint4 x4 = ((const device uint4*)(x + xo + k_off))[0];
+                float4 xf0 = float4(as_type<bfloat4>(x4.xy));
+                float4 xf1 = float4(as_type<bfloat4>(x4.zw));
+                if constexpr (BITS == 4) {
+                    thread uint32_t wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_u32_fp4_8(wr[r], wv);
+                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
+                    }
+                } else {
+                    thread uint2 wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_u2_fp8_8(wr[r], wv);
+                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
+                    }
+                }
+            } else {
+                uint2 x2 = ((const device uint2*)(x + xo + k_off))[0];
+                float4 xf0 = float4(as_type<bfloat4>(x2));
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) {
+                    thread U wv[VPT];
+                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                    result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
+                }
+            }
+            ws += BLOCK * BITS / 8;
+            sc += BLOCK / GS;
+        }
+        if constexpr (HAS_TAIL) {
+            if (tail_on) {
+                const uint k_off = (uint)NFULL * (uint)BLOCK;
+                if constexpr (VPT == 8) {
+                    uint4 x4 = ((const device uint4*)(x + xo + k_off))[0];
+                    float4 xf0 = float4(as_type<bfloat4>(x4.xy));
+                    float4 xf1 = float4(as_type<bfloat4>(x4.zw));
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[8];
+                        dequant_vals<BITS, 8>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
+                    }
+                } else {
+                    uint2 x2 = ((const device uint2*)(x + xo + k_off))[0];
+                    float4 xf0 = float4(as_type<bfloat4>(x2));
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        result[r] += dot_vals_f4_4<BITS>(xf0, wv, sv);
+                    }
+                }
+            }
+        }
+        emit_one(pos, result);
+    } else {
+        for (int tb = 0; tb < cnt; tb += TMAX) {
+            const int nb = min(TMAX, cnt - tb);
+            size_t xo[TMAX];
+            #pragma unroll
+            for (int t = 0; t < TMAX; t++) {
+                if (t < nb) {
+                    uint pos = m_base + uint(tb + t);
+                    uint tok = USE_LHS ? lhs_idx[pos] : pos;
+                    xo[t] = (size_t)tok * KK + (size_t)lane * VPT;
+                } else {
+                    xo[t] = 0u;
+                }
+            }
+            thread U result[TMAX][ROWS];
+            #pragma unroll
+            for (int t = 0; t < TMAX; t++) {
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) result[t][r] = 0.0f;
+            }
+            const device uint8_t* ws = ws0;
+            const device uint8_t* sc = sc0;
+            for (int it = 0; it < NFULL; it++) {
+                const uint k_off = (uint)it * (uint)BLOCK;
+                if constexpr (VPT == 8) {
+                    thread uint4 x4[TMAX];
+                    #pragma unroll
+                    for (int t = 0; t < TMAX; t++) {
+                        if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
+                    }
+                    if constexpr (BITS == 4) {
+                        thread uint32_t wr[ROWS];
+                        thread uint8_t sr[ROWS];
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                            sr[r] = (sc + r * in_g)[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[8];
+                            dequant_u32_fp4_8(wr[r], wv);
+                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
+                            }
+                        }
+                    } else {
+                        thread uint2 wr[ROWS];
+                        thread uint8_t sr[ROWS];
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                            sr[r] = (sc + r * in_g)[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[8];
+                            dequant_u2_fp8_8(wr[r], wv);
+                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
+                            }
+                        }
+                    }
+                } else {
+                    thread uint2 x2[TMAX];
+                    #pragma unroll
+                    for (int t = 0; t < TMAX; t++) {
+                        if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {
+                        thread U wv[VPT];
+                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                        #pragma unroll
+                        for (int t = 0; t < TMAX; t++) {
+                            if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                        }
+                    }
+                }
+                ws += BLOCK * BITS / 8;
+                sc += BLOCK / GS;
+            }
+            if constexpr (HAS_TAIL) {
+                if (tail_on) {
+                    const uint k_off = (uint)NFULL * (uint)BLOCK;
+                    if constexpr (VPT == 8) {
+                        thread uint4 x4[TMAX];
+                        #pragma unroll
+                        for (int t = 0; t < TMAX; t++) {
+                            if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[8];
+                            dequant_vals<BITS, 8>(ws + r * in_w, wv);
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
+                            }
+                        }
+                    } else {
+                        thread uint2 x2[TMAX];
+                        #pragma unroll
+                        for (int t = 0; t < TMAX; t++) {
+                            if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[VPT];
+                            dequant_vals<BITS, VPT>(ws + r * in_w, wv);
+                            U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            #pragma unroll
+                            for (int t = 0; t < TMAX; t++) {
+                                if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                            }
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (int t = 0; t < TMAX; t++) {
+                if (t < nb) emit_one(m_base + uint(tb + t), result[t]);
+            }
+        }
+    }
+"""
+
+
+def _k_moe_short():
+    k = _kernels.get("pf_moe_short_qmv")
+    if k is None:
+        hdr = _fpq_mlx_header() + "\n" + _DOT_BF16 + "\n" + GLUE_HEADER
+        k = _kernels["pf_moe_short_qmv"] = mx.fast.metal_kernel(
+            name="pf_moe_short_qmv",
+            input_names=["x", "lhs_idx", "exp_off", "act_e", "w", "scales", "gsc", "caps"],
+            output_names=["out"],
+            source=_MOE_SHORT_QMV_SRC,
+            header=hdr,
+            ensure_row_contiguous=True,
+        )
+    return k
+
+
+def moe_short_forward(
+    ex,
+    hidden_states: mx.array,
+    selected_experts: mx.array,
+    routing_weights: mx.array,
+) -> mx.array:
+    """Bit-exact expert-order fp_qmv MoE for short suffixes (2 <= B*L < _PF_MOE_MIN_L)."""
+    B, L, D = hidden_states.shape
+    gu, dn = ex.gate_up_proj, ex.down_proj
+    E = gu.num_experts
+    P = B * L * 8
+    nsg = _PF_MOE_SHORT_NSG
+    tmax = _PF_MOE_SHORT_TMAX
+
+    ks = _k(
+        "pf_moe_csort_short",
+        ("inds",),
+        ("lhs_idx", "inv_order", "exp_off", "act_e"),
+        _MOE_CSORT_SHORT_SRC,
+    )
+    lhs_idx, inv_order, exp_off, act_e = ks(
+        inputs=[selected_experts.reshape(-1).astype(mx.uint32)],
+        template=[("PP", P), ("EE", E)],
+        grid=(256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(P,), (P,), (E + 1,), (E + 1,)],
+        output_dtypes=[mx.uint32, mx.uint32, mx.uint32, mx.uint32],
+    )
+
+    ckey = ("swiglu", ex.act_fn.gate_softcap, ex.act_fn.up_softcap)
+    caps = _PARAMS_CACHE.get(ckey)
+    if caps is None:
+        caps = _PARAMS_CACHE[ckey] = mx.array([ex.act_fn.gate_softcap, ex.act_fn.up_softcap], dtype=mx.float32)
+
+    kq = _k_moe_short()
+    z_act = min(P, E)
+
+    # 1. Expert-order gate_up + SwiGLU (direct lhs_idx gather from hidden_states)
+    hgs_gu = int(gu.global_scale is not None)
+    gsc_gu = gu.global_scale.astype(mx.float32) if hgs_gu else _DUMMY_F32
+    N_gu, K_gu = gu.output_dims, gu.input_dims
+    act = kq(
+        inputs=[hidden_states, lhs_idx, exp_off, act_e, gu["weight"], gu["scales"], gsc_gu, caps],
+        template=[
+            ("BITS", gu.bits), ("GS", gu.group_size), ("HGS", hgs_gu),
+            ("KK", K_gu), ("NN", N_gu), ("EE", E), ("NSG", nsg), ("TMAX", tmax),
+            ("USE_LHS", 1), ("FUSED_SWIGLU", 1),
+        ],
+        grid=(32, nsg * (N_gu // (4 * nsg)), z_act),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(P, N_gu // 2)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+    # 2. Expert-order down_proj (reads contiguous act directly)
+    hgs_dn = int(dn.global_scale is not None)
+    gsc_dn = dn.global_scale.astype(mx.float32) if hgs_dn else _DUMMY_F32
+    N_dn, K_dn = dn.output_dims, dn.input_dims
+    dn_s = kq(
+        inputs=[act, lhs_idx, exp_off, act_e, dn["weight"], dn["scales"], gsc_dn, caps],
+        template=[
+            ("BITS", dn.bits), ("GS", dn.group_size), ("HGS", hgs_dn),
+            ("KK", K_dn), ("NN", N_dn), ("EE", E), ("NSG", nsg), ("TMAX", tmax),
+            ("USE_LHS", 0), ("FUSED_SWIGLU", 0),
+        ],
+        grid=(32, nsg * (N_dn // (4 * nsg)), z_act),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(P, N_dn)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+    return unsort_combine(dn_s, inv_order, routing_weights)
 
 
 def moe_gmm_forward(
@@ -3036,14 +3520,15 @@ _MGIN_DOWN_QKV_SRC = r"""
 """
 
 
-def _fg_mix_src(is_qkv: bool) -> str:
+def _fg_mix_src(is_qkv: bool, w_bf16: bool = False) -> str:
+    wt = "bfloat16_t" if w_bf16 else "float"
     if is_qkv:
         setup = (
             "    const uint c0 = (threadgroup_position_in_grid.x % (DD / 64)) * 64;\n"
             "    const uint g = threadgroup_position_in_grid.x / (DD / 64);\n"
             "    const device float* stp = (g == 0 ? st0 : (g == 1 ? st1 : st2));\n"
-            "    const device float* wfp_base = (g == 0 ? wf0 : (g == 1 ? wf1 : wf2));\n"
-            "    const device float* wmp_base = (g == 0 ? wm0 : (g == 1 ? wm1 : wm2));\n"
+            f"    const device {wt}* wfp_base = (g == 0 ? wf0 : (g == 1 ? wf1 : wf2));\n"
+            f"    const device {wt}* wmp_base = (g == 0 ? wm0 : (g == 1 ? wm1 : wm2));\n"
             "    device float* out_p = (g == 0 ? o0 : (g == 1 ? o1 : o2));\n"
             "    auto hoff_fn = [&](uint mr) { return (SHARED_H ? size_t(mr) : (size_t(mr) * 3 + g)) * DD; };\n"
             "    auto moff_fn = [&](uint mr) { return (size_t(mr) * 4 + g) * DD; };\n"
@@ -3052,8 +3537,8 @@ def _fg_mix_src(is_qkv: bool) -> str:
         setup = (
             "    const uint c0 = threadgroup_position_in_grid.x * 64;\n"
             "    const device float* stp = st;\n"
-            "    const device float* wfp_base = wf;\n"
-            "    const device float* wmp_base = wm;\n"
+            f"    const device {wt}* wfp_base = wf;\n"
+            f"    const device {wt}* wmp_base = wm;\n"
             "    device float* out_p = mixed;\n"
             "    auto hoff_fn = [&](uint mr) { return size_t(mr) * DD; };\n"
             "    auto moff_fn = [&](uint mr) { return (size_t(mr) * 4 + SLOT) * DD; };\n"
@@ -3063,7 +3548,7 @@ def _fg_mix_src(is_qkv: bool) -> str:
         "    constexpr int BM = 32, TM = 4;\n"
         "    const uint m0 = threadgroup_position_in_grid.y * BM;\n"
         + setup
-        + r"""
+        + f"""
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const short fm = ((lane / 4) & 4) + (lane / 2) % 4;
@@ -3072,42 +3557,42 @@ def _fg_mix_src(is_qkv: bool) -> str:
 
     threadgroup float Ss[BM * 72];
     const uint tid = thread_position_in_threadgroup.x;
-    for (uint i = tid; i < BM * 32; i += 256) {
+    for (uint i = tid; i < BM * 32; i += 256) {{
         uint r = i >> 5;
         uint k2 = (i & 31) * 2;
         uint rr = min(m0 + r, uint(NN - 1));
         ((threadgroup float2*)(Ss + r * 72 + k2))[0] = ((const device float2*)(stp + (size_t)rr * 64 + k2))[0];
-    }
+    }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     simdgroup_float8x8 cf[TM], cm[TM];
     #pragma clang loop unroll(full)
-    for (int tm = 0; tm < TM; ++tm) {
+    for (int tm = 0; tm < TM; ++tm) {{
         cf[tm] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         cm[tm] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    }
-    const device float* wfp0 = wfp_base + (size_t)col * 64;
-    const device float* wfp1 = wfp_base + (size_t)(col + 1) * 64;
-    const device float* wmp0 = wmp_base + (size_t)col * 64;
-    const device float* wmp1 = wmp_base + (size_t)(col + 1) * 64;
+    }}
+    const device {wt}* wfp0 = wfp_base + (size_t)col * 64;
+    const device {wt}* wfp1 = wfp_base + (size_t)(col + 1) * 64;
+    const device {wt}* wmp0 = wmp_base + (size_t)col * 64;
+    const device {wt}* wmp1 = wmp_base + (size_t)(col + 1) * 64;
     #pragma clang loop unroll(full)
-    for (int k = 0; k < 64; k += 8) {
+    for (int k = 0; k < 64; k += 8) {{
         simdgroup_float8x8 Bf, Bm;
-        Bf.thread_elements()[0] = wfp0[k + fm]; Bf.thread_elements()[1] = wfp1[k + fm];
-        Bm.thread_elements()[0] = wmp0[k + fm]; Bm.thread_elements()[1] = wmp1[k + fm];
+        Bf.thread_elements()[0] = float(wfp0[k + fm]); Bf.thread_elements()[1] = float(wfp1[k + fm]);
+        Bm.thread_elements()[0] = float(wmp0[k + fm]); Bm.thread_elements()[1] = float(wmp1[k + fm]);
         #pragma clang loop unroll(full)
-        for (int tm = 0; tm < TM; ++tm) {
+        for (int tm = 0; tm < TM; ++tm) {{
             simdgroup_float8x8 A;
             const float2 av = *((const threadgroup float2*)(Ss + (tm * 8 + fm) * 72 + k + fn));
             A.thread_elements()[0] = av.x; A.thread_elements()[1] = av.y;
             simdgroup_multiply_accumulate(cf[tm], A, Bf, cf[tm]);
             simdgroup_multiply_accumulate(cm[tm], A, Bm, cm[tm]);
-        }
-    }
+        }}
+    }}
     #pragma clang loop unroll(full)
-    for (int tm = 0; tm < TM; ++tm) {
+    for (int tm = 0; tm < TM; ++tm) {{
         const uint mr = m0 + uint(tm) * 8u + fm;
-        if (mr < uint(NN)) {
+        if (mr < uint(NN)) {{
             size_t off = (size_t)mr * DD + col;
             size_t hoff = hoff_fn(mr) + col;
             size_t moff = moff_fn(mr) + col;
@@ -3116,14 +3601,16 @@ def _fg_mix_src(is_qkv: bool) -> str:
             float v0 = glue_msg_combine<0>(cf[tm].thread_elements()[0], cm[tm].thread_elements()[0], hv.x, mv.x);
             float v1 = glue_msg_combine<0>(cf[tm].thread_elements()[1], cm[tm].thread_elements()[1], hv.y, mv.y);
             ((device float2*)(out_p + off))[0] = float2(v0, v1);
-        }
-    }
+        }}
+    }}
 """
     )
 
 
-_FG_MIX_SINGLE_SRC = _fg_mix_src(False)
-_FG_MIX_QKV_SRC = _fg_mix_src(True)
+_FG_MIX_SINGLE_SRC = _fg_mix_src(False, False)
+_FG_MIX_QKV_SRC = _fg_mix_src(True, False)
+_FG_MIX_SINGLE_BF16_SRC = _fg_mix_src(False, True)
+_FG_MIX_QKV_BF16_SRC = _fg_mix_src(True, True)
 
 
 def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) -> mx.array:
@@ -3161,9 +3648,23 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
     )[0]
     if _PF_FG_MIX and N >= 256:
         st = gate_mod.down_proj(g_in).astype(mx.float32)
-        k_fg = _k_mma("pf_fg_mix_s", ("st", "wf", "wm", "h", "msg"), ("mixed",), _FG_MIX_SINGLE_SRC)
+        wf = _maybe_bf16_w(gate_mod.forget_gate_proj.weight)
+        wm = _maybe_bf16_w(gate_mod.message_gate_proj.weight)
+        use_bf16 = wf is not None and wm is not None
+        k_fg = _k_mma(
+            "pf_fg_mix_s_bf16" if use_bf16 else "pf_fg_mix_s",
+            ("st", "wf", "wm", "h", "msg"),
+            ("mixed",),
+            _FG_MIX_SINGLE_BF16_SRC if use_bf16 else _FG_MIX_SINGLE_SRC,
+        )
         mixed = k_fg(
-            inputs=[st, gate_mod.forget_gate_proj.weight, gate_mod.message_gate_proj.weight, h, msg],
+            inputs=[
+                st,
+                wf if use_bf16 else gate_mod.forget_gate_proj.weight,
+                wm if use_bf16 else gate_mod.message_gate_proj.weight,
+                h,
+                msg,
+            ],
             template=[("DD", D), ("NN", N), ("SLOT", slot)],
             grid=((D // 64) * 256, (N + 31) // 32, 1),
             threadgroup=(256, 1, 1),
@@ -3246,17 +3747,20 @@ def msg_gate_norm_qkv(gates, h_or_ai: mx.array, msg: mx.array, lns, *, shared_h:
             st0 = gates[0].down_proj(in0).astype(mx.float32)
             st1 = gates[1].down_proj(in1).astype(mx.float32)
             st2 = gates[2].down_proj(in2).astype(mx.float32)
+        wf_b = [_maybe_bf16_w(g.forget_gate_proj.weight) for g in gates]
+        wm_b = [_maybe_bf16_w(g.message_gate_proj.weight) for g in gates]
+        use_bf16 = all(x is not None for x in wf_b) and all(x is not None for x in wm_b)
         k_fg = _k_mma(
-            "pf_fg_mix_qkv",
+            "pf_fg_mix_qkv_bf16" if use_bf16 else "pf_fg_mix_qkv",
             ("st0", "st1", "st2", "wf0", "wf1", "wf2", "wm0", "wm1", "wm2", "h", "msg"),
             ("o0", "o1", "o2"),
-            _FG_MIX_QKV_SRC,
+            _FG_MIX_QKV_BF16_SRC if use_bf16 else _FG_MIX_QKV_SRC,
         )
         mx0, mx1, mx2 = k_fg(
             inputs=[
                 st0, st1, st2,
-                gates[0].forget_gate_proj.weight, gates[1].forget_gate_proj.weight, gates[2].forget_gate_proj.weight,
-                gates[0].message_gate_proj.weight, gates[1].message_gate_proj.weight, gates[2].message_gate_proj.weight,
+                *(wf_b if use_bf16 else [g.forget_gate_proj.weight for g in gates]),
+                *(wm_b if use_bf16 else [g.message_gate_proj.weight for g in gates]),
                 h_or_ai, msg,
             ],
             template=[("DD", D), ("NN", N), ("SHARED_H", int(shared_h))],

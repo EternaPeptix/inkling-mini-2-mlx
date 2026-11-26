@@ -1325,6 +1325,33 @@ def gate_down_rows(x, ws):
     )[0]
 
 
+_MSG_BF16 = os.environ.get("LOOPLING_MSG_BF16", "1") not in ("0", "", "false", "False")
+_BF16_W_CACHE: dict[int, tuple[mx.array, mx.array | None]] = {}
+
+
+_BF16_MASK = mx.array(0xFFFF, mx.uint32)
+
+
+def _maybe_bf16_w(w: mx.array) -> mx.array | None:
+    """Return bit-exact BF16 copy of an FP32 weight (identity-guarded) if lossless and LOOPLING_MSG_BF16=1."""
+    if w.dtype == mx.bfloat16:
+        return w
+    if not _MSG_BF16 or w.dtype != mx.float32:
+        return None
+    wid = id(w)
+    entry = _BF16_W_CACHE.get(wid)
+    if entry is not None and entry[0] is w:
+        return entry[1]
+    lossless = bool(mx.all((w.view(mx.uint32) & _BF16_MASK) == 0).item())
+    val = w.astype(mx.bfloat16) if lossless else None
+    if val is not None:
+        mx.eval(val)
+    if len(_BF16_W_CACHE) >= 512:
+        _BF16_W_CACHE.clear()
+    _BF16_W_CACHE[wid] = (w, val)
+    return val
+
+
 # =============================================================================================== K3 (gate mix)
 # forget/message_gate_proj (D=2304, 64) f32 at M=1: MLX gemv bm1 bn1 sm8 sn4 tm4 tn4 -> each quad of 4 lanes owns 1 row
 # (K=64 split 4 lanes x 4 uint4/float4 loads), 8 rows per simdgroup, 4 simdgroups (32 output rows) per threadgroup;
@@ -1337,8 +1364,17 @@ inline float proj_inv_from_part(const device float* p, float eps, uint lane) {
   return metal::precise::rsqrt(tot / 2304.0f + eps);
 }
 
-template <int B, int RB, int G, int D, int NSG>
-METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, const device bfloat16_t* down, const int g,
+template <typename WT>
+inline float4 load_w4(const device WT* p) {
+  if constexpr (sizeof(WT) == 2) {
+    return float4(as_type<bfloat4>(((const device uint2*)p)[0]));
+  } else {
+    return ((const device float4*)p)[0];
+  }
+}
+
+template <int B, int RB, int G, int D, int NSG, typename WT = float>
+METAL_FUNC void gate_mix_one(const device WT* wf, const device WT* wm, const device bfloat16_t* down, const int g,
                              const device float* s, const device float* msg, const int slot, device float* out,
                              const uint row0, const uint b0, const uint sg, const uint lane,
                              threadgroup bfloat16_t* dn_s) {
@@ -1359,18 +1395,18 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
     fr[b] = 0.0f;
     mr[b] = 0.0f;
   }
-  const device float* wfr = wf + (size_t)row * 64 + qn;
-  const device float* wmr = wm + (size_t)row * 64 + qn;
+  const device WT* wfr = wf + (size_t)row * 64 + qn;
+  const device WT* wmr = wm + (size_t)row * 64 + qn;
   if constexpr (B <= 4) {
     float4 ffa[4], mma[4];
-    ffa[0] = ((const device float4*)(wfr + 0))[0];
-    ffa[1] = ((const device float4*)(wfr + 16))[0];
-    ffa[2] = ((const device float4*)(wfr + 32))[0];
-    ffa[3] = ((const device float4*)(wfr + 48))[0];
-    mma[0] = ((const device float4*)(wmr + 0))[0];
-    mma[1] = ((const device float4*)(wmr + 16))[0];
-    mma[2] = ((const device float4*)(wmr + 32))[0];
-    mma[3] = ((const device float4*)(wmr + 48))[0];
+    ffa[0] = load_w4(wfr + 0);
+    ffa[1] = load_w4(wfr + 16);
+    ffa[2] = load_w4(wfr + 32);
+    ffa[3] = load_w4(wfr + 48);
+    mma[0] = load_w4(wmr + 0);
+    mma[1] = load_w4(wmr + 16);
+    mma[2] = load_w4(wmr + 32);
+    mma[3] = load_w4(wmr + 48);
     #pragma unroll
     for (int i = 0; i < 4; i++) {
       int off = i * 16;
@@ -1389,10 +1425,10 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
   } else {
     for (int p = 0; p < 2; p++) {
       int o0 = p * 32, o1 = p * 32 + 16;
-      float4 f0 = ((const device float4*)(wfr + o0))[0];
-      float4 f1 = ((const device float4*)(wfr + o1))[0];
-      float4 m0 = ((const device float4*)(wmr + o0))[0];
-      float4 m1 = ((const device float4*)(wmr + o1))[0];
+      float4 f0 = load_w4(wfr + o0);
+      float4 f1 = load_w4(wfr + o1);
+      float4 m0 = load_w4(wmr + o0);
+      float4 m1 = load_w4(wmr + o1);
       #pragma unroll
       for (int b = 0; b < RB; b++) {
         if (b < nb) {
@@ -1425,8 +1461,8 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
 }
 
 // K3 + exact 36-half-SG rms_single_row partial sum-of-squares (36 TGs/gate = 108 TGs for G=3, 64 rows/TG, NSG=8, 1 pass).
-template <int B, int RB, int G, int D, int NSG>
-METAL_FUNC void gate_mix_part_one(const device float* wf, const device float* wm, const device bfloat16_t* down, const int g,
+template <int B, int RB, int G, int D, int NSG, typename WT = float>
+METAL_FUNC void gate_mix_part_one(const device WT* wf, const device WT* wm, const device bfloat16_t* down, const int g,
                                   const device float* s, const device float* msg, const int slot,
                                   device float* out, device float* part,
                                   const uint vs, const uint b0, const uint sg, const uint lane,
@@ -1451,18 +1487,18 @@ METAL_FUNC void gate_mix_part_one(const device float* wf, const device float* wm
     fr[b] = 0.0f;
     mr[b] = 0.0f;
   }
-  const device float* wfr = wf + (size_t)row * 64 + qn;
-  const device float* wmr = wm + (size_t)row * 64 + qn;
+  const device WT* wfr = wf + (size_t)row * 64 + qn;
+  const device WT* wmr = wm + (size_t)row * 64 + qn;
   if constexpr (B <= 4) {
     float4 ffa[4], mma[4];
-    ffa[0] = ((const device float4*)(wfr + 0))[0];
-    ffa[1] = ((const device float4*)(wfr + 16))[0];
-    ffa[2] = ((const device float4*)(wfr + 32))[0];
-    ffa[3] = ((const device float4*)(wfr + 48))[0];
-    mma[0] = ((const device float4*)(wmr + 0))[0];
-    mma[1] = ((const device float4*)(wmr + 16))[0];
-    mma[2] = ((const device float4*)(wmr + 32))[0];
-    mma[3] = ((const device float4*)(wmr + 48))[0];
+    ffa[0] = load_w4(wfr + 0);
+    ffa[1] = load_w4(wfr + 16);
+    ffa[2] = load_w4(wfr + 32);
+    ffa[3] = load_w4(wfr + 48);
+    mma[0] = load_w4(wmr + 0);
+    mma[1] = load_w4(wmr + 16);
+    mma[2] = load_w4(wmr + 32);
+    mma[3] = load_w4(wmr + 48);
     #pragma unroll
     for (int i = 0; i < 4; i++) {
       int off = i * 16;
@@ -1481,10 +1517,10 @@ METAL_FUNC void gate_mix_part_one(const device float* wf, const device float* wm
   } else {
     for (int p = 0; p < 2; p++) {
       int o0 = p * 32, o1 = p * 32 + 16;
-      float4 f0 = ((const device float4*)(wfr + o0))[0];
-      float4 f1 = ((const device float4*)(wfr + o1))[0];
-      float4 m0 = ((const device float4*)(wmr + o0))[0];
-      float4 m1 = ((const device float4*)(wmr + o1))[0];
+      float4 f0 = load_w4(wfr + o0);
+      float4 f1 = load_w4(wfr + o1);
+      float4 m0 = load_w4(wmr + o0);
+      float4 m1 = load_w4(wmr + o1);
       #pragma unroll
       for (int b = 0; b < RB; b++) {
         if (b < nb) {
@@ -1546,18 +1582,12 @@ def _gmix_rb(B):
     return min(B, 2)
 
 
-def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
-    """K3 + exact 18-virtual-SG RMS partials -> (mixed (B,G,2304) f32, part (B,G,18) f32).
-    Eliminates K3b launch when consumer (K4 qkv_rows_from_mixed / K11+K12) normalizes on load."""
-    B, G, R = down.shape
-    D = wf[0].shape[0]
-    if D != 2304 or R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G:
-        raise ValueError("gate_mix_part_rows requires D=2304, R=64, down bf16, B in 1..16")
+def _prepare_mix_inputs(ss, msg, wf, wm, D):
     for w in list(wf) + list(wm):
-        if w.shape != (D, 64) or w.dtype != mx.float32:
-            raise ValueError("forget/message weights must be (2304,64) f32")
-    if msg.shape != (B, 4, D) or msg.dtype != mx.float32 or any(s.shape != (B, D) or s.dtype != mx.float32 for s in ss):
-        raise ValueError("msg must be (B,4,2304) f32 and each s (B,2304) f32")
+        if w.shape != (D, 64) or w.dtype not in (mx.float32, mx.bfloat16):
+            raise ValueError("forget/message weights must be (D,64) f32 or bf16")
+    if msg.shape[1:] != (4, D) or msg.dtype != mx.float32 or any(s.shape != msg.shape[:1] + (D,) or s.dtype != mx.float32 for s in ss):
+        raise ValueError("msg must be (B,4,D) f32 and each s (B,D) f32")
     uniq, smap = [], []
     for s in ss:
         for j, u in enumerate(uniq):
@@ -1567,10 +1597,29 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
         else:
             smap.append(len(uniq))
             uniq.append(s)
+    wf_b = [_maybe_bf16_w(w) for w in wf]
+    wm_b = [_maybe_bf16_w(w) for w in wm]
+    use_bf16 = all(x is not None for x in wf_b) and all(x is not None for x in wm_b)
+    if not use_bf16 and any(w.dtype == mx.bfloat16 for w in list(wf) + list(wm)):
+        wf = [w.astype(mx.float32) if w.dtype == mx.bfloat16 else w for w in wf]
+        wm = [w.astype(mx.float32) if w.dtype == mx.bfloat16 else w for w in wm]
+    w_ins = (wf_b + wm_b) if use_bf16 else (list(wf) + list(wm))
+    wt = "bfloat16_t" if use_bf16 else "float"
+    return uniq, smap, w_ins, use_bf16, wt
+
+
+def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
+    """K3 + exact 18-virtual-SG RMS partials -> (mixed (B,G,2304) f32, part (B,G,18) f32).
+    Eliminates K3b launch when consumer (K4 qkv_rows_from_mixed / K11+K12) normalizes on load."""
+    B, G, R = down.shape
+    D = wf[0].shape[0]
+    if D != 2304 or R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G or msg.shape[0] != B:
+        raise ValueError("gate_mix_part_rows requires D=2304, R=64, down bf16, B in 1..16")
+    uniq, smap, w_ins, use_bf16, wt = _prepare_mix_inputs(ss, msg, wf, wm, D)
     nsg = 8
     nt = 36  # 2304 / 64 = 36 half-SG tiles (108 TGs for G=3 -> all 80 M3 Ultra cores busy, 1 pass!)
     rb = _gmix_rb(B)
-    key = (B, rb, G, tuple(smap), tuple(slots))
+    key = (B, rb, G, tuple(smap), tuple(slots), use_bf16)
     kern = _k3p.get(key)
     if kern is None:
         lines = [
@@ -1588,11 +1637,12 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
             else:
                 head = "else" if g else ""
             lines.append(
-                "%s { gate_mix_part_one<%d, %d, %d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, part, vs, b0, sg, lane, dn_s, mix_s); }"
-                % (head, B, rb, G, D, nsg, g, g, g, smap[g], slots[g])
+                "%s { gate_mix_part_one<%d, %d, %d, %d, %d, %s>(wf%d, wm%d, down, %d, s%d, msg, %d, out, part, vs, b0, sg, lane, dn_s, mix_s); }"
+                % (head, B, rb, G, D, nsg, wt, g, g, g, smap[g], slots[g])
             )
         kern = mx.fast.metal_kernel(
-            name="f3_gate_mix_part36_b%d_rb%d_g%d_s%s_m%s" % (B, rb, G, "".join(map(str, smap)), "".join(map(str, slots))),
+            name="f3_gate_mix_part36_b%d_rb%d_g%d_s%s_m%s%s"
+            % (B, rb, G, "".join(map(str, smap)), "".join(map(str, slots)), "_bf16" if use_bf16 else ""),
             input_names=["down", "msg"] + ["s%d" % j for j in range(len(uniq))]
             + ["wf%d" % g for g in range(G)] + ["wm%d" % g for g in range(G)],
             output_names=["out", "part"],
@@ -1603,7 +1653,7 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
         _k3p[key] = kern
     tg_t = nsg * 32
     return kern(
-        inputs=[down, msg] + uniq + list(wf) + list(wm),
+        inputs=[down, msg] + uniq + w_ins,
         grid=(((B + rb - 1) // rb) * tg_t, G * nt, 1),
         threadgroup=(tg_t, 1, 1),
         output_shapes=[(B, G, D), (B, G, 36)],
@@ -1618,29 +1668,16 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
     MessageGate epilogue (separate mul/add, no fma)."""
     B, G, R = down.shape
     D = wf[0].shape[0]
-    if R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G:
+    if R != 64 or down.dtype != mx.bfloat16 or not 1 <= B <= MAX_B or len(ss) != G or len(wf) != G or len(wm) != G or msg.shape[0] != B:
         raise ValueError("down must be (B,G,64) bf16; one s/wf/wm per gate")
     if D % 32 or (D != 2304 and _gemv._cfg(D, 64) != (1, 1, 8, 4, 4, 4)):
         raise ValueError("gate_mix_rows is specialised for D % 32 == 0 and MLX's bm1 bn1 sm8 sn4 tm4 tn4 gemv config")
-    for w in list(wf) + list(wm):
-        if w.shape != (D, 64) or w.dtype != mx.float32:
-            raise ValueError("forget/message weights must be (D,64) f32")
-    if msg.shape != (B, 4, D) or msg.dtype != mx.float32 or any(s.shape != (B, D) or s.dtype != mx.float32 for s in ss):
-        raise ValueError("msg must be (B,4,D) f32 and each s (B,D) f32")
-    uniq, smap = [], []
-    for s in ss:
-        for j, u in enumerate(uniq):
-            if u is s:
-                smap.append(j)
-                break
-        else:
-            smap.append(len(uniq))
-            uniq.append(s)
+    uniq, smap, w_ins, use_bf16, wt = _prepare_mix_inputs(ss, msg, wf, wm, D)
     nsg = 2 if (G == 1 and D % 16 == 0) else 4
     rows_tg = nsg * 8
     nt = D // rows_tg
     rb = _gmix_rb(B)
-    key = (B, rb, G, D, nsg, tuple(smap), tuple(slots))
+    key = (B, rb, G, D, nsg, tuple(smap), tuple(slots), use_bf16)
     kern = _k3.get(key)
     if kern is None:
         lines = [
@@ -1657,11 +1694,12 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
             else:
                 head = "else" if g else ""
             lines.append(
-                "%s { gate_mix_one<%d, %d, %d, %d, %d>(wf%d, wm%d, down, %d, s%d, msg, %d, out, row0, b0, sg, lane, dn_s); }"
-                % (head, B, rb, G, D, nsg, g, g, g, smap[g], slots[g])
+                "%s { gate_mix_one<%d, %d, %d, %d, %d, %s>(wf%d, wm%d, down, %d, s%d, msg, %d, out, row0, b0, sg, lane, dn_s); }"
+                % (head, B, rb, G, D, nsg, wt, g, g, g, smap[g], slots[g])
             )
         kern = mx.fast.metal_kernel(
-            name="f3_gate_mix_b%d_rb%d_g%d_n%d_s%s_m%s" % (B, rb, G, nsg, "".join(map(str, smap)), "".join(map(str, slots))),
+            name="f3_gate_mix_b%d_rb%d_g%d_n%d_s%s_m%s%s"
+            % (B, rb, G, nsg, "".join(map(str, smap)), "".join(map(str, slots)), "_bf16" if use_bf16 else ""),
             input_names=["down", "msg"] + ["s%d" % j for j in range(len(uniq))]
             + ["wf%d" % g for g in range(G)] + ["wm%d" % g for g in range(G)],
             output_names=["out"],
@@ -1672,7 +1710,7 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
         _k3[key] = kern
     tg_t = nsg * 32
     return kern(
-        inputs=[down, msg] + uniq + list(wf) + list(wm),
+        inputs=[down, msg] + uniq + w_ins,
         grid=(((B + rb - 1) // rb) * tg_t, G * nt, 1),
         threadgroup=(tg_t, 1, 1),
         output_shapes=[(B, G, D)],

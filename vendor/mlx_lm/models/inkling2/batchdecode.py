@@ -1963,7 +1963,7 @@ class BatchDecoder:
                 and f_key is not None
             )
             if use_compile:
-                cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if (use_cd and cfg.mode == "hidden") else None
+                cd_key = self._loopcd_cd_key(cfg, ref_pass, force_hidden=True) if (use_cd and cfg.mode == "hidden") else None
                 fuse_k3b = (
                 os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
                 and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
@@ -2086,7 +2086,9 @@ class BatchDecoder:
                 keep_bs = cfg.blend_bs or cfg.mode == "logits"
                 ref_state = (h, list(bs) if keep_bs else None)
         if use_cd and cfg.mode == "hidden":
-            h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
+            h, bs = loopcd.apply_hidden(
+                h, bs, ref_state[0], ref_state[1], pre_n, cfg, skip_mask=self._loopcd_skip_mask(cfg)
+            )
         coda_layers = layers[core.stop :]
         h, bs = run_b1(coda_layers, h, bs)
         assert self._v == self.nv
@@ -2132,6 +2134,7 @@ class BatchDecoder:
         cfg = tm.loopcd
         use_cd = cd_key is not None
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        skip_mask = mx.array(cd_key[4], dtype=mx.bool_) if (use_cd and len(cd_key) > 4) else None
         C = self.C
         nv = self.nv
         pre_n = sum(1 for v in range(0, core.start) if layers_seq[v].is_block_boundary)
@@ -2176,7 +2179,7 @@ class BatchDecoder:
                     bank4 = None
                     if apply_cd:
                         h, bs = loopcd.apply_hidden(
-                            h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg
+                            h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg, skip_mask=skip_mask
                         )
                 kv_news = [None] * nv
                 metas_map = [None] * nv
@@ -2240,6 +2243,7 @@ class BatchDecoder:
         cfg = tm.loopcd
         use_cd = cd_key is not None
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        skip_mask = mx.array(cd_key[4], dtype=mx.bool_) if (use_cd and len(cd_key) > 4) else None
         blend_bs = bool(cfg.blend_bs)
         C = self.C
         nv = self.nv
@@ -2285,7 +2289,7 @@ class BatchDecoder:
                     msgs = None
                     bank4 = None
                     if apply_cd:
-                        h, bs = loopcd.apply_hidden(h, bs, ref_h, ref_bs, pre_n, cfg)
+                        h, bs = loopcd.apply_hidden(h, bs, ref_h, ref_bs, pre_n, cfg, skip_mask=skip_mask)
                 prev_moe = None
                 last_v = v1 - 1
                 for j, v in enumerate(range(v0, v1)):
@@ -2339,6 +2343,7 @@ class BatchDecoder:
         cfg = tm.loopcd
         use_cd = cd_key is not None
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        skip_mask = mx.repeat(mx.array(cd_key[4], dtype=mx.bool_), int(W)) if (use_cd and len(cd_key) > 4) else None
         C = self.C
         B = C * int(W)
         nv = self.nv
@@ -2388,7 +2393,7 @@ class BatchDecoder:
                     bank4 = None
                     if apply_cd:
                         h, bs = loopcd.apply_hidden(
-                            h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg
+                            h, bs, h_aux, (list(bs_aux) if cfg.blend_bs else None), pre_n, cfg, skip_mask=skip_mask
                         )
                 kv_news = [None] * nv
                 metas_map = [None] * nv
@@ -2484,7 +2489,7 @@ class BatchDecoder:
         )
         use_cd = cfg.enabled_for(num_passes)
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
-        cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if use_cd else None
+        cd_key = self._loopcd_cd_key(cfg, ref_pass) if use_cd else None
         fuse_ck1 = os.environ.get("LOOPLING_FUSE_COMB_K1_BATCH", "0") not in ("0", "")
         fuse_k3b = (
             os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
@@ -2621,7 +2626,7 @@ class BatchDecoder:
                 (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N), max(Ss) >= 256)
                 for Ss in step_Ss
             )
-            cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if (use_cd and cfg.mode == "hidden") else None
+            cd_key = self._loopcd_cd_key(cfg, ref_pass, force_hidden=True) if (use_cd and cfg.mode == "hidden") else None
             fuse_k3b = (
                 os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
                 and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
@@ -2810,7 +2815,9 @@ class BatchDecoder:
                 keep_bs = cfg.blend_bs or do_logits_cd
                 ref_state = (h, list(bs) if keep_bs else None)
         if use_cd and cfg.mode == "hidden":
-            h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
+            h, bs = loopcd.apply_hidden(
+                h, bs, ref_state[0], ref_state[1], pre_n, cfg, skip_mask=self._loopcd_skip_mask(cfg)
+            )
         coda_layers = layers[core.stop :]
         h, bs = run_batch(coda_layers, h, bs)
         assert self._v == self.nv
@@ -2855,7 +2862,7 @@ class BatchDecoder:
         is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
         if h_ref is not None:
             z_R, z_ref = self._pair_logits_softcap(h, h_ref)
-            logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd)
+            logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd, skip_mask=self._loopcd_skip_mask(self.tm.loopcd))
         elif not is_greedy:
             tok = self._sample_verify_tokens(h.reshape(1, 2304), sampler).reshape(1).astype(mx.uint32)
             return self._with_stage_deps(tok), tap_buf
@@ -3304,7 +3311,7 @@ class BatchDecoder:
         cfg = tm.loopcd
         use_cd = cfg.enabled_for(num_passes) and cfg.mode == "hidden"
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
-        cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if use_cd else None
+        cd_key = self._loopcd_cd_key(cfg, ref_pass, force_hidden=True) if use_cd else None
         md_key = None if use_tau_table else max_depth
         sdpa_mid_cw = os.environ.get("LOOPLING_SDPA_MID_CW", "1") not in ("0", "")
         key = (
@@ -3655,7 +3662,9 @@ class BatchDecoder:
             if use_cd and p == ref_pass:
                 ref_state = (h, list(bs) if cfg.blend_bs else None)
         if use_cd and cfg.mode == "hidden":
-            h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
+            h, bs = loopcd.apply_hidden(
+                h, bs, ref_state[0], ref_state[1], pre_n, cfg, skip_mask=self._loopcd_skip_mask(cfg)
+            )
         h, bs = run_cw(layers[core.stop :], h, bs)
         assert v_idx == self.nv
         if tap_buf is not None and "o" in tap_set:
@@ -3849,7 +3858,9 @@ class BatchDecoder:
             if p == ref_pass:
                 ref_state = (h, bs)
         if use_cd and cfg.mode == "hidden":
-            h, bs = loopcd.apply_hidden(h, bs, ref_state[0], ref_state[1], pre_n, cfg)
+            h, bs = loopcd.apply_hidden(
+                h, bs, ref_state[0], ref_state[1], pre_n, cfg, skip_mask=self._loopcd_skip_mask(cfg)
+            )
         coda_layers = layers[core.stop :]
         h, bs = run(coda_layers, h, bs)
         assert self._v == self.nv
@@ -3915,13 +3926,37 @@ class BatchDecoder:
             return raw[: self.C], raw[self.C :]
         return self._project_logits_softcap(h_R), self._project_logits_softcap(h_ref)
 
+    def _loopcd_skip_flags(self, cfg) -> tuple[bool, ...] | None:
+        if not cfg.exclude_thinking:
+            return None
+        flags = tuple(loopcd.get_cache_skip(c) for c in self.caches)
+        return flags if any(flags) else None
+
+    def _loopcd_skip_mask(self, cfg):
+        flags = self._loopcd_skip_flags(cfg)
+        if flags is None:
+            return None
+        if all(flags):
+            return True
+        return mx.array(flags, dtype=mx.bool_)
+
+    def _loopcd_cd_key(self, cfg, ref_pass: int, *, force_hidden: bool = False):
+        flags = self._loopcd_skip_flags(cfg)
+        if flags is not None and all(flags):
+            return None
+        mode = "hidden" if force_hidden else cfg.mode
+        base = (mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs))
+        return base if flags is None else (*base, flags)
+
     def logits(self, h):
         if isinstance(h, tuple):
             h_R, h_ref = h
             if h_ref is None:
                 return self._with_stage_deps(self._project_logits_softcap(h_R))
             z_R, z_ref = self._pair_logits_softcap(h_R, h_ref)
-            return self._with_stage_deps(loopcd.combine_logits(z_R, z_ref, self.tm.loopcd))
+            return self._with_stage_deps(
+                loopcd.combine_logits(z_R, z_ref, self.tm.loopcd, skip_mask=self._loopcd_skip_mask(self.tm.loopcd))
+            )
         return self._with_stage_deps(self._project_logits_softcap(h))
 
     def logprobs(self, h, *, argmax: bool = False):
@@ -3956,7 +3991,7 @@ class BatchDecoder:
         h, h_ref = self._hidden_pair(tokens)
         if h_ref is not None:
             z_R, z_ref = self._pair_logits_softcap(h, h_ref)
-            logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd)
+            logits = loopcd.combine_logits(z_R, z_ref, self.tm.loopcd, skip_mask=self._loopcd_skip_mask(self.tm.loopcd))
         else:
             if "head" in _FUSED:
                 m = self.model

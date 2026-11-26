@@ -783,13 +783,15 @@ class SparseMoeBlock(nn.Module):
         if (
             group is None
             and P.enabled(hidden_states)
-            and selected_experts.size >= 64
+            and selected_experts.size >= 16
             and selected_experts.shape[-1] == 8
         ):
             ex = self.experts
             idx = mx.stop_gradient(selected_experts)
             if P.moe_gmm_ok(ex, hidden_states, idx):
                 return P.moe_gmm_forward(ex, hidden_states, idx, routing_weights)
+            if P.moe_short_ok(ex, hidden_states, idx):
+                return P.moe_short_forward(ex, hidden_states, idx, routing_weights)
             num_e = ex.gate_up_proj.num_experts
             if num_e % 32 == 0 and num_e <= 256 and hidden_states.shape[-1] % 8 == 0:
                 x, idx_s, inv_order = P.moe_gather_sort(hidden_states, idx, num_experts=num_e)

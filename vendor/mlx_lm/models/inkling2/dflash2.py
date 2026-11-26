@@ -15,6 +15,7 @@ from collections import deque
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2.rows import qmv as RQ
@@ -56,6 +57,23 @@ def _dyn_conv(x: mx.array, dyn: mx.array, base: mx.array, residual: mx.array | N
     w1 = base[stage, 1].astype(mx.float32) + d1.astype(mx.float32)
     xf = x.astype(mx.float32)
     prev = mx.concatenate([mx.zeros((1, hidden), mx.float32), xf[:-1]], axis=0)
+    val = xf * w0 + prev * w1
+    if residual is not None:
+        val = val + residual.astype(mx.float32)
+    return val.astype(mx.bfloat16)
+
+
+@mx.compile
+def _dyn_conv_batch(x: mx.array, dyn: mx.array, base: mx.array, residual: mx.array | None = None) -> mx.array:
+    """Batched 2-tap per-group dynamic conv over `(C, 8, H)` without cross-stream bleed."""
+    C_n, _, hidden = x.shape
+    stage = 0 if residual is None else 1
+    d0 = mx.broadcast_to(dyn[:, :, stage, 0, :, None], (C_n, 8, 144, 16)).reshape(C_n, 8, hidden)
+    d1 = mx.broadcast_to(dyn[:, :, stage, 1, :, None], (C_n, 8, 144, 16)).reshape(C_n, 8, hidden)
+    w0 = base[stage, 0].astype(mx.float32) + d0.astype(mx.float32)
+    w1 = base[stage, 1].astype(mx.float32) + d1.astype(mx.float32)
+    xf = x.astype(mx.float32)
+    prev = mx.concatenate([mx.zeros((C_n, 1, hidden), mx.float32), xf[:, :-1, :]], axis=1)
     val = xf * w0 + prev * w1
     if residual is not None:
         val = val + residual.astype(mx.float32)
@@ -139,6 +157,79 @@ def _get_df_compiled(nh: int, nkv: int, hd: int, inter: int, qbits: int):
         return _dyn_conv(m_out, dyn_m, m_base, res)
 
     ent = _DF_COMPILED[key] = (pre_rope, post_attn)
+    return ent
+
+
+_DF_BATCH_COMPILED: dict = {}
+
+
+def _get_df_batch_compiled(nh: int, nkv: int, hd: int, inter: int, qbits: int, theta: float):
+    key = (nh, nkv, hd, inter, qbits, float(theta))
+    ent = _DF_BATCH_COMPILED.get(key)
+    if ent is not None:
+        return ent
+
+    def _dlin(x: mx.array, w) -> mx.array:
+        if qbits:
+            if (
+                qbits == 4
+                and _USE_QMV4
+                and x.ndim == 2
+                and x.dtype == mx.bfloat16
+                and x.shape[0] <= 16
+                and x.shape[1] % 256 == 0
+                and x.shape[1] not in (64, 128)
+                and w[1].dtype == mx.bfloat16
+            ):
+                return RQ4.qmv4_rows(x, w[0], w[1], w[2])
+            return mx.quantized_matmul(
+                x, w[0], scales=w[1], biases=w[2], transpose=True, group_size=64, bits=qbits, mode="affine"
+            )
+        return x @ w
+
+    @mx.compile
+    def pre_rope_b(x_3d, in_ln, a_dyn, a_base, qkv_w, q_norm, k_norm, offs_arr):
+        Cn, blk, H = x_3d.shape
+        B_tot = Cn * blk
+        h_norm = mx.fast.rms_norm(x_3d.reshape(B_tot, H), in_ln, _EPS).reshape(Cn, blk, H)
+        dyn_a = _dlin(h_norm.reshape(B_tot, H), a_dyn).reshape(Cn, blk, 2, 2, 144)
+        c_in = _dyn_conv_batch(h_norm, dyn_a, a_base, None)
+        qkv = _dlin(c_in.reshape(B_tot, H), qkv_w)
+        q_w = nh * hd
+        k_w = nkv * hd
+        q_raw = mx.fast.rms_norm(qkv[:, :q_w].reshape(Cn, blk, nh, hd), q_norm, _EPS).transpose(0, 2, 1, 3)
+        k_raw = mx.fast.rms_norm(qkv[:, q_w : q_w + k_w].reshape(Cn, blk, nkv, hd), k_norm, _EPS).transpose(0, 2, 1, 3)
+        v_cur = qkv[:, q_w + k_w :].reshape(Cn, blk, nkv, hd).transpose(0, 2, 1, 3)
+        q_cur = mx.fast.rope(q_raw, hd, traditional=False, base=theta, scale=1.0, offset=offs_arr)
+        k_cur = mx.fast.rope(k_raw, hd, traditional=False, base=theta, scale=1.0, offset=offs_arr)
+        return q_cur, k_cur, v_cur, dyn_a
+
+    @mx.compile
+    def post_attn_b(x_3d, attn_2d, o_w, dyn_a, a_base, post_ln, m_dyn, m_base, gu_w, dn_w):
+        Cn, blk, H = x_3d.shape
+        B_tot = Cn * blk
+        proj = _dlin(attn_2d, o_w).reshape(Cn, blk, H)
+        res = _dyn_conv_batch(proj, dyn_a, a_base, x_3d)
+        m_norm = mx.fast.rms_norm(res.reshape(B_tot, H), post_ln, _EPS).reshape(Cn, blk, H)
+        dyn_m = _dlin(m_norm.reshape(B_tot, H), m_dyn).reshape(Cn, blk, 2, 2, 144)
+        m_in = _dyn_conv_batch(m_norm, dyn_m, m_base, None)
+        gu = _dlin(m_in.reshape(B_tot, H), gu_w)
+        m_out = _dlin(_swiglu(gu[:, :inter], gu[:, inter:]), dn_w).reshape(Cn, blk, H)
+        return _dyn_conv_batch(m_out, dyn_m, m_base, res)
+
+    @mx.compile
+    def sel_n1(raw_logits, sel_h, pred_cb, succ_cb, anc_nn, softcap: float):
+        top_idx = mx.argpartition(-raw_logits, 16, axis=-1)[:, :16]
+        unary = mx.take_along_axis(raw_logits, top_idx, axis=-1).astype(mx.float32)
+        succ0 = succ_cb[top_idx].astype(mx.float32)
+        pred0 = pred_cb[anc_nn].astype(mx.float32) * sel_h
+        edge0 = mx.matmul(succ0, pred0[:, :, None])[:, :, 0]
+        sum0 = unary + edge0
+        sc0 = softcap * mx.tanh(sum0 / softcap) if softcap > 0.0 else sum0
+        best_slot = mx.argmax(sc0, axis=-1)
+        return mx.take_along_axis(top_idx, best_slot[:, None], axis=-1)[:, 0]
+
+    ent = _DF_BATCH_COMPILED[key] = (pre_rope_b, post_attn_b, sel_n1)
     return ent
 
 
@@ -270,6 +361,67 @@ class LookupIndex:
         start = self.match_end + 1
         stop = min(start + count, len(self.tokens))
         return self.tokens[start:stop]
+
+    def clone(self) -> "LookupIndex":
+        cp = LookupIndex()
+        cp.tokens = self.tokens.copy()
+        cp._len = self._len.copy()
+        cp._link = self._link.copy()
+        cp._next = [dict(d) for d in self._next]
+        cp._end = self._end.copy()
+        cp._last = self._last
+        cp.match_len = self.match_len
+        cp.match_end = self.match_end
+        return cp
+
+
+class DFlash2StreamState:
+    """Per-stream drafter KV context + LookupIndex sharing one DFlash2Drafter weight set."""
+
+    def __init__(self, nl: int, nkv: int, hd: int, dtype: mx.Dtype = mx.bfloat16, *, allocate: bool = True):
+        self.nl = int(nl)
+        self.nkv = int(nkv)
+        self.hd = int(hd)
+        self.dtype = dtype
+        self.ck: list[mx.array | None] = [None] * self.nl
+        self.cv: list[mx.array | None] = [None] * self.nl
+        self.n = 0
+        self.lookup = LookupIndex()
+        if allocate:
+            self.ensure_cap(2048)
+
+    def ensure_cap(self, need: int) -> None:
+        cur = 0 if self.ck[0] is None else int(self.ck[0].shape[2])
+        if need <= cur:
+            return
+        new_cap = max(2048, ((need + 1023) // 1024) * 1024)
+        for i in range(self.nl):
+            nk = mx.zeros((1, self.nkv, new_cap, self.hd), self.dtype)
+            nv = mx.zeros((1, self.nkv, new_cap, self.hd), self.dtype)
+            if self.ck[i] is not None and self.n > 0:
+                nk[:, :, : self.n, :] = self.ck[i][:, :, : self.n, :]
+                nv[:, :, : self.n, :] = self.cv[i][:, :, : self.n, :]
+            self.ck[i], self.cv[i] = nk, nv
+
+    def clone(self) -> "DFlash2StreamState":
+        cp = DFlash2StreamState(self.nl, self.nkv, self.hd, self.dtype, allocate=False)
+        cp.n = int(self.n)
+        cp.lookup = self.lookup.clone()
+        cp.ck = [None if a is None else (a + mx.zeros((), a.dtype)) for a in self.ck]
+        cp.cv = [None if a is None else (a + mx.zeros((), a.dtype)) for a in self.cv]
+        return cp
+
+
+_DFLASH2_BATCH_MAX_C = max(1, min(8, int(os.environ.get("LOOPLING_DFLASH2_BATCH_MAX_C", "4"))))
+
+
+def _default_batch_w(C: int) -> int:
+    ov = os.environ.get("LOOPLING_DFLASH2_BATCH_W")
+    if ov:
+        return max(2, min(8, int(ov)))
+    if C <= 2:
+        return 3
+    return 2
 
 
 # ---------------------------------------------------------------------------------------------------- Splash VerifyBudget
@@ -1061,6 +1213,184 @@ class DFlash2Drafter:
             anchor_tok, w_max=width, budget=None, step_costs=None, lookup_props=None, use_tree=True
         )
         return toks, parents, depths
+
+    def new_stream_state(self, *, allocate: bool = True) -> DFlash2StreamState:
+        return DFlash2StreamState(self.nl, self.nkv, self.hd, self._kv_dtype, allocate=allocate)
+
+    def append_ctx_batch(self, states: list[DFlash2StreamState], feats_per_stream: list[mx.array]) -> None:
+        """Project target taps for C streams in one batched fc + 5*kv matmul and scatter into each stream state."""
+        ks = [int(f.shape[1]) if f.ndim == 4 else int(f.shape[0]) for f in feats_per_stream]
+        tot = sum(ks)
+        if tot == 0:
+            return
+        for st, kc in zip(states, ks):
+            if kc > 0:
+                st.ensure_cap(st.n + kc + self.block)
+        flat = mx.concatenate(
+            [f.reshape(kc, 4 * self.H) for f, kc in zip(feats_per_stream, ks) if kc > 0], axis=0
+        )
+        ctx = _rms(self._lin(flat, self.fc), self.hidden_norm)
+        kw = self.nkv * self.hd
+        offs0 = [st.n for st in states]
+        for i, lw in enumerate(self.layers):
+            kv = self._lin(ctx, lw["kv"])
+            k_all = _rms(kv[:, :kw].reshape(tot, self.nkv, self.hd), lw["k_norm"])
+            v_all = kv[:, kw:].reshape(tot, self.nkv, self.hd)
+            pos = 0
+            for c_idx, (st, kc) in enumerate(zip(states, ks)):
+                if kc <= 0:
+                    continue
+                k_c = k_all[pos : pos + kc].reshape(1, kc, self.nkv, self.hd).transpose(0, 2, 1, 3)
+                k_c = mx.fast.rope(k_c, self.hd, traditional=False, base=self.theta, scale=1.0, offset=offs0[c_idx])
+                v_c = v_all[pos : pos + kc].reshape(1, kc, self.nkv, self.hd).transpose(0, 2, 1, 3)
+                ck_i = st.ck[i]
+                st.ck[i] = None
+                st.ck[i] = mx.slice_update(ck_i, k_c, FD._wpos(offs0[c_idx]), axes=(2,))
+                cv_i = st.cv[i]
+                st.cv[i] = None
+                st.cv[i] = mx.slice_update(cv_i, v_c, FD._wpos(offs0[c_idx]), axes=(2,))
+                pos += kc
+        for st, kc in zip(states, ks):
+            st.n += kc
+
+    def draft_batch_chains(
+        self,
+        states: list[DFlash2StreamState],
+        anchors_c: list[int] | mx.array,
+        W: int,
+        *,
+        use_lookup: bool = True,
+    ) -> mx.array:
+        """Draft `(C, W)` int32 greedy chains for C active streams sharing one batched drafter forward."""
+        W = max(2, min(self.block, int(W)))
+        C = len(states)
+        if isinstance(anchors_c, mx.array):
+            anc_list = anchors_c.tolist()
+            anc_arr_all = anchors_c.reshape(C).astype(mx.int32)
+        else:
+            anc_list = [int(a) for a in anchors_c]
+            anc_arr_all = mx.array(anc_list, mx.int32)
+
+        out_rows: list[list[int] | None] = [None] * C
+        nn_idx: list[int] = []
+        for c, st in enumerate(states):
+            lp = st.lookup
+            if use_lookup and _LOOKUP_BYPASS_MIN > 0 and lp.match_len >= _LOOKUP_BYPASS_MIN:
+                props = lp.proposals(W - 1)
+                if len(props) >= W - 1:
+                    out_rows[c] = [anc_list[c]] + props[: W - 1]
+                    continue
+            nn_idx.append(c)
+
+        if not nn_idx:
+            return mx.array(out_rows, mx.int32)
+
+        Cn = len(nn_idx)
+        anc_nn = mx.array([anc_list[c] for c in nn_idx], mx.int32)
+        anc_embs = self.target.model.language_model.embed(anc_nn.reshape(Cn, 1))[:, 0, :]  # (Cn, H)
+        m7 = mx.broadcast_to(self._mask_7[None, :, :], (Cn, self.block - 1, self.H))
+        x = mx.concatenate([anc_embs[:, None, :], m7], axis=1)  # (Cn, 8, H)
+        B_tot = Cn * self.block
+        scale = self.hd ** -0.5
+
+        ctx_lens = [max(0, states[c].n - max(0, states[c].n - self.window)) for c in nn_idx]
+        ctx_starts = [max(0, states[c].n - self.window) for c in nn_idx]
+        ctx_max = max(ctx_lens) if ctx_lens else 0
+
+        attn_mask = None
+        if ctx_max > 0 and any(cl != ctx_max for cl in ctx_lens):
+            m_np = np.zeros((Cn, 1, self.block, ctx_max + self.block), dtype=np.float32)
+            for idx_c, cl in enumerate(ctx_lens):
+                if cl < ctx_max:
+                    m_np[idx_c, :, :, cl:ctx_max] = -1e9
+            attn_mask = mx.array(m_np).astype(mx.bfloat16)
+
+        offs_arr = mx.array([states[c].n for c in nn_idx], mx.int32)
+        pre_rope_b, post_attn_b, sel_n1 = _get_df_batch_compiled(
+            self.nh, self.nkv, self.hd, self.inter, self.qbits, self.theta
+        )
+        pads = [
+            mx.zeros((1, self.nkv, ctx_max - cl, self.hd), self._kv_dtype) if (ctx_max > 0 and cl < ctx_max) else None
+            for cl in ctx_lens
+        ]
+        for i, lw in enumerate(self.layers):
+            q_cur, k_cur, v_cur, dyn_a = pre_rope_b(
+                x, lw["in_ln"], lw["a_dyn"], lw["a_base"], lw["qkv"], lw["q_norm"], lw["k_norm"], offs_arr
+            )
+            if ctx_max > 0:
+                ks_ctx, vs_ctx = [], []
+                for idx_c, c in enumerate(nn_idx):
+                    cl = ctx_lens[idx_c]
+                    s0 = ctx_starts[idx_c]
+                    kc = states[c].ck[i][:, :, s0 : states[c].n, :]
+                    vc = states[c].cv[i][:, :, s0 : states[c].n, :]
+                    pad = pads[idx_c]
+                    if pad is not None:
+                        kc = mx.concatenate([kc, pad], axis=2)
+                        vc = mx.concatenate([vc, pad], axis=2)
+                    ks_ctx.append(kc)
+                    vs_ctx.append(vc)
+                k_all = mx.concatenate([mx.concatenate(ks_ctx, axis=0), k_cur], axis=2)
+                v_all = mx.concatenate([mx.concatenate(vs_ctx, axis=0), v_cur], axis=2)
+            else:
+                k_all, v_all = k_cur, v_cur
+            attn = mx.fast.scaled_dot_product_attention(q_cur, k_all, v_all, scale=scale, mask=attn_mask)
+            attn = attn.transpose(0, 2, 1, 3).reshape(B_tot, self.nh * self.hd)
+            x = post_attn_b(
+                x, attn, lw["o_proj"], dyn_a, lw["a_base"], lw["post_ln"], lw["m_dyn"], lw["m_base"], lw["gu"], lw["down"]
+            )
+
+        n_pos = W - 1
+        hid = _rms(x.reshape(B_tot, self.H), self.final_norm).reshape(Cn, self.block, self.H)[:, 1 : 1 + n_pos, :]
+        hid_flat = hid.reshape(Cn * n_pos, self.H)
+        if self._lm_q4 is not None:
+            wq4, sc4, bi4 = self._lm_q4
+            raw_logits = mx.quantized_matmul(
+                hid_flat, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
+            )
+        elif self._lm_aff8:
+            raw_logits = RQ.qmv_rows(hid_flat, *self._lm_t)[:, : self._unpadded_vocab]
+        else:
+            raw_logits = self.target.lm_head(hid_flat)[:, : self._unpadded_vocab]
+        sel_h = self._lin(hid_flat, self.sel_proj).astype(mx.float32).reshape(Cn, n_pos, self.rank)
+
+        if n_pos == 1:
+            nxt_tok = sel_n1(raw_logits, sel_h[:, 0], self.pred_cb, self.succ_cb, anc_nn, self.softcap)
+            mx.eval(nxt_tok)
+            for idx_c, nt in zip(nn_idx, nxt_tok.tolist()):
+                out_rows[idx_c] = [anc_list[idx_c], int(nt)]
+        else:
+            top_idx = mx.argpartition(-raw_logits, 16, axis=-1)[:, :16]
+            unary = mx.take_along_axis(raw_logits, top_idx, axis=-1).astype(mx.float32)
+            top_idx_c = top_idx.reshape(Cn, n_pos, 16)
+            unary_c = unary.reshape(Cn, n_pos, 16)
+            sc0_list, sc16_list = [], []
+            for idx_c in range(Cn):
+                _, sc0_i, sc16_i = _selector_scores_from_top16(
+                    top_idx_c[idx_c], unary_c[idx_c], sel_h[idx_c], self.pred_cb, self.succ_cb, anc_nn[idx_c], self.softcap,
+                )
+                sc0_list.append(sc0_i)
+                sc16_list.append(sc16_i)
+            sc0_all = mx.stack(sc0_list, axis=0)
+            sc16_all = mx.stack(sc16_list, axis=0)
+            mx.eval(top_idx_c, sc0_all, sc16_all)
+            tl_all = top_idx_c.tolist()
+            s0_all = sc0_all.tolist()
+            s16_all = sc16_all.tolist()
+            for idx_c, c in enumerate(nn_idx):
+                s0 = s0_all[idx_c]
+                s16 = s16_all[idx_c]
+                tl = tl_all[idx_c]
+                slot = max(range(len(s0)), key=s0.__getitem__)
+                row = [anc_list[c], int(tl[0][slot])]
+                for p in range(1, n_pos):
+                    r_p = s16[p - 1][slot]
+                    slot = max(range(len(r_p)), key=r_p.__getitem__)
+                    row.append(int(tl[p][slot]))
+                out_rows[c] = row
+        # Overlay short LookupIndex proposals (len >= 3) if available? Wait: greedy lookup wins when >= MIN_MATCH?
+        # Keep pure neural chain unless >= _LOOKUP_BYPASS_MIN, matching draft_hybrid_tree lookup_bypass gating.
+        return mx.array(out_rows, mx.int32)
 
 
 _DF2_INST: dict = {}

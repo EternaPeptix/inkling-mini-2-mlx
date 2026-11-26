@@ -247,8 +247,8 @@ def _run_mid(
         if not flat or debug or packed_kv_b:
             raise ValueError("causal_w requires flat=True and debug=False")
         packed_kv = True
-        if cs0.shape != (1, 3, C) or cs0.dtype != mx.float32 or cs1.shape != (1, 3, C) or cs1.dtype != mx.float32:
-            raise ValueError("causal_w cs0/cs1 must be (1, 3, C) f32")
+        if cs0.ndim != 3 or cs0.shape[1:] != (3, C) or cs0.dtype != mx.float32 or cs1.shape != cs0.shape or cs1.dtype != mx.float32:
+            raise ValueError("causal_w cs0/cs1 must be (S, 3, C) f32")
     else:
         B = cs0.shape[0]
         if packed_kv and packed_kv_b:

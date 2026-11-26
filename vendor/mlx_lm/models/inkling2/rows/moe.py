@@ -1403,14 +1403,13 @@ def _combine_conv_causal_src(dbg, scale_lit, has_w_act=False):
         }
         moe_x[b] = float(bfloat16_t(glue_moe_combine8(ev, wv)));
     }
-    float cs_v[3] = {cs3[c], cs3[CC + c], cs3[2 * CC + c]};
     for (int b = 0; b < @WLIM@; b++) {
         int a0 = conv_anc[b * 3 + 0];
         int a1 = conv_anc[b * 3 + 1];
         int a2 = conv_anc[b * 3 + 2];
-        float r0 = (a0 >= 0) ? moe_x[a0] : cs_v[-1 - a0];
-        float r1 = (a1 >= 0) ? moe_x[a1] : cs_v[-1 - a1];
-        float r2 = (a2 >= 0) ? moe_x[a2] : cs_v[-1 - a2];
+        float r0 = (a0 >= 0) ? moe_x[a0] : cs3[(-1 - a0) * CC + c];
+        float r1 = (a1 >= 0) ? moe_x[a1] : cs3[(-1 - a1) * CC + c];
+        float r2 = (a2 >= 0) ? moe_x[a2] : cs3[(-1 - a2) * CC + c];
         float x0 = moe_x[b];
         float s0 = float(bfloat16_t(r0)), s1 = float(bfloat16_t(r1)), s2 = float(bfloat16_t(r2));
         float acc = 0.0f;
@@ -2006,8 +2005,8 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
     (, moe_out (B,C) bf16, post_mlp_conv (B,C) bf16, down (B,8,C) bf16 if debug)]."""
     B, E, K = sw.shape
     C = w.shape[1]
-    expected_cs_b = 1 if causal else B
-    if B > 16 or E != 8 or sw.dtype != mx.bfloat16 or residual.shape != (B, C) or cs3.shape != (expected_cs_b, 3, C):
+    cs3_ok = (cs3.ndim == 3 and cs3.shape[1:] == (3, C)) if causal else (cs3.shape == (B, 3, C))
+    if B > 16 or E != 8 or sw.dtype != mx.bfloat16 or residual.shape != (B, C) or not cs3_ok:
         raise ValueError("down_rows: shapes / dtypes")
     if residual.dtype != mx.float32 or cs3.dtype != mx.float32 or conv_w.dtype != mx.bfloat16 or conv_w.size != C * 4:
         raise ValueError("down_rows: residual/cs3 f32, conv weight bf16 (C,4)")

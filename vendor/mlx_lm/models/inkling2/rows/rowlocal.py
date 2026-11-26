@@ -580,9 +580,11 @@ def _k1_from_down_impl(
     _check(resid, (D,), _F32, "resid")
     if resid.shape[0] != B:
         raise ValueError("resid batch mismatch")
-    cs3_b = 1 if causal else B
-    if cs3.dtype != _F32 or cs3.shape != (cs3_b, 3, D):
-        raise ValueError(f"cs3: expected float32 ({cs3_b},3,{D}), got {cs3.dtype} {cs3.shape}")
+    if causal:
+        if cs3.dtype != _F32 or cs3.ndim != 3 or cs3.shape[1:] != (3, D):
+            raise ValueError(f"cs3 causal: expected float32 (*,3,{D}), got {cs3.dtype} {cs3.shape}")
+    elif cs3.dtype != _F32 or cs3.shape != (B, 3, D):
+        raise ValueError(f"cs3: expected float32 {(B, 3, D)}, got {cs3.dtype} {cs3.shape}")
     if conv_w.dtype != _BF or conv_w.size != D * 4:
         raise ValueError("conv_w: expected bfloat16 of size D*4")
     if causal:
@@ -1085,8 +1087,8 @@ def k10_post(o_proj, h, nr, bs, cs2, conv_w, query, ln_w, msg, *, boundary, eps_
     for x, dt, nm in ((o_proj, _BF, "o_proj"), (h, _BF, "h"), (nr, _F32, "nr"), (ln_w, _BF, "ln_w")):
         _check(x, (D,), dt, nm)
     if causal:
-        if cs2.dtype != _F32 or cs2.shape != (1, 3, D):
-            raise ValueError(f"cs2 causal: expected float32 {(1, 3, D)}, got {cs2.dtype} {cs2.shape}")
+        if cs2.dtype != _F32 or cs2.ndim != 3 or cs2.shape[1:] != (3, D):
+            raise ValueError(f"cs2 causal: expected float32 (*, 3, {D}), got {cs2.dtype} {cs2.shape}")
     elif cs2.dtype != _F32 or cs2.shape != (B, 3, D):
         raise ValueError(f"cs2: expected float32 {(B, 3, D)}, got {cs2.dtype} {cs2.shape}")
     if conv_w.dtype != _BF or conv_w.size != D * 4:

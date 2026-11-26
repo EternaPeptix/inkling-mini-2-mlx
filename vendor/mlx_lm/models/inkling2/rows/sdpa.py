@@ -2981,6 +2981,564 @@ def sdpa_rows_staged(
     return out
 
 
+# =============================================================================================== Multi-stream causal staged SDPA
+_MCW = 8  # end_m, slot_main, rot, rot_wrap, max_size, kcap, vcap, st_len
+
+_STAGED_MULTI_HEADER = _HEADER + r"""
+template <typename T, typename PBT, int D, int NS, bool HAS_GATE>
+METAL_FUNC void sdpa1_head_v32_multi_causal(
+    const device T* queries, const device T* K_main, const device T* V_main,
+    const device T* Kst, const device T* Vst, const device T* Knew, const device T* Vnew,
+    const device T* gate, device T* out, const int N, const float scale, const float sink,
+    const RowMask<T, PBT> msk, const int slot_main, const int rot_wrap, const int max_size,
+    const int st_len, const int dd, threadgroup float* outputs, threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores, uint simd_gid, uint simd_lid) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int NV = BN / NS;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  typedef float U;
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread];
+  const int loff = (int)simd_lid * qk_per_thread;
+  queries += loff;
+  bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+  q[0] = static_cast<U>(scale) * qb.x;
+  q[1] = static_cast<U>(scale) * qb.y;
+  q[2] = static_cast<U>(scale) * qb.z;
+  q[3] = static_cast<U>(scale) * qb.w;
+  for (int v = 0; v < NV; v++) {
+    int vg = (int)simd_gid + v * NS;
+    for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+    if (vg == 0) {
+      max_score = sink;
+      sum_exp_score = 1;
+    }
+    for (int i = vg; i < N; i += BN) {
+      float fm = 0;
+      if (msk.at(i, fm)) {
+        int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+        const device T* kp;
+        const device T* vp;
+        if (ds >= st_len && ds <= st_len + dd) {
+          int off = ds - st_len;
+          kp = Knew + (size_t)off * D + loff;
+          vp = Vnew + (size_t)off * D + loff;
+        } else if (ds >= 0 && ds < st_len) {
+          kp = Kst + (size_t)ds * D + loff;
+          vp = Vst + (size_t)ds * D + loff;
+        } else {
+          kp = K_main + (size_t)i * D + loff;
+          vp = V_main + (size_t)i * D + loff;
+        }
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      }
+    }
+    if (simd_lid == 0) {
+      max_scores[vg] = max_score;
+      sum_exp_scores[vg] = sum_exp_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[(i * BD + simd_lid) * BN + vg] = o[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  U max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  U sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  for (int f = (int)simd_gid; f < BD; f += NS) {
+    for (int i = 0; i < v_per_thread; i++) {
+      o[i] = simd_sum(outputs[(i * BD + f) * BN + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    }
+    if (simd_lid == 0) {
+      int base = f * v_per_thread;
+      if constexpr (HAS_GATE) {
+        bfloat4 gb = as_type<bfloat4>(((const device uint2*)(gate + base))[0]);
+        bfloat4 ob = bfloat4(
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
+        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      } else {
+        bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+        ((device uint2*)(out + base))[0] = as_type<uint2>(ob);
+      }
+    }
+  }
+}
+
+template <typename T, typename PBT, int D, int BLOCKS>
+METAL_FUNC void sdpa2_block_multi_causal(
+    const device T* queries, const device T* K_main, const device T* V_main,
+    const device T* Kst, const device T* Vst, const device T* Knew, const device T* Vnew,
+    device T* out, device float* sums, device float* maxs, const int N, const float scale,
+    const float sink, const RowMask<T, PBT> msk, const int slot_main, const int rot_wrap,
+    const int max_size, const int st_len, const int dd, const int block_idx, uint simd_lid) {
+  constexpr int TK = 4;
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = D / BD;
+  constexpr int blocks = BLOCKS;
+  typedef float U;
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread] = {0};
+  const int loff = (int)simd_lid * qk_per_thread;
+  queries += loff;
+  out += loff;
+  bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+  q[0] = static_cast<U>(scale) * qb.x;
+  q[1] = static_cast<U>(scale) * qb.y;
+  q[2] = static_cast<U>(scale) * qb.z;
+  q[3] = static_cast<U>(scale) * qb.w;
+  U max_score = Limits<U>::finite_min;
+  U sum_exp_score = 0;
+  if (block_idx == 0) {
+    max_score = sink;
+    sum_exp_score = 1;
+  }
+  int i = block_idx;
+  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+    bfloat4 k_reg[TK];
+    bfloat4 v_reg[TK];
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+      const device T* kp;
+      if (ds >= st_len && ds <= st_len + dd) kp = Knew + (size_t)(ds - st_len) * D + loff;
+      else if (ds >= 0 && ds < st_len) kp = Kst + (size_t)ds * D + loff;
+      else kp = K_main + (size_t)ii * D + loff;
+      k_reg[t] = as_type<bfloat4>(((const device uint2*)kp)[0]);
+    }
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+      const device T* vp;
+      if (ds >= st_len && ds <= st_len + dd) vp = Vnew + (size_t)(ds - st_len) * D + loff;
+      else if (ds >= 0 && ds < st_len) vp = Vst + (size_t)ds * D + loff;
+      else vp = V_main + (size_t)ii * D + loff;
+      v_reg[t] = as_type<bfloat4>(((const device uint2*)vp)[0]);
+    }
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      float fm = 0;
+      if (msk.at(ii, fm)) {
+        U score = 0;
+        score += q[0] * static_cast<U>(k_reg[t].x);
+        score += q[1] * static_cast<U>(k_reg[t].y);
+        score += q[2] * static_cast<U>(k_reg[t].z);
+        score += q[3] * static_cast<U>(k_reg[t].w);
+        score = simd_sum(score);
+        score += static_cast<U>(fm);
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
+        o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
+        o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
+        o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+      }
+    }
+  }
+  for (; i < N; i += blocks) {
+    float fm = 0;
+    if (msk.at(i, fm)) {
+      int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+      const device T* kp;
+      const device T* vp;
+      if (ds >= st_len && ds <= st_len + dd) {
+        int off = ds - st_len;
+        kp = Knew + (size_t)off * D + loff;
+        vp = Vnew + (size_t)off * D + loff;
+      } else if (ds >= 0 && ds < st_len) {
+        kp = Kst + (size_t)ds * D + loff;
+        vp = Vst + (size_t)ds * D + loff;
+      } else {
+        kp = K_main + (size_t)i * D + loff;
+        vp = V_main + (size_t)i * D + loff;
+      }
+      bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
+      U score = 0;
+      score += q[0] * kb.x;
+      score += q[1] * kb.y;
+      score += q[2] * kb.z;
+      score += q[3] * kb.w;
+      score = simd_sum(score);
+      score += fm;
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+      bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
+      o[0] = o[0] * factor + exp_score * vb.x;
+      o[1] = o[1] * factor + exp_score * vb.y;
+      o[2] = o[2] * factor + exp_score * vb.z;
+      o[3] = o[3] * factor + exp_score * vb.w;
+    }
+  }
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+  bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+  ((device uint2*)out)[0] = as_type<uint2>(ob);
+}
+"""
+
+_MC_COMMON = r"""
+    int c = r / WW;
+    int dd = r % WW;
+    const int end_m = meta[c * 8 + 0];
+    const int slot_main = meta[c * 8 + 1];
+    const int rot = meta[c * 8 + 2];
+    const int rot_wrap = meta[c * 8 + 3];
+    const int max_size = meta[c * 8 + 4];
+    const int kcap = meta[c * 8 + 5];
+    const int vcap = meta[c * 8 + 6];
+    const int st_len = meta[c * 8 + 7];
+    const int end_r = end_m + st_len + dd + 1;
+    const int S = rot ? min(end_r, max_size) : end_r;
+    const int idx_r = rot ? (rot_wrap ? (((slot_main + st_len + dd) % max_size) + 1) : end_r) : 0;
+"""
+
+_MULTI_CAUSAL_SHORT_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int r = (int)t / HQ;
+    int h = (int)t % HQ;
+    int kvh = h / GQA;
+    int rh = (int)t;
+""" + _MC_COMMON + r"""
+    const device T* K; const device T* V;
+    SELECT_KV
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = end_r; msk.idx = idx_r; msk.rot = rot;
+    msk.R = R; msk.window = WIN;
+    msk.pb = pb + (size_t)rh * R;
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    const device T* Kst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+    const device T* Vst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+    const device T* Knew = kv_new + ((size_t)kvh * (CC * WW) + (size_t)c * WW) * D;
+    const device T* Vnew = kv_new + ((size_t)(HKV + kvh) * (CC * WW) + (size_t)c * WW) * D;
+    float sink = float(static_cast<T>(qkv[SINK_OFF + (size_t)r * SINK_STRIDE + h]));
+    sdpa1_head_v32_multi_causal<T, PBT, D, NS, true>(
+        q + (size_t)rh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+        Kst, Vst, Knew, Vnew,
+        qkv + GATE_OFF + (size_t)r * GATE_STRIDE + (size_t)h * D, o1 + (size_t)rh * D,
+        S, scale[0], sink, msk, slot_main, rot_wrap, max_size, st_len, dd,
+        outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+"""
+
+_MULTI_CAUSAL_2P_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    constexpr int NTG2 = HKV * TGPK;
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int r = (int)t / NTG2;
+    int tl = (int)t % NTG2;
+""" + _MC_COMMON + r"""
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = end_r; msk.idx = idx_r; msk.rot = rot;
+    msk.R = R; msk.window = WIN;
+    const float sc = scale[0];
+    int kvh = tl / TGPK;
+    int f = (tl % TGPK) * NS + (int)simd_gid;
+    if (f < BLOCKS * GQA) {
+        int block = f / GQA;
+        int h = kvh * GQA + f % GQA;
+        int rh = r * HQ + h;
+        msk.pb = pb + (size_t)rh * R;
+        const device T* Kst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+        const device T* Vst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+        const device T* Knew = kv_new + ((size_t)kvh * (CC * WW) + (size_t)c * WW) * D;
+        const device T* Vnew = kv_new + ((size_t)(HKV + kvh) * (CC * WW) + (size_t)c * WW) * D;
+        sdpa2_block_multi_causal<T, PBT, D, BLOCKS>(
+            q + (size_t)rh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+            Kst, Vst, Knew, Vnew,
+            partials + ((size_t)rh * BLOCKS + block) * D, sums + (size_t)rh * BLOCKS + block,
+            maxs + (size_t)rh * BLOCKS + block, S, sc,
+            float(static_cast<T>(qkv[SINK_OFF + (size_t)r * SINK_STRIDE + h])),
+            msk, slot_main, rot_wrap, max_size, st_len, dd, block, simd_lid);
+    }
+"""
+
+_MULTI_CAUSAL_MIX_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TGPK = (BLOCKS * GQA + NS - 1) / NS;
+    constexpr int NTG2 = HKV * TGPK;
+    threadgroup float outputs[4 * 1024];
+    threadgroup float max_scores[32];
+    threadgroup float sum_exp_scores[32];
+    uint t = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int r = 0, acc = 0;
+    for (; r < CC * WW; ++r) {
+        int cr = r / WW, dr = r % WW;
+        int er = meta[cr * 8 + 0] + meta[cr * 8 + 7] + dr + 1;
+        int sr = meta[cr * 8 + 2] ? min(er, meta[cr * 8 + 4]) : er;
+        int n = sr >= 1024 ? NTG2 : HQ;
+        if ((int)t < acc + n) break;
+        acc += n;
+    }
+    int tl = (int)t - acc;
+""" + _MC_COMMON + r"""
+    const device T* K; const device T* V;
+    SELECT_KV
+    const int kv_lidx = st_info[0];
+    const int scap = st_info[1];
+    RowMask<T, PBT> msk;
+    msk.S = S; msk.end = end_r; msk.idx = idx_r; msk.rot = rot;
+    msk.R = R; msk.window = WIN;
+    const float sc = scale[0];
+    if (S < 1024) {
+        int h = tl;
+        int kvh = h / GQA;
+        int rh = r * HQ + h;
+        msk.pb = pb + (size_t)rh * R;
+        const device T* Kst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+        const device T* Vst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+        const device T* Knew = kv_new + ((size_t)kvh * (CC * WW) + (size_t)c * WW) * D;
+        const device T* Vnew = kv_new + ((size_t)(HKV + kvh) * (CC * WW) + (size_t)c * WW) * D;
+        sdpa1_head_v32_multi_causal<T, PBT, D, 32, true>(
+            q + (size_t)rh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+            Kst, Vst, Knew, Vnew,
+            qkv + GATE_OFF + (size_t)r * GATE_STRIDE + (size_t)h * D, o1 + (size_t)rh * D,
+            S, sc, float(static_cast<T>(qkv[SINK_OFF + (size_t)r * SINK_STRIDE + h])),
+            msk, slot_main, rot_wrap, max_size, st_len, dd, outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
+    } else {
+        int kvh = tl / TGPK;
+        int f = (tl % TGPK) * NS + (int)simd_gid;
+        if (f < BLOCKS * GQA) {
+            int block = f / GQA;
+            int h = kvh * GQA + f % GQA;
+            int rh = r * HQ + h;
+            msk.pb = pb + (size_t)rh * R;
+            const device T* Kst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 0) * HKV + kvh) * (size_t)scap * D;
+            const device T* Vst = stage + ((((size_t)kv_lidx * CC + c) * 2 + 1) * HKV + kvh) * (size_t)scap * D;
+            const device T* Knew = kv_new + ((size_t)kvh * (CC * WW) + (size_t)c * WW) * D;
+            const device T* Vnew = kv_new + ((size_t)(HKV + kvh) * (CC * WW) + (size_t)c * WW) * D;
+            sdpa2_block_multi_causal<T, PBT, D, BLOCKS>(
+                q + (size_t)rh * D, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D,
+                Kst, Vst, Knew, Vnew,
+                partials + ((size_t)rh * BLOCKS + block) * D, sums + (size_t)rh * BLOCKS + block,
+                maxs + (size_t)rh * BLOCKS + block, S, sc,
+                float(static_cast<T>(qkv[SINK_OFF + (size_t)r * SINK_STRIDE + h])),
+                msk, slot_main, rot_wrap, max_size, st_len, dd, block, simd_lid);
+        }
+    }
+"""
+
+_MULTI_CAUSAL_S2_SRC = r"""
+    constexpr int D = 128;
+    threadgroup float outputs[4 * 1024];
+    uint rh = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint tix = thread_position_in_threadgroup.x;
+    int r = int(rh) / HQ;
+    int h = int(rh) % HQ;
+    int c = r / WW;
+    int dd = r % WW;
+    int end_r = meta[c * 8 + 0] + meta[c * 8 + 7] + dd + 1;
+    int S = meta[c * 8 + 2] ? min(end_r, meta[c * 8 + 4]) : end_r;
+    if (S >= 1024) {
+        sdpa2_reduce<T, D, true>(
+            partials + (size_t)rh * BLOCKS * D, sums + (size_t)rh * BLOCKS,
+            maxs + (size_t)rh * BLOCKS,
+            qkv + GATE_OFF + (size_t)r * GATE_STRIDE + (size_t)h * D,
+            out + (size_t)rh * D,
+            BLOCKS, outputs, simd_gid, simd_lid);
+    } else if (tix < D) {
+        out[(size_t)rh * D + tix] = o1[(size_t)rh * D + tix];
+    }
+"""
+
+_multi_causal_kernels: dict = {}
+
+
+def _get_multi_causal_kernels(C):
+    ks = _multi_causal_kernels.get(C)
+    if ks is None:
+        sel = "switch (c) {\n" + "".join(
+            f"        case {i}: K = k{i}; V = v{i}; break;\n" for i in range(C)
+        ) + "        default: K = k0; V = v0; break;\n    }"
+        kv_names = [f"k{i}" for i in range(C)] + [f"v{i}" for i in range(C)]
+        ins_base = ["q", "pb", "qkv", "meta", "scale", "st_info", "stage", "kv_new"] + kv_names
+        s1_short = mx.fast.metal_kernel(
+            name=f"multi_causal_short_c{C}",
+            input_names=ins_base,
+            output_names=["o1"],
+            source=_MULTI_CAUSAL_SHORT_SRC.replace("SELECT_KV", sel),
+            header=_STAGED_MULTI_HEADER,
+            ensure_row_contiguous=False,
+        )
+        s1_2p = mx.fast.metal_kernel(
+            name=f"multi_causal_2p_c{C}",
+            input_names=ins_base,
+            output_names=["partials", "sums", "maxs"],
+            source=_MULTI_CAUSAL_2P_SRC.replace("SELECT_KV", sel),
+            header=_STAGED_MULTI_HEADER,
+            ensure_row_contiguous=False,
+        )
+        s1_mix = mx.fast.metal_kernel(
+            name=f"multi_causal_mix_c{C}",
+            input_names=ins_base,
+            output_names=["o1", "partials", "sums", "maxs"],
+            source=_MULTI_CAUSAL_MIX_SRC.replace("SELECT_KV", sel),
+            header=_STAGED_MULTI_HEADER,
+            ensure_row_contiguous=False,
+        )
+        s2 = _multi_causal_kernels.get("s2")
+        if s2 is None:
+            s2 = _multi_causal_kernels["s2"] = mx.fast.metal_kernel(
+                name="multi_causal_s2",
+                input_names=["partials", "sums", "maxs", "o1", "meta", "qkv"],
+                output_names=["out"],
+                source=_MULTI_CAUSAL_S2_SRC,
+                header=_HEADER,
+                ensure_row_contiguous=False,
+            )
+        ks = _multi_causal_kernels[C] = (s1_short, s1_2p, s1_mix, s2)
+    return ks
+
+
+def sdpa_multi_causal_w_staged(
+    q, ks_main, vs_main, stage, kv_new, pb, qkv_flat, gate_off, gate_stride, sink_off, sink_stride,
+    meta_arr, Ss, C, W, *, scale, window, kv_layer_idx, scap=64, Hq=24, Hkv=8,
+):
+    """Multi-stream causal W-token staged SDPA over unpacked main KV + stage buffer + kv_new (B = C * W)."""
+    B = int(C) * int(W)
+    assert 2 <= C <= 8 and 2 <= W <= 8 and B <= 16
+    assert len(ks_main) == C and len(vs_main) == C and len(Ss) == B
+    assert q.dtype == mx.bfloat16 and q.shape[0] == B
+    gqa = Hq // Hkv
+    R = int(pb.shape[-1])
+    qc = mx.contiguous(q.reshape(B, Hq, 128) if q.ndim != 3 else q)
+    pbc = mx.contiguous(pb.reshape(B, Hq, R) if pb.ndim != 3 else pb)
+    max_s = max(Ss)
+    blocks = _blocks(max_s, gqa)
+    assert blocks == 128
+    has2 = max_s >= _TWO_PASS_N
+    all2 = min(Ss) >= _TWO_PASS_N
+    sck = float(scale)
+    sc = _SCALE_CACHE.get(sck)
+    if sc is None:
+        sc = _SCALE_CACHE[sck] = mx.array([sck], mx.float32)
+    st_key = (int(kv_layer_idx), int(scap))
+    st_info = _ST_INFO_CACHE.get(st_key)
+    if st_info is None:
+        if len(_ST_INFO_CACHE) >= 4096:
+            _ST_INFO_CACHE.clear()
+        st_info = _ST_INFO_CACHE[st_key] = mx.array(st_key, mx.int32)
+    s1_short, s1_2p, s1_mix, s2 = _get_multi_causal_kernels(C)
+    ins = [qc, pbc, qkv_flat, meta_arr, sc, st_info, stage, kv_new] + list(ks_main) + list(vs_main)
+    if not has2:
+        ns_env = os.environ.get("LOOPLING_SDPA1_NS", "0")
+        ns = int(ns_env) if ns_env and ns_env != "0" else (32 if B <= 2 else 8)
+        tmpl = [
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("CC", int(C)), ("WW", int(W)),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("R", R), ("WIN", int(window)),
+            ("NS", ns), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", int(gate_stride)),
+            ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+        ]
+        (o1,) = s1_short(
+            inputs=ins,
+            template=tmpl,
+            grid=(B * Hq * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(B, Hq * 128)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return o1
+    n2 = B * Hq * blocks
+    if all2:
+        ns = gqa
+        tgpk = (blocks * gqa + ns - 1) // ns
+        ntg = B * Hkv * tgpk
+        tmpl = [
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("CC", int(C)), ("WW", int(W)),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("BLOCKS", blocks), ("R", R),
+            ("WIN", int(window)), ("NS", ns), ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+        ]
+        partials, sums, maxs = s1_2p(
+            inputs=ins,
+            template=tmpl,
+            grid=(ntg * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(n2 * 128,), (n2,), (n2,)],
+            output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+        )
+        o1 = _DUMMY_GATE
+    else:
+        ns = 32
+        tgpk = (blocks * gqa + ns - 1) // ns
+        ntg = sum(Hkv * tgpk if s >= _TWO_PASS_N else Hq for s in Ss)
+        tmpl = [
+            ("T", mx.bfloat16), ("PBT", pb.dtype), ("CC", int(C)), ("WW", int(W)),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("BLOCKS", blocks), ("R", R),
+            ("WIN", int(window)), ("NS", ns), ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", int(gate_stride)),
+            ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+        ]
+        o1, partials, sums, maxs = s1_mix(
+            inputs=ins,
+            template=tmpl,
+            grid=(ntg * 32 * ns, 1, 1),
+            threadgroup=(32 * ns, 1, 1),
+            output_shapes=[(B, Hq * 128), (n2 * 128,), (n2,), (n2,)],
+            output_dtypes=[mx.bfloat16, mx.bfloat16, mx.float32, mx.float32],
+        )
+    (out,) = s2(
+        inputs=[partials, sums, maxs, o1, meta_arr, qkv_flat],
+        template=[
+            ("T", mx.bfloat16), ("CC", int(C)), ("WW", int(W)), ("HQ", Hq), ("BLOCKS", blocks),
+            ("GATE_OFF", int(gate_off)), ("GATE_STRIDE", int(gate_stride)),
+        ],
+        grid=(B * Hq * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(B, Hq * 128)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out
+
+
 # =============================================================================================== B=1 packed staged SDPA
 # Eliminates 48x/step K7 slice_update copies on C=1 by reading main stacked/packed KV + small ring/full stage + kv_new.
 # meta[0..10] = (S, end, idx, rot, cap, kv_lidx, slot_main, rot_wrap, max_size, scap, st_len)

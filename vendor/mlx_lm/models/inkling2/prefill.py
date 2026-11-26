@@ -20,8 +20,14 @@ _PF_MOE_CFG_ENV = os.environ.get("LOOPLING_PF_MOE_CFG", "")
 _PF_MOE_CFG = tuple(int(x) for x in _PF_MOE_CFG_ENV.split(",")) if _PF_MOE_CFG_ENV else None
 _PF_MOE_MIN_L = int(os.environ.get("LOOPLING_PF_MOE_MIN_L", "64"))
 _PF_AFF8_QMM = os.environ.get("LOOPLING_PF_AFF8_QMM", "1") not in ("0", "")
+_PF_AFF8_WK = os.environ.get("LOOPLING_PF_AFF8_WK", "1") not in ("0", "")
 _PF_AFF8_CFG_ENV = os.environ.get("LOOPLING_PF_AFF8_CFG", "64,32,32,2,1")
 _PF_AFF8_CFG = tuple(int(x) for x in _PF_AFF8_CFG_ENV.split(","))
+_IS_G15D = (
+    mx.metal.is_available()
+    and getattr(mx, "device_info", None) is not None
+    and mx.device_info().get("architecture", "") == "applegpu_g15d"
+)
 _SPLASH_MSGGATE = os.environ.get("LOOPLING_SPLASH_MSGGATE", "0") not in ("0", "", "false", "False")
 _D = 2304
 _TG_RMS = 576
@@ -738,6 +744,139 @@ _AFF8_QMM_SRC = r"""
 """
 
 
+_AFF8_WK_SRC = r"""
+    constexpr int GS = 64;
+    constexpr int LDX = BK + 8;
+    constexpr int NSG_MN = WM * WN;
+    constexpr int TM = (BM / WM) / 8;
+    constexpr int TN = (BN / WN) / 8;
+    constexpr int XPT = (BM * BK) / (NSG_MN * 32);
+    constexpr int WPT = (BN * BK) / (NSG_MN * 32);
+
+    const uint tgn = threadgroup_position_in_grid.x;
+    const uint tgm = threadgroup_position_in_grid.y;
+    const uint m0 = tgm * uint(BM), n0 = tgn * uint(BN);
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint wk_id = sg / uint(NSG_MN);
+    const uint mn_sg = sg % uint(NSG_MN);
+    const uint mn_tid = mn_sg * 32u + lane;
+    const uint sg_m = (mn_sg / uint(WN)) * uint(TM * 8);
+    const uint sg_n = (mn_sg % uint(WN)) * uint(TN * 8);
+    const ushort fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
+    const ushort fn = ((lane >> 2) & 2) * 2 | ((lane & 1) * 2);
+
+    const int k_per = ((KK / BK + WK - 1) / WK) * BK;
+    const int k0 = int(wk_id) * k_per;
+    const int k1 = min(KK, k0 + k_per);
+
+    constexpr int BUF_BF = WK * (BM + BN) * LDX;
+    constexpr int BUF_F32 = WK * BM * BN;
+    constexpr int BUF_U32 = (BUF_BF / 2 > BUF_F32) ? (BUF_BF / 2) : BUF_F32;
+    threadgroup uint smem[BUF_U32];
+    threadgroup bfloat16_t* Xs = ((threadgroup bfloat16_t*)smem) + wk_id * (BM * LDX);
+    threadgroup bfloat16_t* Ws = ((threadgroup bfloat16_t*)smem) + WK * BM * LDX + wk_id * (BN * LDX);
+
+    constexpr uint XTPR = uint(BK / XPT);
+    const uint x_mr = mn_tid / XTPR;
+    const uint x_mk = (mn_tid % XTPR) * uint(XPT);
+    const bool x_ok = (m0 + x_mr) < uint(MM);
+    const device bfloat16_t* x_ptr = x + (size_t)(m0 + x_mr) * KK + x_mk;
+
+    constexpr uint WTPR = uint(BK / WPT);
+    const uint w_nr = mn_tid / WTPR;
+    const uint w_koff = (mn_tid % WTPR) * uint(WPT);
+    const device uint8_t* w_ptr = (const device uint8_t*)w + (size_t)(n0 + w_nr) * KK + w_koff;
+    const device bfloat16_t* s_ptr = scales + (size_t)(n0 + w_nr) * (KK / GS);
+    const device bfloat16_t* b_ptr = biases + (size_t)(n0 + w_nr) * (KK / GS);
+
+    simdgroup_float8x8 C[TM][TN];
+    for (int tm = 0; tm < TM; ++tm)
+        for (int tn = 0; tn < TN; ++tn)
+            C[tm][tn] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    threadgroup uint4* xd = (threadgroup uint4*)(Xs + x_mr * LDX + x_mk);
+    threadgroup uint4* wd4 = (threadgroup uint4*)(Ws + w_nr * LDX + w_koff);
+    const threadgroup bfloat16_t* as_base = Xs + (sg_m + fm) * LDX + fn;
+    const threadgroup bfloat16_t* bs_base = Ws + (sg_n + fn) * LDX + fm;
+
+    for (int k = k0; k < k1; k += BK) {
+        if constexpr (XPT == 16) {
+            if (x_ok) { const device uint4* xp = (const device uint4*)(x_ptr + k); xd[0] = xp[0]; xd[1] = xp[1]; }
+            else { xd[0] = uint4(0); xd[1] = uint4(0); }
+        } else if constexpr (XPT == 8) {
+            xd[0] = x_ok ? ((const device uint4*)(x_ptr + k))[0] : uint4(0);
+        }
+        const float sc = float(s_ptr[k / GS]), bi = float(b_ptr[k / GS]);
+        const device uint8_t* wp = w_ptr + k;
+        const device uint4* wp4 = (const device uint4*)wp;
+        const uint4 r0 = wp4[0], r1 = wp4[1];
+        const uint ws[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+        #pragma clang loop unroll(full)
+        for (int gi = 0; gi < 4; ++gi) {
+            const uchar4 c0 = as_type<uchar4>(ws[gi * 2]);
+            const uchar4 c1 = as_type<uchar4>(ws[gi * 2 + 1]);
+            uint2 a2 = as_type<uint2>(bfloat4(sc * float4(c0.x, c0.y, c0.z, c0.w) + bi));
+            uint2 b2 = as_type<uint2>(bfloat4(sc * float4(c1.x, c1.y, c1.z, c1.w) + bi));
+            wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int ks = 0; ks < BK; ks += 8) {
+            simdgroup_bfloat8x8 A[TM], B[TN];
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (int tm = 0; tm < TM; ++tm) {
+                const bfloat2 av = *((const threadgroup bfloat2*)(as_base + (tm * 8) * LDX + ks));
+                A[tm].thread_elements()[0] = av.x; A[tm].thread_elements()[1] = av.y;
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (int tn = 0; tn < TN; ++tn) {
+                const threadgroup bfloat16_t* bp = bs_base + (tn * 8) * LDX + ks;
+                B[tn].thread_elements()[0] = bp[0]; B[tn].thread_elements()[1] = bp[LDX];
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (int tm = 0; tm < TM; ++tm)
+                for (int tn = 0; tn < TN; ++tn)
+                    simdgroup_multiply_accumulate(C[tm][tn], A[tm], B[tn], C[tm][tn]);
+        }
+        if (k + BK < k1) simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* Cs = (threadgroup float*)smem;
+    for (int tm = 0; tm < TM; ++tm) {
+        const uint rm = sg_m + uint(tm) * 8u + fm;
+        for (int tn = 0; tn < TN; ++tn) {
+            const uint cn = sg_n + uint(tn) * 8u + fn;
+            ((threadgroup float2*)(Cs + (wk_id * BM + rm) * BN + cn))[0] =
+                float2(C[tm][tn].thread_elements()[0], C[tm][tn].thread_elements()[1]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (wk_id == 0) {
+        for (int tm = 0; tm < TM; ++tm) {
+            const uint rm = sg_m + uint(tm) * 8u + fm;
+            const uint mr_o = m0 + rm;
+            if (mr_o < uint(MM)) {
+                device bfloat16_t* dst = out + (size_t)mr_o * NN;
+                for (int tn = 0; tn < TN; ++tn) {
+                    const uint cn = sg_n + uint(tn) * 8u + fn;
+                    float2 s = ((const threadgroup float2*)(Cs + rm * BN + cn))[0];
+                    #pragma clang loop unroll(full)
+                    for (int w = 1; w < WK; ++w) {
+                        s += ((const threadgroup float2*)(Cs + (w * BM + rm) * BN + cn))[0];
+                    }
+                    ((device uint*)(dst + n0 + cn))[0] = as_type<uint>(bfloat2(bfloat16_t(s.x), bfloat16_t(s.y)));
+                }
+            }
+        }
+    }
+"""
+
+
 def _k_aff8_qmm():
     k = _kernels.get("pf_aff8_qmm")
     if k is None:
@@ -750,6 +889,37 @@ def _k_aff8_qmm():
             ensure_row_contiguous=True,
         )
     return k
+
+
+def _k_aff8_wk():
+    k = _kernels.get("pf_aff8_wk")
+    if k is None:
+        k = _kernels["pf_aff8_wk"] = mx.fast.metal_kernel(
+            name="pf_aff8_wk",
+            input_names=["x", "w", "scales", "biases"],
+            output_names=["out"],
+            source=_AFF8_WK_SRC,
+            header="#include <metal_simdgroup_matrix>\n",
+            ensure_row_contiguous=True,
+        )
+    return k
+
+
+def _aff8_spk_g15d(M: int, N: int, K: int) -> int:
+    """Exact MLX affine_qmm split-K factor on g15d for proven-faster M in [33, 128] (0 = fallback)."""
+    if not (33 <= M <= 128):
+        return 0
+    if N == 3072 and K == 2304:
+        return 1 if M >= 65 else 2
+    if N == 2304 and K == 3072:
+        if M >= 128:
+            return 1
+        if M >= 65:
+            return 2 if M <= 96 else 0
+        return 3
+    if N == 1024 and K == 2304:
+        return 4 if M >= 65 else 6
+    return 0
 
 
 def aff8_linear(mod, x: mx.array) -> mx.array:
@@ -766,12 +936,44 @@ def aff8_linear(mod, x: mx.array) -> mx.array:
     K = x.shape[-1]
     M = x.size // K
     N = mod["weight"].shape[0]
+    if K % 64 != 0 or N % 32 != 0 or mod["scales"].dtype != mx.bfloat16:
+        return mod(x)
+    if _IS_G15D and _PF_AFF8_WK and 33 <= M <= 128:
+        spk = _aff8_spk_g15d(M, N, K)
+        if spk > 1:
+            bm, bn, bk = 16, 32, 32
+            tg = spk * 32
+            ntm = (M + bm - 1) // bm
+            return _k_aff8_wk()(
+                inputs=[x, mod["weight"], mod["scales"], mod["biases"]],
+                template=[
+                    ("BM", bm), ("BN", bn), ("BK", bk), ("WM", 1), ("WN", 1), ("WK", spk),
+                    ("MM", M), ("NN", N), ("KK", K),
+                ],
+                grid=(tg * (N // bn), ntm, 1),
+                threadgroup=(tg, 1, 1),
+                output_shapes=[x.shape[:-1] + (N,)],
+                output_dtypes=[mx.bfloat16],
+            )[0]
+        if spk == 1:
+            bm, bn, bk, wm, wn = (16, 32, 32, 1, 1)
+            tg = 32
+            ntm = (M + bm - 1) // bm
+            return _k_aff8_qmm()(
+                inputs=[x, mod["weight"], mod["scales"], mod["biases"]],
+                template=[("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn), ("MM", M), ("NN", N), ("KK", K)],
+                grid=(tg * (N // bn), ntm, 1),
+                threadgroup=(tg, 1, 1),
+                output_shapes=[x.shape[:-1] + (N,)],
+                output_dtypes=[mx.bfloat16],
+            )[0]
+        return mod(x)
     if len(_PF_AFF8_CFG) == 5:
         bm, bn, bk, wm, wn = _PF_AFF8_CFG
     else:
         bm, bn, wm, wn = _PF_AFF8_CFG
         bk = 32
-    if M < 1024 or N < 1024 or M % bm != 0 or K % 64 != 0 or N % bn != 0 or mod["scales"].dtype != mx.bfloat16:
+    if M < 1024 or N < 1024 or M % bm != 0 or N % bn != 0:
         return mod(x)
     tg = wm * wn * 32
     ntm = (M + bm - 1) // bm
@@ -935,8 +1137,8 @@ _MOE_SHORT_QMV_SRC = r"""
     const uint lane = thread_index_in_simdgroup;
     const int out_row = (int)threadgroup_position_in_grid.y * (ROWS * NSG) + (int)sg * ROWS;
 
-    const int in_w = KK * BITS / 8;
-    const int in_g = KK / GS;
+    constexpr int in_w = KK * BITS / 8;
+    constexpr int in_g = KK / GS;
     const device uint8_t* ws0 = (const device uint8_t*)w
         + (size_t)e * NN * in_w + (size_t)out_row * in_w + lane * PPT * 4;
     const device uint8_t* sc0 = scales
@@ -958,20 +1160,21 @@ _MOE_SHORT_QMV_SRC = r"""
             }
             if (lane == 0) {
                 const float gc = caps[0], uc = caps[1];
-                #pragma unroll
-                for (int pair = 0; pair < ROWS / 2; pair++) {
-                    out[(size_t)pos * (NN / 2) + (size_t)(out_row / 2 + pair)] =
-                        static_cast<T>(glue_swiglu(gv[2 * pair], gv[2 * pair + 1], gc, uc));
-                }
+                bfloat2 ov = bfloat2(
+                    static_cast<T>(glue_swiglu(gv[0], gv[1], gc, uc)),
+                    static_cast<T>(glue_swiglu(gv[2], gv[3], gc, uc)));
+                ((device uint*)(out + (size_t)pos * (NN / 2) + (size_t)(out_row / 2)))[0] = as_type<uint>(ov);
             }
         } else {
+            T ov[ROWS];
             #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 float v = simd_sum(result[r]);
-                if (lane == 0) {
-                    out[(size_t)pos * NN + (size_t)(out_row + r)] =
-                        HGS ? static_cast<T>(v * inv_scale_enc) : static_cast<T>(v);
-                }
+                ov[r] = HGS ? static_cast<T>(v * inv_scale_enc) : static_cast<T>(v);
+            }
+            if (lane == 0) {
+                ((device uint2*)(out + (size_t)pos * NN + (size_t)out_row))[0] =
+                    as_type<uint2>(bfloat4(ov[0], ov[1], ov[2], ov[3]));
             }
         }
     };
@@ -1067,13 +1270,13 @@ _MOE_SHORT_QMV_SRC = r"""
     } else {
         for (int tb = 0; tb < cnt; tb += TMAX) {
             const int nb = min(TMAX, cnt - tb);
-            size_t xo[TMAX];
+            uint xo[TMAX];
             #pragma unroll
             for (int t = 0; t < TMAX; t++) {
                 if (t < nb) {
                     uint pos = m_base + uint(tb + t);
                     uint tok = USE_LHS ? lhs_idx[pos] : pos;
-                    xo[t] = (size_t)tok * KK + (size_t)lane * VPT;
+                    xo[t] = tok * uint(KK) + lane * uint(VPT);
                 } else {
                     xo[t] = 0u;
                 }
@@ -1304,8 +1507,10 @@ def moe_gmm_forward(
         else:
             bm, bn, wm, wn = _PF_MOE_CFG
             bk = 32
-    elif _PF_MOE_BM_ENV in (16, 32, 64):
+    elif _PF_MOE_BM_ENV in (8, 16, 32, 64):
         bm, bn, bk, wm, wn = (_PF_MOE_BM_ENV, 32, 32, 1, 1)
+    elif B * L < 256:
+        bm, bn, bk, wm, wn = (8, 32, 32, 1, 1)
     elif B * L < 1024:
         bm, bn, bk, wm, wn = (16, 32, 32, 1, 1)
     elif B * L < 3072:

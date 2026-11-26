@@ -1489,7 +1489,7 @@ class BatchDecoder:
             x_mlp, mlp_mixed = r10["mlp_x"], None
         elif (
             os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
-            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
         ):
             x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
@@ -1606,7 +1606,7 @@ class BatchDecoder:
             x_mlp, mlp_mixed = r10["mlp_x"], None
         elif (
             os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
-            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
         ):
             x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
@@ -1708,7 +1708,7 @@ class BatchDecoder:
             x_mlp, mlp_mixed = r10["mlp_x"], None
         elif (
             os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
-            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
         ):
             x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
@@ -1823,7 +1823,7 @@ class BatchDecoder:
             x_mlp, mlp_mixed = r10["mlp_x"], None
         elif (
             os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
-            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
         ):
             x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
@@ -2123,7 +2123,10 @@ class BatchDecoder:
         return h_out, h_ref_out
 
     def _get_batch_compiled(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, sdpa_mid=True):
-        fuse_mlp = os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+        fuse_mlp = (
+            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+            and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
+        )
         key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid))
         ent = self._batch_compiled.get(key)
         if ent is not None:
@@ -2232,7 +2235,10 @@ class BatchDecoder:
         return ent
 
     def _get_batch_compiled_one(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, sdpa_mid=True):
-        fuse_mlp = os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+        fuse_mlp = (
+            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+            and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
+        )
         key = ("one", self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid))
         ent = self._batch_compiled.get(key)
         if ent is not None:

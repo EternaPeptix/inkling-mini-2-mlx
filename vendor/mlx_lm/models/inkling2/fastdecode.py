@@ -394,8 +394,17 @@ def _fused_b1_ok_layer(layer) -> bool:
             a["q_l2_clip"]["scale"], a["rel_logits_proj"]["proj"],
         )
     c = getattr(layer, "_fd_ok_cache", None)
-    if c is not None and len(c[0]) == len(refs) and all(x is y for x, y in zip(c[0], refs)):
-        return c[1]
+    if c is not None:
+        cr = c[0]
+        if len(cr) == len(refs):
+            if len(cr) == 13:
+                if (cr[0] is refs[0] and cr[1] is refs[1] and cr[2] is refs[2] and cr[3] is refs[3]
+                    and cr[4] is refs[4] and cr[5] is refs[5] and cr[6] is refs[6] and cr[7] is refs[7]
+                    and cr[8] is refs[8] and cr[9] is refs[9] and cr[10] is refs[10] and cr[11] is refs[11]
+                    and cr[12] is refs[12]):
+                    return c[1]
+            elif all(x is y for x, y in zip(cr, refs)):
+                return c[1]
     ok = _fused_b1_ok_layer_slow(layer, L, a, ks, vs, pac, pmc, ai, mlp, gu_m, dn_m)
     layer._fd_ok_cache = (refs, ok)
     return ok

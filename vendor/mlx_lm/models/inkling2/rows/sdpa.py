@@ -1728,6 +1728,133 @@ _CAUSAL_2P1_SRC = r"""
     }
 """
 
+_CAUSAL_2P1_GQA3_SRC = r"""
+    constexpr int D = 128;
+    constexpr int TK = 4;
+    constexpr int blocks = BLOCKS;
+    int tg = (int)threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int kvh = tg / BLOCKS;
+    int block_idx = tg % BLOCKS;
+    int b_idx = (int)simd_gid;
+    if (b_idx >= B_CNT) return;
+    int b = BOFF + b_idx;
+    int h0 = kvh * 3;
+    const int S0 = meta[0], end0 = meta[1], slot0 = meta[2], cap = meta[3], max_size = meta[4];
+    const int lidx = (KV_LIDX >= 0) ? KV_LIDX : meta[5];
+    constexpr int TMW = (WW > 8) ? 17 : 9;
+    const int db = tree_meta[b * TMW];
+    const int N = ROT ? min(end0 + db + 1, max_size) : (S0 + db + 1);
+    const int end_b = end0 + db + 1;
+    const int idx_b = ROT ? (((slot0 + db) % max_size) + 1) : 0;
+    const device T* K = kv + ((size_t)lidx * 2 * HKV + kvh) * cap * D;
+    const device T* V = kv + ((size_t)lidx * 2 * HKV + HKV + kvh) * cap * D;
+    const device T* Knew = kv_new + (size_t)kvh * WW * D;
+    const device T* Vnew = kv_new + (size_t)(HKV + kvh) * WW * D;
+    const device int* anc_ptr = tree_meta + b * TMW + 1;
+    const int loff = (int)simd_lid * 4;
+    const float sc = scale[0];
+    typedef float U;
+    thread U q0[4], q1[4], q2[4];
+    {
+        int bh0 = b * HQ + h0;
+        bfloat4 qb0 = as_type<bfloat4>(((const device uint2*)(q + (size_t)(bh0 + 0) * D + loff))[0]);
+        bfloat4 qb1 = as_type<bfloat4>(((const device uint2*)(q + (size_t)(bh0 + 1) * D + loff))[0]);
+        bfloat4 qb2 = as_type<bfloat4>(((const device uint2*)(q + (size_t)(bh0 + 2) * D + loff))[0]);
+        q0[0] = sc * qb0.x; q0[1] = sc * qb0.y; q0[2] = sc * qb0.z; q0[3] = sc * qb0.w;
+        q1[0] = sc * qb1.x; q1[1] = sc * qb1.y; q1[2] = sc * qb1.z; q1[3] = sc * qb1.w;
+        q2[0] = sc * qb2.x; q2[1] = sc * qb2.y; q2[2] = sc * qb2.z; q2[3] = sc * qb2.w;
+    }
+    RowMask<T, PBT> msk0;
+    msk0.S = N; msk0.end = end_b; msk0.idx = idx_b; msk0.rot = ROT; msk0.R = R; msk0.window = WIN;
+    RowMask<T, PBT> msk1 = msk0, msk2 = msk0;
+    msk0.pb = pb + (size_t)(b * HQ + h0 + 0) * R;
+    msk1.pb = pb + (size_t)(b * HQ + h0 + 1) * R;
+    msk2.pb = pb + (size_t)(b * HQ + h0 + 2) * R;
+    thread U o0[4] = {0, 0, 0, 0}, o1[4] = {0, 0, 0, 0}, o2[4] = {0, 0, 0, 0};
+    U m0 = Limits<U>::finite_min, m1 = m0, m2 = m0;
+    U s0 = 0, s1 = 0, s2 = 0;
+    if (block_idx == 0) {
+        m0 = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h0 + 0])); s0 = 1;
+        m1 = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h0 + 1])); s1 = 1;
+        m2 = float(static_cast<T>(qkv[SINK_OFF + (size_t)b * SINK_STRIDE + h0 + 2])); s2 = 1;
+    }
+    auto do_key = [&](int ii, bfloat4 kb, bfloat4 vb) __attribute__((always_inline)) {
+        float fm0 = 0, fm1 = 0, fm2 = 0;
+        bool u0 = msk0.at(ii, fm0);
+        bool u1 = msk1.at(ii, fm1);
+        bool u2 = msk2.at(ii, fm2);
+        if (u0) {
+            U score = 0;
+            score += q0[0] * static_cast<U>(kb.x); score += q0[1] * static_cast<U>(kb.y);
+            score += q0[2] * static_cast<U>(kb.z); score += q0[3] * static_cast<U>(kb.w);
+            score = simd_sum(score) + static_cast<U>(fm0);
+            U nm = max(m0, score); U f = fast::exp(m0 - nm); U e = fast::exp(score - nm);
+            m0 = nm; s0 = s0 * f + e;
+            o0[0] = o0[0] * f + e * static_cast<U>(vb.x); o0[1] = o0[1] * f + e * static_cast<U>(vb.y);
+            o0[2] = o0[2] * f + e * static_cast<U>(vb.z); o0[3] = o0[3] * f + e * static_cast<U>(vb.w);
+        }
+        if (u1) {
+            U score = 0;
+            score += q1[0] * static_cast<U>(kb.x); score += q1[1] * static_cast<U>(kb.y);
+            score += q1[2] * static_cast<U>(kb.z); score += q1[3] * static_cast<U>(kb.w);
+            score = simd_sum(score) + static_cast<U>(fm1);
+            U nm = max(m1, score); U f = fast::exp(m1 - nm); U e = fast::exp(score - nm);
+            m1 = nm; s1 = s1 * f + e;
+            o1[0] = o1[0] * f + e * static_cast<U>(vb.x); o1[1] = o1[1] * f + e * static_cast<U>(vb.y);
+            o1[2] = o1[2] * f + e * static_cast<U>(vb.z); o1[3] = o1[3] * f + e * static_cast<U>(vb.w);
+        }
+        if (u2) {
+            U score = 0;
+            score += q2[0] * static_cast<U>(kb.x); score += q2[1] * static_cast<U>(kb.y);
+            score += q2[2] * static_cast<U>(kb.z); score += q2[3] * static_cast<U>(kb.w);
+            score = simd_sum(score) + static_cast<U>(fm2);
+            U nm = max(m2, score); U f = fast::exp(m2 - nm); U e = fast::exp(score - nm);
+            m2 = nm; s2 = s2 * f + e;
+            o2[0] = o2[0] * f + e * static_cast<U>(vb.x); o2[1] = o2[1] * f + e * static_cast<U>(vb.y);
+            o2[2] = o2[2] * f + e * static_cast<U>(vb.z); o2[3] = o2[3] * f + e * static_cast<U>(vb.w);
+        }
+    };
+    int i = block_idx;
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+        bfloat4 kr[TK], vr[TK];
+        for (int t = 0; t < TK; t++) {
+            int ii = i + t * blocks;
+            int d = ROT ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
+            const device T* kp = (d >= 0 && d <= db) ? (Knew + (size_t)anc_ptr[d] * D + loff) : (K + (size_t)ii * D + loff);
+            kr[t] = as_type<bfloat4>(((const device uint2*)kp)[0]);
+        }
+        for (int t = 0; t < TK; t++) {
+            int ii = i + t * blocks;
+            int d = ROT ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
+            const device T* vp = (d >= 0 && d <= db) ? (Vnew + (size_t)anc_ptr[d] * D + loff) : (V + (size_t)ii * D + loff);
+            vr[t] = as_type<bfloat4>(((const device uint2*)vp)[0]);
+        }
+        for (int t = 0; t < TK; t++) do_key(i + t * blocks, kr[t], vr[t]);
+    }
+    for (; i < N; i += blocks) {
+        int d = ROT ? (i - slot0 + (i < slot0 ? max_size : 0)) : (i - S0);
+        const device T* kp = (d >= 0 && d <= db) ? (Knew + (size_t)anc_ptr[d] * D + loff) : (K + (size_t)i * D + loff);
+        const device T* vp = (d >= 0 && d <= db) ? (Vnew + (size_t)anc_ptr[d] * D + loff) : (V + (size_t)i * D + loff);
+        do_key(i, as_type<bfloat4>(((const device uint2*)kp)[0]), as_type<bfloat4>(((const device uint2*)vp)[0]));
+    }
+    size_t p0 = (size_t)(b_idx * HQ + h0 + 0) * BLOCKS + block_idx;
+    size_t p1 = (size_t)(b_idx * HQ + h0 + 1) * BLOCKS + block_idx;
+    size_t p2 = (size_t)(b_idx * HQ + h0 + 2) * BLOCKS + block_idx;
+    if (simd_lid == 0) {
+        sums[p0] = s0; maxs[p0] = m0;
+        sums[p1] = s1; maxs[p1] = m1;
+        sums[p2] = s2; maxs[p2] = m2;
+    }
+    ((device uint2*)(partials + p0 * D + loff))[0] =
+        as_type<uint2>(bfloat4(static_cast<T>(o0[0]), static_cast<T>(o0[1]), static_cast<T>(o0[2]), static_cast<T>(o0[3])));
+    ((device uint2*)(partials + p1 * D + loff))[0] =
+        as_type<uint2>(bfloat4(static_cast<T>(o1[0]), static_cast<T>(o1[1]), static_cast<T>(o1[2]), static_cast<T>(o1[3])));
+    ((device uint2*)(partials + p2 * D + loff))[0] =
+        as_type<uint2>(bfloat4(static_cast<T>(o2[0]), static_cast<T>(o2[1]), static_cast<T>(o2[2]), static_cast<T>(o2[3])));
+"""
+
 _CAUSAL_2P2_SRC = r"""
     constexpr int D = 128;
     threadgroup float outputs[4 * 1024];
@@ -2241,6 +2368,37 @@ def _get_causal_w_dyn_kernels():
     return _causal_w_dyn_kernels
 
 
+_causal_w_2p_gqa3_kernels = None
+
+
+def _get_causal_w_2p_gqa3_kernels():
+    global _causal_w_2p_gqa3_kernels
+    if _causal_w_2p_gqa3_kernels is None:
+        s_dyn = _CAUSAL_2P1_GQA3_SRC.replace(
+            "    int b = BOFF + b_idx;",
+            "    int b = BOFF + b_idx;\n    if (b >= w_act[0]) return;",
+        )
+        assert s_dyn != _CAUSAL_2P1_GQA3_SRC
+        k_std = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p1_gqa3",
+            input_names=["q", "kv", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta"],
+            output_names=["partials", "sums", "maxs"],
+            source=_CAUSAL_2P1_GQA3_SRC,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        k_dyn = mx.fast.metal_kernel(
+            name="causal_w_sdpa_2p1_gqa3_dyn",
+            input_names=["q", "kv", "kv_new", "pb", "qkv", "meta", "scale", "tree_meta", "w_act"],
+            output_names=["partials", "sums", "maxs"],
+            source=s_dyn,
+            header=_CAUSAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+        _causal_w_2p_gqa3_kernels = (k_std, k_dyn)
+    return _causal_w_2p_gqa3_kernels
+
+
 def _get_causal_w_stage_kernels():
     global _causal_w_stage_kernels
     if _causal_w_stage_kernels is None:
@@ -2401,6 +2559,24 @@ def sdpa_causal_w_packed(
                 ],
                 grid=(ntg * 32 * ns, 1, 1),
                 threadgroup=(32 * ns, 1, 1),
+                output_shapes=[(b_cnt * Hq * blocks * 128,), (b_cnt * Hq * blocks,), (b_cnt * Hq * blocks,)],
+                output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+            )
+        elif gqa == 3 and 2 <= b_cnt <= 16 and os.environ.get("LOOPLING_CW_2P_GQA3", "1") not in ("0", ""):
+            k_std, k_dyn = _get_causal_w_2p_gqa3_kernels()
+            k_2p = k_dyn if has_wa else k_std
+            ntg_g3 = Hkv * blocks
+            partials, sums, maxs = k_2p(
+                inputs=[q, kv_buf, kv_new, pb, qkv_flat, mta, sc, tree_meta] + wa_arg,
+                template=[
+                    ("T", mx.bfloat16), ("PBT", pb.dtype), ("HQ", Hq), ("HKV", Hkv),
+                    ("BLOCKS", blocks), ("R", R), ("WIN", int(window)), ("ROT", int(rot)),
+                    ("WW", int(W)), ("BOFF", int(b_off)), ("B_CNT", int(b_cnt)),
+                    ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", s_str),
+                    ("KV_LIDX", kv_lidx_t),
+                ],
+                grid=(ntg_g3 * 32 * b_cnt, 1, 1),
+                threadgroup=(32 * b_cnt, 1, 1),
                 output_shapes=[(b_cnt * Hq * blocks * 128,), (b_cnt * Hq * blocks,), (b_cnt * Hq * blocks,)],
                 output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
             )

@@ -234,8 +234,66 @@ def _get_df_batch_compiled(nh: int, nkv: int, hd: int, inter: int, qbits: int, t
     return ent
 
 
+_SEL_TOP16_SRC = r"""
+    int p = (int)threadgroup_position_in_grid.x;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int c0 = (int)lane * 2;
+    int c1 = c0 + 1;
+    float sh0 = sel_h[p * 64 + c0];
+    float sh1 = sel_h[p * 64 + c1];
+    float scap = sc_cfg[0];
+    if (p == 0) {
+        uint aid = anc[0];
+        uint sid = top_idx[sg];
+        float pv0 = float(pred_cb[(size_t)aid * 64 + c0]) * sh0;
+        float pv1 = float(pred_cb[(size_t)aid * 64 + c1]) * sh1;
+        float sv0 = float(succ_cb[(size_t)sid * 64 + c0]);
+        float sv1 = float(succ_cb[(size_t)sid * 64 + c1]);
+        float dot = simd_sum(pv0 * sv0 + pv1 * sv1);
+        if (lane == 0) {
+            float v = unary[sg] + dot;
+            sc0[sg] = (scap > 0.0f) ? (scap * precise::tanh(v / scap)) : v;
+        }
+    } else {
+        threadgroup float succ_s[16 * 64];
+        uint sid_sg = top_idx[p * 16 + sg];
+        succ_s[sg * 64 + c0] = float(succ_cb[(size_t)sid_sg * 64 + c0]);
+        succ_s[sg * 64 + c1] = float(succ_cb[(size_t)sid_sg * 64 + c1]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint pid = top_idx[(p - 1) * 16 + sg];
+        float pv0 = float(pred_cb[(size_t)pid * 64 + c0]) * sh0;
+        float pv1 = float(pred_cb[(size_t)pid * 64 + c1]) * sh1;
+        device float* out_row = sc16 + ((p - 1) * 16 + sg) * 16;
+        for (int j = 0; j < 16; j++) {
+            float dot = simd_sum(pv0 * succ_s[j * 64 + c0] + pv1 * succ_s[j * 64 + c1]);
+            if (lane == 0) {
+                float v = unary[p * 16 + j] + dot;
+                out_row[j] = (scap > 0.0f) ? (scap * precise::tanh(v / scap)) : v;
+            }
+        }
+    }
+"""
+
+_sel_top16_kern = None
+_sel_sc_cfg_cache: dict = {}
+
+
+def _get_sel_top16_kernel():
+    global _sel_top16_kern
+    if _sel_top16_kern is None:
+        _sel_top16_kern = mx.fast.metal_kernel(
+            name="df2_sel_top16_r64",
+            input_names=["top_idx", "unary", "sel_h", "pred_cb", "succ_cb", "anc", "sc_cfg"],
+            output_names=["sc0", "sc16"],
+            source=_SEL_TOP16_SRC,
+            ensure_row_contiguous=True,
+        )
+    return _sel_top16_kern
+
+
 @mx.compile
-def _selector_scores_from_top16(
+def _selector_scores_from_top16_mlx(
     top_idx: mx.array,
     unary: mx.array,
     sel_h: mx.array,
@@ -258,6 +316,44 @@ def _selector_scores_from_top16(
     sums = unary[1:, None, :] + edges
     sc16 = softcap * mx.tanh(sums / softcap) if softcap > 0.0 else sums
     return top_idx, sc0, sc16
+
+
+def _selector_scores_from_top16(
+    top_idx: mx.array,
+    unary: mx.array,
+    sel_h: mx.array,
+    pred_cb: mx.array,
+    succ_cb: mx.array,
+    anchor_tok: mx.array,
+    softcap: float,
+):
+    """Fused Metal Top-16 bigram codebook scoring (falls back to MLX if rank != 64)."""
+    if (
+        int(sel_h.shape[-1]) == 64
+        and int(top_idx.shape[-1]) == 16
+        and int(top_idx.shape[0]) >= 2
+        and pred_cb.dtype == mx.bfloat16
+        and succ_cb.dtype == mx.bfloat16
+        and os.environ.get("LOOPLING_DFLASH2_FUSE_SEL", "1") not in ("0", "")
+    ):
+        P = int(top_idx.shape[0])
+        sc_k = float(softcap)
+        sc_arr = _sel_sc_cfg_cache.get(sc_k)
+        if sc_arr is None:
+            sc_arr = _sel_sc_cfg_cache[sc_k] = mx.array([sc_k], mx.float32)
+        anc_u32 = anchor_tok.reshape(1)
+        if anc_u32.dtype != mx.uint32:
+            anc_u32 = anc_u32.astype(mx.uint32)
+        tidx = top_idx if top_idx.dtype == mx.uint32 else top_idx.astype(mx.uint32)
+        sc0, sc16 = _get_sel_top16_kernel()(
+            inputs=[tidx, unary, sel_h, pred_cb, succ_cb, anc_u32, sc_arr],
+            grid=(P * 512, 1, 1),
+            threadgroup=(512, 1, 1),
+            output_shapes=[(16,), (P - 1, 16, 16)],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+        return top_idx, sc0, sc16
+    return _selector_scores_from_top16_mlx(top_idx, unary, sel_h, pred_cb, succ_cb, anchor_tok, softcap)
 
 
 @mx.compile
@@ -291,6 +387,7 @@ class LookupIndex:
         self._last = 0
         self.match_len = 0
         self.match_end = 0
+        self._prompt_end = -1
 
     def reset(self) -> None:
         self.tokens.clear()
@@ -301,6 +398,10 @@ class LookupIndex:
         self._last = 0
         self.match_len = 0
         self.match_end = 0
+        self._prompt_end = -1
+
+    def set_prompt_end(self, n: int) -> None:
+        self._prompt_end = int(n)
 
     def append_one(self, tok: int) -> None:
         idx = len(self.tokens)
@@ -360,7 +461,11 @@ class LookupIndex:
         if self.match_len < self.MIN_MATCH:
             return []
         start = self.match_end + 1
-        stop = min(start + count, len(self.tokens))
+        # Never extrapolate a prompt match across the prompt-to-generation chat-template boundary.
+        limit = self._prompt_end if (self._prompt_end > 0 and self.match_end < self._prompt_end) else len(self.tokens)
+        if start >= limit:
+            return []
+        stop = min(start + count, limit)
         return self.tokens[start:stop]
 
     def clone(self) -> "LookupIndex":
@@ -373,6 +478,7 @@ class LookupIndex:
         cp._last = self._last
         cp.match_len = self.match_len
         cp.match_end = self.match_end
+        cp._prompt_end = self._prompt_end
         return cp
 
 
@@ -1604,7 +1710,9 @@ def dflash2_exact_generate_step(
             lookup = LookupIndex()
             p_list = list(full_prompt) if full_prompt is not None else prompt.tolist()
             lookup.append(p_list)
+            lookup.set_prompt_end(len(p_list))
             lookup.append_one(y_tok)
+        lookup_cd = 0
 
         deferred_feats: list[mx.array] = []
 
@@ -1824,7 +1932,7 @@ def dflash2_exact_generate_step(
 
         while n < max_tokens:
             if use_pipe_ahead:
-                want_lookup_bypass = _snapped_lookup_props(max_tokens - n, pa_w_run, in_pa=True) is not None
+                want_lookup_bypass = (lookup_cd == 0) and (_snapped_lookup_props(max_tokens - n, pa_w_run, in_pa=True) is not None)
                 want_ar_burst = pa_ar_burst > 0 and not want_lookup_bypass
                 if not want_lookup_bypass and not want_ar_burst:
                     if deferred_feats:
@@ -1920,6 +2028,8 @@ def dflash2_exact_generate_step(
                     if lookup is not None:
                         for tok_e in em:
                             lookup.append_one(tok_e)
+                    if lookup_cd > 0:
+                        lookup_cd -= 1
                     if pa_adapt:
                         pa_ema_tpc = 0.72 * pa_ema_tpc + 0.28 * keep
                         if 4.0 <= cyc_ms <= 60.0:
@@ -2114,6 +2224,8 @@ def dflash2_exact_generate_step(
                 for j in range(1, keep):
                     lookup.append_one(bl[path[j]])
                 lookup.append_one(bonus_tok)
+            if did_lookup_bypass and keep < 6:
+                lookup_cd = 8
 
             tc_ms = (time.perf_counter() - tv0) * 1000.0
             stats["verify_ms"] += tv_ms
@@ -2146,7 +2258,7 @@ def dflash2_exact_generate_step(
                 rem_next = max_tokens - (n + keep)
                 w_next = max(1, min(W_cfg, dr.block, rem_next))
                 l_next = lookup.match_len if lookup is not None else 0
-                byp_next = _snapped_lookup_props(rem_next, pa_w_run if use_pipe_ahead else w_next, in_pa=use_pipe_ahead) is not None
+                byp_next = (lookup_cd == 0) and (_snapped_lookup_props(rem_next, pa_w_run if use_pipe_ahead else w_next, in_pa=use_pipe_ahead) is not None)
                 if did_lookup_bypass and byp_next:
                     # Defer drafter KV update while continuing zero-draft lookup streak (-0.5ms/cycle on P8!).
                     deferred_feats.append(f_keep)

@@ -31,7 +31,7 @@ inline float head_sc(bfloat16_t v, float sc) {
   return HAS_SC ? (metal::precise::tanh(x / sc) * sc) : x;
 }
 
-template <int TG, bool HAS_SC>
+template <int TG, bool HAS_SC, bool ALIGN4 = true>
 inline float head_logsumexp_bf16(const device bfloat16_t* in, int n, float sc, uint lid,
                                  threadgroup float* lmax, threadgroup float* lnrm) {
   GL_NOFMA
@@ -50,7 +50,15 @@ inline float head_logsumexp_bf16(const device bfloat16_t* in, int n, float sc, u
       float vals[4];
       if (offset + 4 <= n) {
         const device bfloat16_t* p = in + offset;
-        for (int i = 0; i < 4; i++) vals[i] = head_sc<HAS_SC>(p[i], sc);
+        if constexpr (ALIGN4) {
+          bfloat4 bv = as_type<bfloat4>(((const device uint2*)p)[0]);
+          vals[0] = head_sc<HAS_SC>(bv.x, sc);
+          vals[1] = head_sc<HAS_SC>(bv.y, sc);
+          vals[2] = head_sc<HAS_SC>(bv.z, sc);
+          vals[3] = head_sc<HAS_SC>(bv.w, sc);
+        } else {
+          for (int i = 0; i < 4; i++) vals[i] = head_sc<HAS_SC>(p[i], sc);
+        }
       } else {
         for (int i = 0; i < 4; i++) vals[i] = (offset + i < n) ? head_sc<HAS_SC>(in[offset + i], sc) : -INFINITY;
       }
@@ -85,7 +93,7 @@ _LSE_SRC = r"""
     uint lid = thread_position_in_threadgroup.x;
     threadgroup float lmax[32];
     threadgroup float lnrm[32];
-    float out_v = head_logsumexp_bf16<TG, HAS_SC>(logits + size_t(b) * PP, VV, SC, lid, lmax, lnrm);
+    float out_v = head_logsumexp_bf16<TG, HAS_SC, (PP & 3) == 0>(logits + size_t(b) * PP, VV, SC, lid, lmax, lnrm);
     if (lid == 0) lse[b] = out_v;
 """
 
@@ -195,16 +203,39 @@ _FAST_ARG_P1_SRC = r"""
     uint lid = thread_position_in_threadgroup.x;
     uint lane = lid & 31, sg = lid >> 5;
     const device bfloat16_t* row = logits + size_t(b) * PP;
-    const int chunk = (VV + SP - 1) / SP;
+    const int chunk = (((VV + SP - 1) / SP) + 7) & ~7;
     const int s0 = int(sp) * chunk;
     const int s1 = min(VV, s0 + chunk);
     float bval = -INFINITY, sval = -INFINITY;
     uint bidx = 0xFFFFFFFFu, nanf = 0u;
-    for (int i = s0 + int(lid); i < s1; i += TG) {
-      float v = float(row[i]);
-      if (metal::isnan(v)) { nanf = 1u; }
-      else if (v > bval || (v == bval && uint(i) < bidx)) { sval = bval; bval = v; bidx = uint(i); }
-      else if (v > sval) { sval = v; }
+    if constexpr ((PP & 7) == 0) {
+      int i = s0 + int(lid) * 8;
+      for (; i + 8 <= s1; i += TG * 8) {
+        uint4 pk = ((const device uint4*)(row + i))[0];
+        bfloat4 v0 = as_type<bfloat4>(pk.xy), v1 = as_type<bfloat4>(pk.zw);
+        float vs[8] = { float(v0.x), float(v0.y), float(v0.z), float(v0.w), float(v1.x), float(v1.y), float(v1.z), float(v1.w) };
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+          float v = vs[k];
+          uint idx = uint(i + k);
+          if (metal::isnan(v)) { nanf = 1u; }
+          else if (v > bval || (v == bval && idx < bidx)) { sval = bval; bval = v; bidx = idx; }
+          else if (v > sval) { sval = v; }
+        }
+      }
+      for (; i < s1; i++) {
+        float v = float(row[i]);
+        if (metal::isnan(v)) { nanf = 1u; }
+        else if (v > bval || (v == bval && uint(i) < bidx)) { sval = bval; bval = v; bidx = uint(i); }
+        else if (v > sval) { sval = v; }
+      }
+    } else {
+      for (int i = s0 + int(lid); i < s1; i += TG) {
+        float v = float(row[i]);
+        if (metal::isnan(v)) { nanf = 1u; }
+        else if (v > bval || (v == bval && uint(i) < bidx)) { sval = bval; bval = v; bidx = uint(i); }
+        else if (v > sval) { sval = v; }
+      }
     }
     for (uint d = 16; d > 0; d /= 2) {
       float ov = simd_shuffle_down(bval, d);
@@ -275,7 +306,7 @@ _FAST_ARG_P2_SRC = r"""
     if (!need_fb[0]) return;
     const device bfloat16_t* row = logits + size_t(b) * PP;
     threadgroup float lmax[32], lnrm[32];
-    float sub = head_logsumexp_bf16<256, HAS_SC>(row, VV, SC, lid, lmax, lnrm);
+    float sub = head_logsumexp_bf16<256, HAS_SC, (PP & 3) == 0>(row, VV, SC, lid, lmax, lnrm);
     GlueIV best;
     best.val = -INFINITY;
     best.idx = 0;
@@ -326,7 +357,15 @@ _LSE32_P1_SRC = r"""
       float vals[4];
       if (offset + 4 <= VV) {
         const device bfloat16_t* p = in + offset;
-        for (int i = 0; i < 4; i++) vals[i] = head_sc<HAS_SC>(p[i], SC);
+        if constexpr ((PP & 3) == 0) {
+          bfloat4 bv = as_type<bfloat4>(((const device uint2*)p)[0]);
+          vals[0] = head_sc<HAS_SC>(bv.x, SC);
+          vals[1] = head_sc<HAS_SC>(bv.y, SC);
+          vals[2] = head_sc<HAS_SC>(bv.z, SC);
+          vals[3] = head_sc<HAS_SC>(bv.w, SC);
+        } else {
+          for (int i = 0; i < 4; i++) vals[i] = head_sc<HAS_SC>(p[i], SC);
+        }
       } else {
         for (int i = 0; i < 4; i++) vals[i] = (offset + i < VV) ? head_sc<HAS_SC>(in[offset + i], SC) : -INFINITY;
       }
@@ -358,12 +397,23 @@ _LP32_ARG_P1_SRC = r"""
     float sub = metal::isinf(gm) ? gm : (metal::log(tot) + gm);
     const device bfloat16_t* row = logits + size_t(b) * PP;
     device float* lp_row = lp + size_t(b) * VV;
-    const int chunk = (VV + SP - 1) / SP;
+    const int chunk = (((VV + SP - 1) / SP) + 3) & ~3;
     const int s0 = int(sp) * chunk;
     const int s1 = min(VV, s0 + chunk);
+    const bool lp_aligned = ((size_t(b) * uint(VV)) & 3u) == 0u;
     if constexpr (!DO_ARG) {
-      for (int i = s0 + int(lid); i < s1; i += TG) {
-        lp_row[i] = head_sc<HAS_SC>(row[i], SC) - sub;
+      if constexpr ((PP & 3) == 0) {
+        int i = s0 + int(lid) * 4;
+        for (; i + 4 <= s1; i += TG * 4) {
+          bfloat4 bv = as_type<bfloat4>(((const device uint2*)(row + i))[0]);
+          float4 fv = float4(head_sc<HAS_SC>(bv.x, SC) - sub, head_sc<HAS_SC>(bv.y, SC) - sub,
+                             head_sc<HAS_SC>(bv.z, SC) - sub, head_sc<HAS_SC>(bv.w, SC) - sub);
+          if (lp_aligned) { ((device float4*)(lp_row + i))[0] = fv; }
+          else { lp_row[i] = fv.x; lp_row[i + 1] = fv.y; lp_row[i + 2] = fv.z; lp_row[i + 3] = fv.w; }
+        }
+        for (; i < s1; i++) lp_row[i] = head_sc<HAS_SC>(row[i], SC) - sub;
+      } else {
+        for (int i = s0 + int(lid); i < s1; i += TG) lp_row[i] = head_sc<HAS_SC>(row[i], SC) - sub;
       }
       return;
     }
@@ -371,13 +421,34 @@ _LP32_ARG_P1_SRC = r"""
     GlueIV best;
     best.val = -INFINITY;
     best.idx = 0;
-    for (int i = s0 + int(lid); i < s1; i += TG) {
-      float v = head_sc<HAS_SC>(row[i], SC) - sub;
-      lp_row[i] = v;
-      GlueIV c;
-      c.val = v;
-      c.idx = uint(i);
-      best = glue_iv_reduce(best, c);
+    if constexpr ((PP & 3) == 0) {
+      int i = s0 + int(lid) * 4;
+      for (; i + 4 <= s1; i += TG * 4) {
+        bfloat4 bv = as_type<bfloat4>(((const device uint2*)(row + i))[0]);
+        float4 fv = float4(head_sc<HAS_SC>(bv.x, SC) - sub, head_sc<HAS_SC>(bv.y, SC) - sub,
+                           head_sc<HAS_SC>(bv.z, SC) - sub, head_sc<HAS_SC>(bv.w, SC) - sub);
+        if (lp_aligned) { ((device float4*)(lp_row + i))[0] = fv; }
+        else { lp_row[i] = fv.x; lp_row[i + 1] = fv.y; lp_row[i + 2] = fv.z; lp_row[i + 3] = fv.w; }
+        GlueIV c;
+        c.val = fv.x; c.idx = uint(i + 0); best = glue_iv_reduce(best, c);
+        c.val = fv.y; c.idx = uint(i + 1); best = glue_iv_reduce(best, c);
+        c.val = fv.z; c.idx = uint(i + 2); best = glue_iv_reduce(best, c);
+        c.val = fv.w; c.idx = uint(i + 3); best = glue_iv_reduce(best, c);
+      }
+      for (; i < s1; i++) {
+        float v = head_sc<HAS_SC>(row[i], SC) - sub;
+        lp_row[i] = v;
+        GlueIV c; c.val = v; c.idx = uint(i); best = glue_iv_reduce(best, c);
+      }
+    } else {
+      for (int i = s0 + int(lid); i < s1; i += TG) {
+        float v = head_sc<HAS_SC>(row[i], SC) - sub;
+        lp_row[i] = v;
+        GlueIV c;
+        c.val = v;
+        c.idx = uint(i);
+        best = glue_iv_reduce(best, c);
+      }
     }
     for (uint d = 16; d > 0; d /= 2) {
       GlueIV o;
@@ -652,19 +723,55 @@ _SAMP_SPARSE_P1_SRC = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const device bfloat16_t* row = logits + size_t(b) * PP;
-    const int chunk = (VV + SP - 1) / SP;
+    const int chunk = (((VV + SP - 1) / SP) + 3) & ~3;
     const int s0 = int(sp) * chunk;
     const int s1 = min(VV, s0 + chunk);
     size_t dst_base = (size_t(b) * SP + sp) * MAX_CSP;
     float mass_loc = 0.0f;
-    for (int i = s0 + int(lid); i < s1; i += TG) {
-      float lp = head_sc<HAS_SC>(row[i], SC) - sub;
-      if (lp >= scan_thr) {
-        mass_loc += metal::fast::exp(lp);
-        uint pos = atomic_fetch_add_explicit(&tg_cnt, 1u, memory_order_relaxed);
-        if (pos < uint(MAX_CSP)) {
-          cand_lp[dst_base + pos] = lp;
-          cand_id[dst_base + pos] = uint(i);
+    if constexpr ((PP & 3) == 0) {
+      int i = s0 + int(lid) * 4;
+      for (; i + 4 <= s1; i += TG * 4) {
+        bfloat4 bv = as_type<bfloat4>(((const device uint2*)(row + i))[0]);
+        float lps4[4] = {
+          head_sc<HAS_SC>(bv.x, SC) - sub,
+          head_sc<HAS_SC>(bv.y, SC) - sub,
+          head_sc<HAS_SC>(bv.z, SC) - sub,
+          head_sc<HAS_SC>(bv.w, SC) - sub
+        };
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+          float lp = lps4[k];
+          if (lp >= scan_thr) {
+            mass_loc += metal::fast::exp(lp);
+            uint pos = atomic_fetch_add_explicit(&tg_cnt, 1u, memory_order_relaxed);
+            if (pos < uint(MAX_CSP)) {
+              cand_lp[dst_base + pos] = lp;
+              cand_id[dst_base + pos] = uint(i + k);
+            }
+          }
+        }
+      }
+      for (; i < s1; i++) {
+        float lp = head_sc<HAS_SC>(row[i], SC) - sub;
+        if (lp >= scan_thr) {
+          mass_loc += metal::fast::exp(lp);
+          uint pos = atomic_fetch_add_explicit(&tg_cnt, 1u, memory_order_relaxed);
+          if (pos < uint(MAX_CSP)) {
+            cand_lp[dst_base + pos] = lp;
+            cand_id[dst_base + pos] = uint(i);
+          }
+        }
+      }
+    } else {
+      for (int i = s0 + int(lid); i < s1; i += TG) {
+        float lp = head_sc<HAS_SC>(row[i], SC) - sub;
+        if (lp >= scan_thr) {
+          mass_loc += metal::fast::exp(lp);
+          uint pos = atomic_fetch_add_explicit(&tg_cnt, 1u, memory_order_relaxed);
+          if (pos < uint(MAX_CSP)) {
+            cand_lp[dst_base + pos] = lp;
+            cand_id[dst_base + pos] = uint(i);
+          }
         }
       }
     }

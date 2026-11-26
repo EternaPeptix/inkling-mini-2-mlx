@@ -1070,7 +1070,7 @@ class DecoderLayer(nn.Module):
         fused_mlp_post = (
             fast_conv
             and self.post_mlp_convolution.kernel_size == 4
-            and hidden_states.shape[1] >= 16
+            and hidden_states.shape[1] >= 2
             and hidden_states.shape[-1] % 4 == 0
             and residual.dtype == mx.float32
             and self.post_mlp_convolution.conv1d.weight.dtype == mx.bfloat16

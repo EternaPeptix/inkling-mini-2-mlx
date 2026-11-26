@@ -672,8 +672,8 @@ def route_group_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0):
 
 # --------------------------------------------------------------------------------------------------------------------
 # Zero-sx, zero-barrier register-lean K-loop for gate_up and down_gather: cnt==1 fast path, or r-outside-t over bf16 x cache.
-def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_stg=False):
-    pq_one_decl = "const int pq = q;" if use_mask else "const int pq = (int)pl[0];"
+def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_stg=False, pq_one_q=False):
+    pq_one_decl = "const int pq = q;" if (use_mask or pq_one_q) else "const int pq = (int)pl[0];"
     tgsm_decl = (
         "        threadgroup uint4 x4_s[(STG_X && VPT == 8) ? (TMAX * 32) : 1];\n"
         "        threadgroup uint2 x2_s[(STG_X && VPT == 4) ? (TMAX * 32) : 1];\n"
@@ -1376,7 +1376,95 @@ def _early_dup_scan_dyn(ind_name):
 """.replace("@IND@", ind_name)
 
 
-def _gateup_src(mode, dbg, gc, uc, has_w_act=False, has_stg=False):
+def _early_dup_scan_ballot(ind_name):
+    return r"""
+    const int q = (int)tid.z;
+    const uint e = @IND@[q];
+    int cnt;
+    threadgroup uint pl[NPAIR];
+    if constexpr (NPAIR <= 32) {
+        uint32_t mask = (uint32_t)((uint64_t)simd_ballot((int)lane < NPAIR && @IND@[lane] == e));
+        if (mask & ((1u << q) - 1u)) return;
+        cnt = (int)metal::popcount(mask);
+        if (cnt > 1) {
+            if (sg == 0 && lane == 0) {
+                uint32_t m = mask;
+                int i = 0;
+                while (m) {
+                    pl[i++] = (uint)metal::ctz(m);
+                    m &= (m - 1u);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        uint64_t mask = (uint64_t)simd_ballot((int)lane < NPAIR && @IND@[lane] == e) & 0xFFFFFFFFULL;
+        uint64_t m1 = (uint64_t)simd_ballot((int)lane + 32 < NPAIR && @IND@[lane + 32] == e) & 0xFFFFFFFFULL;
+        mask |= (m1 << 32);
+        if (mask & ((1ULL << q) - 1ULL)) return;
+        cnt = (int)metal::popcount(mask);
+        if (cnt > 1) {
+            if (sg == 0 && lane == 0) {
+                uint64_t m = mask;
+                int i = 0;
+                while (m) {
+                    pl[i++] = (uint)metal::ctz(m);
+                    m &= (m - 1ULL);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    const int out_row = tid.y * (ROWS * NSG) + sg * ROWS;
+""".replace("@IND@", ind_name)
+
+
+def _early_dup_scan_ballot_dyn(ind_name):
+    return r"""
+    const int q = (int)tid.z;
+    const int act_pairs = w_act[0] * 8;
+    if (q >= act_pairs) return;
+    const uint e = @IND@[q];
+    int cnt;
+    threadgroup uint pl[NPAIR];
+    if constexpr (NPAIR <= 32) {
+        uint32_t mask = (uint32_t)((uint64_t)simd_ballot((int)lane < act_pairs && @IND@[lane] == e));
+        if (mask & ((1u << q) - 1u)) return;
+        cnt = (int)metal::popcount(mask);
+        if (cnt > 1) {
+            if (sg == 0 && lane == 0) {
+                uint32_t m = mask;
+                int i = 0;
+                while (m) {
+                    pl[i++] = (uint)metal::ctz(m);
+                    m &= (m - 1u);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        uint64_t mask = (uint64_t)simd_ballot((int)lane < act_pairs && @IND@[lane] == e) & 0xFFFFFFFFULL;
+        uint64_t m1 = (uint64_t)simd_ballot((int)lane + 32 < act_pairs && @IND@[lane + 32] == e) & 0xFFFFFFFFULL;
+        mask |= (m1 << 32);
+        if (mask & ((1ULL << q) - 1ULL)) return;
+        cnt = (int)metal::popcount(mask);
+        if (cnt > 1) {
+            if (sg == 0 && lane == 0) {
+                uint64_t m = mask;
+                int i = 0;
+                while (m) {
+                    pl[i++] = (uint)metal::ctz(m);
+                    m &= (m - 1ULL);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    const int out_row = tid.y * (ROWS * NSG) + sg * ROWS;
+""".replace("@IND@", ind_name)
+
+
+def _gateup_src(mode, dbg, gc, uc, has_w_act=False, has_stg=False, use_ballot=False):
     epi_one = r"""
         float gv[ROWS];
         #pragma unroll
@@ -1417,7 +1505,8 @@ def _gateup_src(mode, dbg, gc, uc, has_w_act=False, has_stg=False):
         }
 """ % (gc, uc, "for (int r = 0; r < ROWS; r++) gu[pq * NN + out_row + r] = bfloat16_t(gv[r]);" if dbg else "")
 
-    loop = _k_body_lean("pq / 8", epi_one, epi_multi, use_mask=False, has_stg=has_stg)
+    use_bal = bool(use_ballot and mode == "launch")
+    loop = _k_body_lean("pq / 8", epi_one, epi_multi, use_mask=False, has_stg=has_stg, pq_one_q=use_bal)
     if mode == "group":
         return _CONSTS_STAGED + r"""
     const uint u = tid.z;
@@ -1428,7 +1517,10 @@ def _gateup_src(mode, dbg, gc, uc, has_w_act=False, has_stg=False):
     const int out_row = tid.y * (ROWS * NSG) + sg * ROWS;
 """ + loop
     if mode == "launch":
-        scan = _early_dup_scan_dyn("inds_in") if has_w_act else _early_dup_scan("inds_in")
+        if use_bal:
+            scan = _early_dup_scan_ballot_dyn("inds_in") if has_w_act else _early_dup_scan_ballot("inds_in")
+        else:
+            scan = _early_dup_scan_dyn("inds_in") if has_w_act else _early_dup_scan("inds_in")
         return _CONSTS_STAGED + scan + loop
 
     return _CONSTS_STAGED + r"""
@@ -1456,7 +1548,7 @@ def _gateup_src(mode, dbg, gc, uc, has_w_act=False, has_stg=False):
 """ + loop
 
 
-def _down_gather_src(has_grp, has_w_act=False, has_stg=False):
+def _down_gather_src(has_grp, has_w_act=False, has_stg=False, use_ballot=False):
     epi_one = r"""
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -1483,7 +1575,8 @@ def _down_gather_src(has_grp, has_w_act=False, has_stg=False):
             }
         }
 """
-    loop = _k_body_lean("pq", epi_one, epi_multi, use_mask=False, has_stg=has_stg)
+    use_bal = bool(use_ballot and not has_grp)
+    loop = _k_body_lean("pq", epi_one, epi_multi, use_mask=False, has_stg=has_stg, pq_one_q=use_bal)
     if has_grp:
         return _CONSTS_STAGED + r"""
     const uint u = tid.z;
@@ -1493,7 +1586,10 @@ def _down_gather_src(has_grp, has_w_act=False, has_stg=False):
     const device uint* pl = pair_list + u_off[u];
     const int out_row = tid.y * (ROWS * NSG) + sg * ROWS;
 """ + loop
-    scan = _early_dup_scan_dyn("inds") if has_w_act else _early_dup_scan("inds")
+    if use_bal:
+        scan = _early_dup_scan_ballot_dyn("inds") if has_w_act else _early_dup_scan_ballot("inds")
+    else:
+        scan = _early_dup_scan_dyn("inds") if has_w_act else _early_dup_scan("inds")
     return _CONSTS_STAGED + scan + loop
 
 
@@ -2148,7 +2244,8 @@ def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, b
     stream_x = _stream_x(tmax_gu)
     stg_x = _stg_x(tmax_gu)
     has_wa = (w_act is not None and route == "launch")
-    key = ("gu6", route, debug, gate_softcap, up_softcap, has_wa, stg_x)
+    use_ballot = (B <= 8 and route == "launch" and os.environ.get("MOE_BALLOT_SCAN", "1") not in ("0", ""))
+    key = ("gu6", route, debug, gate_softcap, up_softcap, has_wa, stg_x, use_ballot)
     k = _kernels.get(key)
     if k is None:
         gc, uc = flit(gate_softcap), flit(up_softcap)
@@ -2161,8 +2258,8 @@ def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, b
                 ins.append("w_act")
             outs = (["inds_o", "wts_o"] if route == "kernel" else []) + ["sw"] + (["gu"] if debug else [])
         k = _kernels[key] = mx.fast.metal_kernel(
-            name="moe6_gateup_%s_%d_%d_%d_%s_%s" % (route, debug, int(has_wa), int(stg_x), gc.replace(".", "p"), uc.replace(".", "p")),
-            input_names=ins, output_names=outs, source=_gateup_src(route, debug, gc, uc, has_w_act=has_wa, has_stg=stg_x), header=HEADER,
+            name="moe6_gateup_%s_%d_%d_%d_%d_%s_%s" % (route, debug, int(has_wa), int(stg_x), int(use_ballot), gc.replace(".", "p"), uc.replace(".", "p")),
+            input_names=ins, output_names=outs, source=_gateup_src(route, debug, gc, uc, has_w_act=has_wa, has_stg=stg_x, use_ballot=use_ballot), header=HEADER,
             ensure_row_contiguous=True)
 
     if route == "group":
@@ -2262,19 +2359,20 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
     if dm == "split":
         has_grp = grp is not None
         has_wa = (w_act is not None and not has_grp)
+        use_ballot = (B <= 8 and not has_grp and os.environ.get("MOE_BALLOT_SCAN", "1") not in ("0", ""))
         tmax_dn = _tmax(B, TMAX_CAP_DN)
         stream_x = _stream_x(tmax_dn)
         stg_x = _stg_x(tmax_dn)
-        kg = _kernels.get(("dn_gather6", has_grp, has_wa, stg_x))
+        kg = _kernels.get(("dn_gather6", has_grp, has_wa, stg_x, use_ballot))
         if kg is None:
             ins_g = ["w", "scales", "gsc", "x"] + (
                 ["num_uniq", "uniq_e", "u_off", "u_cnt", "pair_list"] if has_grp else ["inds"]
             ) + (["w_act"] if has_wa else [])
-            kg = _kernels[("dn_gather6", has_grp, has_wa, stg_x)] = mx.fast.metal_kernel(
-                name="moe6_down_gather_%d_%d_%d" % (has_grp, int(has_wa), int(stg_x)),
+            kg = _kernels[("dn_gather6", has_grp, has_wa, stg_x, use_ballot)] = mx.fast.metal_kernel(
+                name="moe6_down_gather_%d_%d_%d_%d" % (has_grp, int(has_wa), int(stg_x), int(use_ballot)),
                 input_names=ins_g,
                 output_names=["down"],
-                source=_down_gather_src(has_grp, has_w_act=has_wa, has_stg=stg_x),
+                source=_down_gather_src(has_grp, has_w_act=has_wa, has_stg=stg_x, use_ballot=use_ballot),
                 header=HEADER,
                 ensure_row_contiguous=True,
             )

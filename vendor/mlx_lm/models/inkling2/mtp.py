@@ -873,9 +873,11 @@ def mtp_exact_generate_step(
             and B >= 4
         )
         if use_dyn:
-            W_MAX = int(os.environ.get("LOOPLING_MTP_DYN_W", "4"))
+            default_w_max = "5" if passes >= 3 else "4"
+            W_MAX = int(os.environ.get("LOOPLING_MTP_DYN_W", default_w_max))
             assert 2 <= W_MAX <= 6
-            D_DYN = int(os.environ.get("LOOPLING_MTP_DYN_D", str(min(3, W_MAX - 1))))
+            default_d_dyn = str(min(4, W_MAX - 1)) if passes >= 3 else str(min(3, W_MAX - 1))
+            D_DYN = int(os.environ.get("LOOPLING_MTP_DYN_D", default_d_dyn))
             assert 1 <= D_DYN <= min(5, B - 1)
             default_pa = "2" if passes > 1 else "3"
             PA_DEPTH = max(1, min(3, int(os.environ.get("LOOPLING_MTP_PA", default_pa))))
@@ -904,9 +906,9 @@ def mtp_exact_generate_step(
 
             w1_ms = float(os.environ.get("LOOPLING_MTP_W1_MS", str(4.88 * fscale)))
             rate_w1_dyn = 1.0 / w1_ms
-            alpha_dyn = float(os.environ.get("LOOPLING_MTP_DYN_ALPHA", "0.08"))
-            min_tree_dyn = int(os.environ.get("LOOPLING_MTP_DYN_MIN_CYC", "20"))
-            drop_ratio_dyn = float(os.environ.get("LOOPLING_MTP_DYN_DROP", "0.70"))
+            alpha_dyn = float(os.environ.get("LOOPLING_MTP_DYN_ALPHA", "0.15" if passes >= 3 else "0.08"))
+            min_tree_dyn = int(os.environ.get("LOOPLING_MTP_DYN_MIN_CYC", "10" if passes >= 3 else "20"))
+            drop_ratio_dyn = float(os.environ.get("LOOPLING_MTP_DYN_DROP", "0.94" if passes >= 3 else "0.70"))
             dyn_burst_init = int(os.environ.get("LOOPLING_MTP_DYN_BURST", "32"))
             dyn_burst_max = int(os.environ.get("LOOPLING_MTP_DYN_BURST_MAX", "128"))
 

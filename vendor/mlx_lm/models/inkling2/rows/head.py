@@ -687,66 +687,75 @@ _SAMP_SRAM_P2_SRC = r"""
     const float TOPP = s_cfg[0];
     const float INVT = s_cfg[2];
     uint b = threadgroup_position_in_grid.x;
-    uint lid = thread_position_in_threadgroup.x;
-    if (lid != 0) return;
+    uint lane = thread_index_in_simdgroup;
 
-    float tot_mass = 0.0f;
-    int total_c = 0;
-    bool ovf = false;
-    for (int s = 0; s < SP; s++) {
-      tot_mass += mass_part[size_t(b) * SP + s];
-      uint cnt_s = c_cnt[size_t(b) * SP + s];
-      if (cnt_s > uint(MAX_CSP)) { ovf = true; cnt_s = uint(MAX_CSP); }
-      total_c += int(cnt_s);
+    float mass_loc = 0.0f;
+    uint cnt_loc = 0u;
+    uint ovf_loc = 0u;
+    for (int s = int(lane); s < SP; s += 32) {
+      mass_loc += mass_part[size_t(b) * SP + s];
+      uint cs = c_cnt[size_t(b) * SP + s];
+      if (cs > uint(MAX_CSP)) { ovf_loc = 1u; cs = uint(MAX_CSP); }
+      cnt_loc += cs;
     }
+    float tot_mass = simd_sum(mass_loc);
+    int total_c = int(simd_sum(cnt_loc));
+    bool ovf = (simd_sum(ovf_loc) != 0u);
     if (ovf || total_c > MAX_TOT || total_c == 0 || (USE_TOPP && tot_mass < TOPP)) {
-      overflow[b] = 1u;
-      out_bonus[b] = 0u;
-      if constexpr (COUPLED) { out_reject[b] = 0u; if (int(b) < N_Q) child_pt[b] = 0.0f; }
+      if (lane == 0u) {
+        overflow[b] = 1u;
+        out_bonus[b] = 0u;
+        if constexpr (COUPLED) { out_reject[b] = 0u; if (int(b) < N_Q) child_pt[b] = 0.0f; }
+      }
       return;
     }
 
     threadgroup float lps[MAX_TOT];
     threadgroup uint ids[MAX_TOT];
-    int n = 0;
-    for (int s = 0; s < SP; s++) {
-      uint cnt_s = min(uint(MAX_CSP), c_cnt[size_t(b) * SP + s]);
-      size_t src_base = (size_t(b) * SP + s) * MAX_CSP;
-      for (uint j = 0; j < cnt_s; j++) {
-        lps[n] = cand_lp[src_base + j];
-        ids[n] = cand_id[src_base + j];
-        n++;
+    threadgroup int k_cut_tg;
+    if (lane == 0u) {
+      int n = 0;
+      for (int s = 0; s < SP; s++) {
+        uint cnt_s = min(uint(MAX_CSP), c_cnt[size_t(b) * SP + s]);
+        size_t src_base = (size_t(b) * SP + s) * MAX_CSP;
+        for (uint j = 0; j < cnt_s; j++) {
+          lps[n] = cand_lp[src_base + j];
+          ids[n] = cand_id[src_base + j];
+          n++;
+        }
       }
-    }
-
-    // Insertion sort descending on lps (n is typically 10..200)
-    for (int i = 1; i < n; i++) {
-      float kl = lps[i];
-      uint ki = ids[i];
-      int j = i - 1;
-      while (j >= 0 && lps[j] < kl) {
-        lps[j + 1] = lps[j];
-        ids[j + 1] = ids[j];
-        j--;
+      // Insertion sort descending on lps (n is typically 10..200)
+      for (int i = 1; i < n; i++) {
+        float kl = lps[i];
+        uint ki = ids[i];
+        int j = i - 1;
+        while (j >= 0 && lps[j] < kl) {
+          lps[j + 1] = lps[j];
+          ids[j + 1] = ids[j];
+          j--;
+        }
+        lps[j + 1] = kl;
+        ids[j + 1] = ki;
       }
-      lps[j + 1] = kl;
-      ids[j + 1] = ki;
-    }
-
-    int k_cut = n;
-    if (USE_TOPP) {
-      float cum = 0.0f;
-      for (int i = 0; i < n; i++) {
-        cum += metal::fast::exp(lps[i]);
-        if (cum >= TOPP) { k_cut = i + 1; break; }
+      int k_cut = n;
+      if (USE_TOPP) {
+        float cum = 0.0f;
+        for (int i = 0; i < n; i++) {
+          cum += metal::fast::exp(lps[i]);
+          if (cum >= TOPP) { k_cut = i + 1; break; }
+        }
       }
+      k_cut_tg = k_cut;
     }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    float lp_max = lps[0];
-    float zt = 0.0f;
-    for (int i = 0; i < k_cut; i++) {
-      zt += metal::fast::exp((lps[i] - lp_max) * INVT);
+    const int k_cut = k_cut_tg;
+    const float lp_max = lps[0];
+    float zt_loc = 0.0f;
+    for (int i = int(lane); i < k_cut; i += 32) {
+      zt_loc += metal::fast::exp((lps[i] - lp_max) * INVT);
     }
+    float zt = simd_sum(zt_loc);
     float inv_zt = 1.0f / max(zt, 1e-30f);
 
     const uint seed0 = seeds[b * 2 + 0];
@@ -778,13 +787,13 @@ _SAMP_SRAM_P2_SRC = r"""
     uint best_r_id = ids[0];
     float c_pt = 0.0f;
 
-    for (int i = 0; i < k_cut; i++) {
+    for (int i = int(lane); i < k_cut; i += 32) {
       uint id_i = ids[i];
       float pt = metal::fast::exp((lps[i] - lp_max) * INVT) * inv_zt;
       float u = hash_u01(seed0, seed1, id_i);
       float g = -metal::log(-metal::log(u));
       float sc_b = metal::log(max(pt, 1e-38f)) + g;
-      if (sc_b > best_b_sc) { best_b_sc = sc_b; best_b_id = id_i; }
+      if (sc_b > best_b_sc || (sc_b == best_b_sc && id_i < best_b_id)) { best_b_sc = sc_b; best_b_id = id_i; }
       if constexpr (COUPLED) {
         if (int(b) < N_Q) {
           if (id_i == cid) c_pt = pt;
@@ -795,17 +804,33 @@ _SAMP_SRAM_P2_SRC = r"""
           float rw = pt - qv;
           if (rw > 0.0f) {
             float sc_r = metal::log(rw) + g;
-            if (sc_r > best_r_sc) { best_r_sc = sc_r; best_r_id = id_i; }
+            if (sc_r > best_r_sc || (sc_r == best_r_sc && id_i < best_r_id)) { best_r_sc = sc_r; best_r_id = id_i; }
           }
         }
       }
     }
 
-    overflow[b] = 0u;
-    out_bonus[b] = best_b_id;
+    for (uint d = 16u; d > 0u; d >>= 1) {
+      float ob_sc = simd_shuffle_down(best_b_sc, d);
+      uint ob_id = simd_shuffle_down(best_b_id, d);
+      if (ob_sc > best_b_sc || (ob_sc == best_b_sc && ob_id < best_b_id)) { best_b_sc = ob_sc; best_b_id = ob_id; }
+      if constexpr (COUPLED) {
+        float or_sc = simd_shuffle_down(best_r_sc, d);
+        uint or_id = simd_shuffle_down(best_r_id, d);
+        if (or_sc > best_r_sc || (or_sc == best_r_sc && or_id < best_r_id)) { best_r_sc = or_sc; best_r_id = or_id; }
+      }
+    }
     if constexpr (COUPLED) {
-      out_reject[b] = (best_r_sc > -1e30f) ? best_r_id : best_b_id;
-      if (int(b) < N_Q) child_pt[b] = c_pt;
+      c_pt = simd_max(c_pt);
+    }
+
+    if (lane == 0u) {
+      overflow[b] = 0u;
+      out_bonus[b] = best_b_id;
+      if constexpr (COUPLED) {
+        out_reject[b] = (best_r_sc > -1e30f) ? best_r_id : best_b_id;
+        if (int(b) < N_Q) child_pt[b] = c_pt;
+      }
     }
 """
 
@@ -887,8 +912,8 @@ def _run_sample_core(logits, softcap, unpadded_vocab, *, temp, top_p=1.0, min_p=
             child_toks.reshape(-1) if coupled else _DUMMY_SAMP_U32,
         ],
         template=[("SP", sp), ("MAX_CSP", max_csp), ("MAX_TOT", max_tot), ("USE_TOPP", use_topp), ("COUPLED", coupled), ("N_Q", n_q)],
-        grid=(B, 1, 1),
-        threadgroup=(1, 1, 1),
+        grid=(B * 32, 1, 1),
+        threadgroup=(32, 1, 1),
         output_shapes=[(B,), (B,) if coupled else (1,), (max(1, n_q),), (B,)],
         output_dtypes=[mx.uint32, mx.uint32, mx.float32, mx.uint32],
     )

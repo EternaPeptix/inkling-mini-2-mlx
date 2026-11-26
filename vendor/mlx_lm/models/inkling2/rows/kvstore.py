@@ -50,7 +50,7 @@ _STAGE1_FLAT = r"""
         int bh = b * HQ + h;
         size_t base = ((size_t)(b * HKV + kvh) * CAP) * D;
         msk.pb = pb + (size_t)bh * R;
-        sdpa1_head<T, PBT, D, HAS_GATE>(
+        sdpa1_head_v32<T, PBT, D, 32, HAS_GATE>(
             q + (size_t)bh * D, kk + base, vv + base, gate + (size_t)bh * D, o1 + (size_t)bh * D, S, sc,
             float(static_cast<T>(sinks[bh])), msk, outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
     } else {
@@ -144,8 +144,16 @@ METAL_FUNC void sdpa1_head_paged(
   queries += loff;
   gate += (int)simd_gid * v_per_thread;
   out += (int)simd_gid * v_per_thread;
-  for (int i = 0; i < qk_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+  if constexpr (D == 128) {
+    bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+    q[0] = static_cast<U>(scale) * qb.x;
+    q[1] = static_cast<U>(scale) * qb.y;
+    q[2] = static_cast<U>(scale) * qb.z;
+    q[3] = static_cast<U>(scale) * qb.w;
+  } else {
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[i] = static_cast<U>(scale) * queries[i];
+    }
   }
   for (int i = 0; i < v_per_thread; i++) {
     o[i] = 0;
@@ -162,12 +170,20 @@ METAL_FUNC void sdpa1_head_paged(
     if (use_key) {
       PagedKvPair<T> kv = paged_kv_pair(
           base_k, ov_k, act_k, base_v, ov_v, act_v, pt_row, n_base, hkv, kvh, b, i >> 8, (i & 255) * 128 + loff);
-      for (int j = 0; j < qk_per_thread; j++) {
-        k[j] = kv.k[j];
-      }
       U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * k[j];
+      if constexpr (D == 128) {
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)kv.k)[0]);
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+      } else {
+        for (int j = 0; j < qk_per_thread; j++) {
+          k[j] = kv.k[j];
+        }
+        for (int j = 0; j < qk_per_thread; j++) {
+          score += q[j] * k[j];
+        }
       }
       score = simd_sum(score);
       score += static_cast<U>(fm);
@@ -176,8 +192,16 @@ METAL_FUNC void sdpa1_head_paged(
       U exp_score = fast::exp(score - new_max);
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * kv.v[j];
+      if constexpr (D == 128) {
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)kv.v)[0]);
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      } else {
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * kv.v[j];
+        }
       }
     }
   }
@@ -185,21 +209,33 @@ METAL_FUNC void sdpa1_head_paged(
     max_scores[simd_gid] = max_score;
     sum_exp_scores[simd_gid] = sum_exp_score;
   }
+  for (int i = 0; i < v_per_thread; i++) {
+    outputs[(i * BD + simd_lid) * BN + simd_gid] = o[i];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   max_score = max_scores[simd_lid];
   U new_max = simd_max(max_score);
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
   for (int i = 0; i < v_per_thread; i++) {
-    outputs[(i * BD + simd_lid) * BN + simd_gid] = o[i];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = 0; i < v_per_thread; i++) {
     o[i] = simd_sum(outputs[(i * BD + simd_gid) * BN + simd_lid] * factor);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
   }
   if (simd_lid == 0) {
-    if constexpr (HAS_GATE) {
+    if constexpr (D == 128) {
+      if constexpr (HAS_GATE) {
+        bfloat4 gb = as_type<bfloat4>(((const device uint2*)gate)[0]);
+        bfloat4 ob = bfloat4(
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[0])), static_cast<float>(gb.x))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[1])), static_cast<float>(gb.y))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[2])), static_cast<float>(gb.z))),
+            static_cast<T>(glue_gate(static_cast<float>(static_cast<T>(o[3])), static_cast<float>(gb.w))));
+        ((device uint2*)out)[0] = as_type<uint2>(ob);
+      } else {
+        bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+        ((device uint2*)out)[0] = as_type<uint2>(ob);
+      }
+    } else if constexpr (HAS_GATE) {
       for (int i = 0; i < v_per_thread; i++) {
         T ov = static_cast<T>(o[i]);
         out[i] = static_cast<T>(glue_gate(static_cast<float>(ov), static_cast<float>(gate[i])));
@@ -231,8 +267,16 @@ METAL_FUNC void sdpa2_block_paged(
   const int loff = (int)simd_lid * qk_per_thread;
   queries += loff;
   out += loff;
-  for (int i = 0; i < qk_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+  if constexpr (D == 128) {
+    bfloat4 qb = as_type<bfloat4>(((const device uint2*)queries)[0]);
+    q[0] = static_cast<U>(scale) * qb.x;
+    q[1] = static_cast<U>(scale) * qb.y;
+    q[2] = static_cast<U>(scale) * qb.z;
+    q[3] = static_cast<U>(scale) * qb.w;
+  } else {
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[i] = static_cast<U>(scale) * queries[i];
+    }
   }
   U max_score = Limits<U>::finite_min;
   U sum_exp_score = 0;
@@ -246,38 +290,74 @@ METAL_FUNC void sdpa2_block_paged(
   for (; i + (TK - 1) * blocks < N; i += blocks * TK, p += 2) {
     PagedKvPair<T> kv0 = paged_kv_pair(base_k, ov_k, act_k, base_v, ov_v, act_v, pt_row, n_base, hkv, kvh, b, p, blk_off);
     PagedKvPair<T> kv1 = paged_kv_pair(base_k, ov_k, act_k, base_v, ov_v, act_v, pt_row, n_base, hkv, kvh, b, p + 1, blk_off);
-    T k_reg[TK][qk_per_thread];
-    T v_reg[TK][v_per_thread];
-    for (int j = 0; j < qk_per_thread; j++) {
-      k_reg[0][j] = kv0.k[j];
-      k_reg[1][j] = kv0.k[128 * 128 + j];
-      k_reg[2][j] = kv1.k[j];
-      k_reg[3][j] = kv1.k[128 * 128 + j];
-    }
-    for (int j = 0; j < v_per_thread; j++) {
-      v_reg[0][j] = kv0.v[j];
-      v_reg[1][j] = kv0.v[128 * 128 + j];
-      v_reg[2][j] = kv1.v[j];
-      v_reg[3][j] = kv1.v[128 * 128 + j];
-    }
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      float fm = 0;
-      bool use_key = msk.at(ii, fm);
-      if (use_key) {
-        U score = 0;
-        for (int j = 0; j < qk_per_thread; j++) {
-          score += q[j] * static_cast<U>(k_reg[t][j]);
+    if constexpr (D == 128) {
+      bfloat4 k_reg[TK];
+      bfloat4 v_reg[TK];
+      k_reg[0] = as_type<bfloat4>(((const device uint2*)kv0.k)[0]);
+      k_reg[1] = as_type<bfloat4>(((const device uint2*)(kv0.k + 128 * 128))[0]);
+      k_reg[2] = as_type<bfloat4>(((const device uint2*)kv1.k)[0]);
+      k_reg[3] = as_type<bfloat4>(((const device uint2*)(kv1.k + 128 * 128))[0]);
+      v_reg[0] = as_type<bfloat4>(((const device uint2*)kv0.v)[0]);
+      v_reg[1] = as_type<bfloat4>(((const device uint2*)(kv0.v + 128 * 128))[0]);
+      v_reg[2] = as_type<bfloat4>(((const device uint2*)kv1.v)[0]);
+      v_reg[3] = as_type<bfloat4>(((const device uint2*)(kv1.v + 128 * 128))[0]);
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        float fm = 0;
+        bool use_key = msk.at(ii, fm);
+        if (use_key) {
+          U score = 0;
+          score += q[0] * static_cast<U>(k_reg[t].x);
+          score += q[1] * static_cast<U>(k_reg[t].y);
+          score += q[2] * static_cast<U>(k_reg[t].z);
+          score += q[3] * static_cast<U>(k_reg[t].w);
+          score = simd_sum(score);
+          score += static_cast<U>(fm);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
+          o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
+          o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
+          o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
         }
-        score = simd_sum(score);
-        score += static_cast<U>(fm);
-        U new_max = max(max_score, score);
-        U factor = fast::exp(max_score - new_max);
-        U exp_score = fast::exp(score - new_max);
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-        for (int j = 0; j < v_per_thread; j++) {
-          o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
+      }
+    } else {
+      T k_reg[TK][qk_per_thread];
+      T v_reg[TK][v_per_thread];
+      for (int j = 0; j < qk_per_thread; j++) {
+        k_reg[0][j] = kv0.k[j];
+        k_reg[1][j] = kv0.k[128 * 128 + j];
+        k_reg[2][j] = kv1.k[j];
+        k_reg[3][j] = kv1.k[128 * 128 + j];
+      }
+      for (int j = 0; j < v_per_thread; j++) {
+        v_reg[0][j] = kv0.v[j];
+        v_reg[1][j] = kv0.v[128 * 128 + j];
+        v_reg[2][j] = kv1.v[j];
+        v_reg[3][j] = kv1.v[128 * 128 + j];
+      }
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        float fm = 0;
+        bool use_key = msk.at(ii, fm);
+        if (use_key) {
+          U score = 0;
+          for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * static_cast<U>(k_reg[t][j]);
+          }
+          score = simd_sum(score);
+          score += static_cast<U>(fm);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
+          }
         }
       }
     }
@@ -288,19 +368,40 @@ METAL_FUNC void sdpa2_block_paged(
     if (use_key) {
       PagedKvPair<T> kv = paged_kv_pair(
           base_k, ov_k, act_k, base_v, ov_v, act_v, pt_row, n_base, hkv, kvh, b, i >> 8, (i & 255) * 128 + loff);
-      U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * kv.k[j];
-      }
-      score = simd_sum(score);
-      score += fm;
-      U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
-      U exp_score = fast::exp(score - new_max);
-      max_score = new_max;
-      sum_exp_score = sum_exp_score * factor + exp_score;
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * kv.v[j];
+      if constexpr (D == 128) {
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)kv.k)[0]);
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += fm;
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)kv.v)[0]);
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      } else {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+          score += q[j] * kv.k[j];
+        }
+        score = simd_sum(score);
+        score += fm;
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * kv.v[j];
+        }
       }
     }
   }
@@ -308,8 +409,13 @@ METAL_FUNC void sdpa2_block_paged(
     sums[0] = sum_exp_score;
     maxs[0] = max_score;
   }
-  for (int i2 = 0; i2 < v_per_thread; i2++) {
-    out[i2] = static_cast<T>(o[i2]);
+  if constexpr (D == 128) {
+    bfloat4 ob = bfloat4(static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3]));
+    ((device uint2*)out)[0] = as_type<uint2>(ob);
+  } else {
+    for (int i2 = 0; i2 < v_per_thread; i2++) {
+      out[i2] = static_cast<T>(o[i2]);
+    }
   }
 }
 """

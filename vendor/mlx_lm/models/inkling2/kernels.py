@@ -480,9 +480,9 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
             const int key = k_blk + r;
             half4 h0 = half4(0), h1 = half4(0);
             if (key < S) {
-                auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
-                h0 = half4(float4(kp[0]));
-                h1 = half4(float4(kp[1]));
+                const uint4 kr = *(const device uint4*)(k_head + key * k_strides[2] + col);
+                h0 = half4(float4(as_type<vec<T, 4>>(kr.xy)));
+                h1 = half4(float4(as_type<vec<T, 4>>(kr.zw)));
             }
             if constexpr (TRANS_K) {
                 ((threadgroup half4*)(KV_smem + r * LDV + col))[0] = h0;
@@ -540,9 +540,9 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
             const int key = k_blk + r;
             half4 h0 = half4(0), h1 = half4(0);
             if (key < S) {
-                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
-                h0 = half4(float4(vp[0]));
-                h1 = half4(float4(vp[1]));
+                const uint4 vr = *(const device uint4*)(v_head + key * v_strides[2] + col);
+                h0 = half4(float4(as_type<vec<T, 4>>(vr.xy)));
+                h1 = half4(float4(as_type<vec<T, 4>>(vr.zw)));
             }
             ((threadgroup half4*)(KV_smem + r * LDV + col))[0] = h0;
             ((threadgroup half4*)(KV_smem + r * LDV + col))[1] = h1;
@@ -567,10 +567,12 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
                     for (int cb = 0; cb < 3; ++cb) {
                         const int col = d_base + cb * 8 + fn;
                         simdgroup_bfloat8x8 p0, p1;
-                        p0.thread_elements()[0] = rel_proj[(fm + 0) * R + col];
-                        p0.thread_elements()[1] = rel_proj[(fm + 0) * R + col + 1];
-                        p1.thread_elements()[0] = rel_proj[(fm + 8) * R + col];
-                        p1.thread_elements()[1] = rel_proj[(fm + 8) * R + col + 1];
+                        const bfloat2 p0v = *(const device bfloat2*)(rel_proj + (fm + 0) * R + col);
+                        p0.thread_elements()[0] = p0v.x;
+                        p0.thread_elements()[1] = p0v.y;
+                        const bfloat2 p1v = *(const device bfloat2*)(rel_proj + (fm + 8) * R + col);
+                        p1.thread_elements()[0] = p1v.x;
+                        p1.thread_elements()[1] = p1v.y;
                         simdgroup_float8x8 bc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                         simdgroup_multiply_accumulate(bc, r_frag0, p0, bc);
                         simdgroup_multiply_accumulate(bc, r_frag1, p1, bc);
@@ -592,6 +594,18 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
                         scores[kb0 + kb].thread_elements()[e] = s;
                         tile_max = max(tile_max, s);
                     }
+                }
+            } else if (OTF && full_visible && d_hi < R) {
+                #pragma clang loop unroll(full)
+                for (int kb = 0; kb < 2; ++kb) {
+                    const int d0 = diag - (k0 + kb * 8 + fn);
+                    float s0 = scores[kb0 + kb].thread_elements()[0] * qscale;
+                    s0 += float(rbp_row[d0]) * LOG2E;
+                    float s1 = scores[kb0 + kb].thread_elements()[1] * qscale;
+                    s1 += float(rbp_row[d0 - 1]) * LOG2E;
+                    scores[kb0 + kb].thread_elements()[0] = s0;
+                    scores[kb0 + kb].thread_elements()[1] = s1;
+                    tile_max = max(tile_max, max(s0, s1));
                 }
             } else if (!OTF && VEC_BIAS && full_visible && d_hi < R) {
                 #pragma clang loop unroll(full)

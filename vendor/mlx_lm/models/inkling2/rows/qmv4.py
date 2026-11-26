@@ -3923,13 +3923,14 @@ _QMV4_BF16_TOP16_MMA_P1_SRC = r"""
     for (int rt = 0; rt < RPT; rt++) {
       simdgroup_store(acc[rt], out_s, 8);
       simdgroup_barrier(mem_flags::mem_threadgroup);
-      if (lane == 0) {
+      if (lane < 8u) {
         int r0 = sg_row + rt * 8;
-        int n_valid = min(8, N - r0);
-        for (int b = 0; b < BB; b++) {
-          for (int r = 0; r < n_valid; r++) {
+        int r = int(lane);
+        if (r0 + r < N) {
+          uint idx = uint(r0 + r);
+          _Pragma("clang loop unroll(full)")
+          for (int b = 0; b < BB; b++) {
             float val = float(static_cast<bfloat16_t>(out_s[b * 8 + r]));
-            uint idx = uint(r0 + r);
             if (val > bv0[b] || (val == bv0[b] && idx < bi0[b])) {
               bv1[b] = bv0[b]; bi1[b] = bi0[b]; bv0[b] = val; bi0[b] = idx;
             } else if (val > bv1[b] || (val == bv1[b] && idx < bi1[b])) {
@@ -3944,10 +3945,28 @@ _QMV4_BF16_TOP16_MMA_P1_SRC = r"""
 
   threadgroup float tg_v0[NSG][BB], tg_v1[NSG][BB];
   threadgroup uint  tg_i0[NSG][BB], tg_i1[NSG][BB];
-  if (lane == 0) {
-    for (int b = 0; b < BB; b++) {
-      tg_v0[sg][b] = bv0[b]; tg_i0[sg][b] = bi0[b];
-      tg_v1[sg][b] = bv1[b]; tg_i1[sg][b] = bi1[b];
+  for (int b = 0; b < BB; b++) {
+    float v0 = bv0[b], v1 = bv1[b];
+    uint  i0 = bi0[b], i1 = bi1[b];
+    for (uint d = 4u; d > 0u; d >>= 1) {
+      float ov0 = simd_shuffle_down(v0, d);
+      uint  oi0 = simd_shuffle_down(i0, d);
+      float ov1 = simd_shuffle_down(v1, d);
+      uint  oi1 = simd_shuffle_down(i1, d);
+      if (ov0 > v0 || (ov0 == v0 && oi0 < i0)) {
+        if (v0 > ov1 || (v0 == ov1 && i0 < oi1)) {
+          v1 = v0; i1 = i0;
+        } else {
+          v1 = ov1; i1 = oi1;
+        }
+        v0 = ov0; i0 = oi0;
+      } else if (ov0 > v1 || (ov0 == v1 && oi0 < i1)) {
+        v1 = ov0; i1 = oi0;
+      }
+    }
+    if (lane == 0u) {
+      tg_v0[sg][b] = v0; tg_i0[sg][b] = i0;
+      tg_v1[sg][b] = v1; tg_i1[sg][b] = i1;
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

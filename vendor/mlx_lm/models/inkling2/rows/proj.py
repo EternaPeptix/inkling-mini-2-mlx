@@ -76,11 +76,12 @@ def _qheader(pro):
 _kernels = {}
 
 
-def _qkernel(nw, xmap, pro, rout=False, ro=False, stg_x=False):
+def _qkernel(nw, xmap, pro, rout=False, ro=False, stg_x=False, f32x=False):
     use_rout = rout and not pro
     use_ro = ro and not pro and not use_rout
     use_stg_x = bool(stg_x and use_rout and not use_ro)
-    key = (nw, xmap, pro, use_rout, use_ro, use_stg_x)
+    use_f32x = bool(f32x and use_rout and not use_ro and not use_stg_x)
+    key = (nw, xmap, pro, use_rout, use_ro, use_stg_x, use_f32x)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -90,12 +91,12 @@ def _qkernel(nw, xmap, pro, rout=False, ro=False, stg_x=False):
         ins += [f"w{i}", f"s{i}", f"b{i}"]
     lines = [
         "uint ty = threadgroup_position_in_grid.y;",
-        "uint rb0 = threadgroup_position_in_grid.z * RB;",
+        "uint rb0 = threadgroup_position_in_grid.x * RB;",
         "uint sg = simdgroup_index_in_threadgroup;",
         "uint sl = thread_index_in_simdgroup;",
     ]
     fn = "rows_qmv_ro" if use_ro else ("rows_qmv_rout" if use_rout else "rows_qmv_tile")
-    tail_t = (", true" if use_stg_x else "") if use_rout else ("" if use_ro else ", STG")
+    tail_t = (", true" if use_stg_x else (", false, false" if use_f32x else "")) if use_rout else ("" if use_ro else ", STG")
     if not pro:
         if use_stg_x:
             lines.insert(0, "threadgroup uint32_t sx_raw[RB * 160]; threadgroup bfloat16_t* sx = (threadgroup bfloat16_t*)sx_raw;")
@@ -130,7 +131,7 @@ def _qkernel(nw, xmap, pro, rout=False, ro=False, stg_x=False):
                 f"(w{i}, s{i}, b{i}, x{xmap[i]}, {gt}, y + B * ({yoff}), N{i}, ty - ({prev}), rb0, sg, sl, sx); }}"
             )
             prev = end
-    suf = "_pro" if pro else ("_ro" if use_ro else ("_rout_sx" if use_stg_x else ("_rout" if use_rout else "")))
+    suf = "_pro" if pro else ("_ro" if use_ro else ("_rout_sx" if use_stg_x else ("_rout_fx" if use_f32x else ("_rout" if use_rout else ""))))
     k = mx.fast.metal_kernel(
         name="f3_qmv_x%s_n%d%s" % ("".join(map(str, xmap)), nw, suf),
         input_names=ins,
@@ -168,6 +169,7 @@ def _launch_q(xs, weights, gate=None):
         tot_n += w.shape[0]
     pro = gate is not None
     rout = _qmv._use_rout(B, tot_n, len(weights), pro=pro)
+    f32x = _qmv._use_rout_f32x(B, tot_n, len(weights), pro=pro) if rout else False
     ro = _qmv._use_ro(B, tot_n, pro=pro, rout=rout)
     stg_x = _qmv._use_stg_x(B, tot_n, rout, pro=pro)
     rps, nsg, rb, stg = _qmv._cfg(B, pro, N=tot_n, rout=rout, ro=ro)
@@ -184,10 +186,10 @@ def _launch_q(xs, weights, gate=None):
         args += [w, s, b]
         tmpl.append((f"N{i}", N))
         tiles += (N + tile_w - 1) // tile_w
-    return _qkernel(len(weights), tuple(xmap), pro, rout=rout, ro=ro, stg_x=stg_x)(
+    return _qkernel(len(weights), tuple(xmap), pro, rout=rout, ro=ro, stg_x=stg_x, f32x=f32x)(
         inputs=args,
         template=tmpl,
-        grid=(32, nsg * tiles, (B + rb - 1) // rb),
+        grid=(((B + rb - 1) // rb) * 32, nsg * tiles, 1),
         threadgroup=(32, nsg, 1),
         output_shapes=[(B * tot_n,)],
         output_dtypes=[mx.bfloat16],
@@ -469,15 +471,15 @@ METAL_FUNC void rows_qmv_norm_run(
       _Pragma("clang loop unroll(full)")
       for (int b = 0; b < RB; b++) {
         if (FULL || b < nb) {
-          smb[b] = proj_norm_load8(mp + size_t(b) * (3u * size_t(K)), inv[b], l0, l1, xtb[b]);
+          smb[b] = proj_norm_load8(mp + b * (3 * K), inv[b], l0, l1, xtb[b]);
         }
       }
       _Pragma("clang loop unroll(full)")
       for (int row = 0; row < RPS; row++) {
         int src = PR ? min(row, last_row) : row;
-        uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
-        U sc = scales[size_t(src) * in_vec_size_g];
-        U bi = biases[size_t(src) * in_vec_size_g];
+        uint2 wr = ((const device uint2*)(ws + src * in_vec_size_w))[0];
+        U sc = scales[src * in_vec_size_g];
+        U bi = biases[src * in_vec_size_g];
         float4 w0 = float4(as_type<uchar4>(wr.x));
         float4 w1 = float4(as_type<uchar4>(wr.y));
         _Pragma("clang loop unroll(full)")
@@ -529,7 +531,7 @@ def _get_qnorm_kernel(shared_ln, eps_ln, use_tile):
         ins += [f"w{i}", f"s{i}", f"b{i}"]
     lines = [
         "uint ty = threadgroup_position_in_grid.y;",
-        "uint rb0 = threadgroup_position_in_grid.z * RB;",
+        "uint rb0 = threadgroup_position_in_grid.x * RB;",
         "uint sg = simdgroup_index_in_threadgroup;",
         "uint sl = thread_index_in_simdgroup;",
     ]
@@ -594,7 +596,7 @@ def qkv_rows_from_mixed(a, mixed, part, ln_ws, *, eps_ln=1e-6, full=None, flat=F
     buf = _get_qnorm_kernel(shared_ln, eps_ln, use_tile)(
         inputs=args,
         template=tmpl,
-        grid=(32, nsg * tiles, (B + rb - 1) // rb),
+        grid=(((B + rb - 1) // rb) * 32, nsg * tiles, 1),
         threadgroup=(32, nsg, 1),
         output_shapes=[(B * tot_n,)],
         output_dtypes=[mx.bfloat16],
@@ -639,6 +641,23 @@ def qkv_msg_rows(layer, r1, msg, *, flat=True):
         m2 = layer["v_input_layernorm"] if is_dict else layer.v_input_layernorm
         ln_ws, eps_ln = [m0["weight"], m1["weight"], m2["weight"]], m0.eps
     return qkv_rows_from_mixed(a, mixed, part, ln_ws, eps_ln=eps_ln, full=not sliding, flat=flat)
+
+
+def mlp_msg_part(layer, r10, msg):
+    """Fused K2 -> K3(with partials) for mlp_message_gate -> (mixed (B,1,2304) f32, part (B,1,36) f32, ln_w, eps_ln)."""
+    is_dict = isinstance(layer, dict)
+    g = layer["mlp_message_gate"] if is_dict else layer.mlp_message_gate
+    ln_m = layer["post_attention_layernorm"] if is_dict else layer.post_attention_layernorm
+    s_mlp = r10["mlp_src"]
+    B = int(s_mlp.shape[0])
+    gin = r10["mlp_gate_in"].reshape(B, 1, 4608)
+    m4 = msg.reshape(B, 4, 2304)
+    down = gate_down_rows(gin, [g["down_proj"]["weight"]])
+    mixed, part = gate_mix_part_rows(
+        down, [s_mlp], m4, (3,),
+        [g["forget_gate_proj"]["weight"]], [g["message_gate_proj"]["weight"]],
+    )
+    return mixed, part, ln_m["weight"], ln_m.eps
 
 
 # =============================================================================================== K4+K5 fused (B=1 QKV+MID+REL)
@@ -1368,17 +1387,23 @@ METAL_FUNC void gate_mix_one(const device float* wf, const device float* wm, con
       }
     }
   } else {
-    for (int i = 0; i < 4; i++) {
-      int off = i * 16;
-      float4 ff = ((const device float4*)(wfr + off))[0];
-      float4 mm = ((const device float4*)(wmr + off))[0];
+    for (int p = 0; p < 2; p++) {
+      int o0 = p * 32, o1 = p * 32 + 16;
+      float4 f0 = ((const device float4*)(wfr + o0))[0];
+      float4 f1 = ((const device float4*)(wfr + o1))[0];
+      float4 m0 = ((const device float4*)(wmr + o0))[0];
+      float4 m1 = ((const device float4*)(wmr + o1))[0];
       #pragma unroll
       for (int b = 0; b < RB; b++) {
         if (b < nb) {
-          bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
-          float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
-          fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
-          mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+          bfloat4 xv0 = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + o0))[0]);
+          float v0 = float(xv0.x), v1 = float(xv0.y), v2 = float(xv0.z), v3 = float(xv0.w);
+          fr[b] += f0.x * v0; fr[b] += f0.y * v1; fr[b] += f0.z * v2; fr[b] += f0.w * v3;
+          mr[b] += m0.x * v0; mr[b] += m0.y * v1; mr[b] += m0.z * v2; mr[b] += m0.w * v3;
+          bfloat4 xv1 = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + o1))[0]);
+          float u0 = float(xv1.x), u1 = float(xv1.y), u2 = float(xv1.z), u3 = float(xv1.w);
+          fr[b] += f1.x * u0; fr[b] += f1.y * u1; fr[b] += f1.z * u2; fr[b] += f1.w * u3;
+          mr[b] += m1.x * u0; mr[b] += m1.y * u1; mr[b] += m1.z * u2; mr[b] += m1.w * u3;
         }
       }
     }
@@ -1454,17 +1479,23 @@ METAL_FUNC void gate_mix_part_one(const device float* wf, const device float* wm
       }
     }
   } else {
-    for (int i = 0; i < 4; i++) {
-      int off = i * 16;
-      float4 ff = ((const device float4*)(wfr + off))[0];
-      float4 mm = ((const device float4*)(wmr + off))[0];
+    for (int p = 0; p < 2; p++) {
+      int o0 = p * 32, o1 = p * 32 + 16;
+      float4 f0 = ((const device float4*)(wfr + o0))[0];
+      float4 f1 = ((const device float4*)(wfr + o1))[0];
+      float4 m0 = ((const device float4*)(wmr + o0))[0];
+      float4 m1 = ((const device float4*)(wmr + o1))[0];
       #pragma unroll
       for (int b = 0; b < RB; b++) {
         if (b < nb) {
-          bfloat4 xv = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + off))[0]);
-          float v0 = float(xv.x), v1 = float(xv.y), v2 = float(xv.z), v3 = float(xv.w);
-          fr[b] += ff.x * v0; fr[b] += ff.y * v1; fr[b] += ff.z * v2; fr[b] += ff.w * v3;
-          mr[b] += mm.x * v0; mr[b] += mm.y * v1; mr[b] += mm.z * v2; mr[b] += mm.w * v3;
+          bfloat4 xv0 = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + o0))[0]);
+          float v0 = float(xv0.x), v1 = float(xv0.y), v2 = float(xv0.z), v3 = float(xv0.w);
+          fr[b] += f0.x * v0; fr[b] += f0.y * v1; fr[b] += f0.z * v2; fr[b] += f0.w * v3;
+          mr[b] += m0.x * v0; mr[b] += m0.y * v1; mr[b] += m0.z * v2; mr[b] += m0.w * v3;
+          bfloat4 xv1 = as_type<bfloat4>(((const threadgroup uint2*)(dn_s + b * 64 + qn + o1))[0]);
+          float u0 = float(xv1.x), u1 = float(xv1.y), u2 = float(xv1.z), u3 = float(xv1.w);
+          fr[b] += f1.x * u0; fr[b] += f1.y * u1; fr[b] += f1.z * u2; fr[b] += f1.w * u3;
+          mr[b] += m1.x * u0; mr[b] += m1.y * u1; mr[b] += m1.z * u2; mr[b] += m1.w * u3;
         }
       }
     }
@@ -1506,7 +1537,13 @@ METAL_FUNC void gate_mix_part_one(const device float* wf, const device float* wm
 
 _k3 = {}
 _k3p = {}
-_GMIX_RB = int(os.environ.get("LOOPLING_GMIX_RB", "2"))
+_GMIX_RB_ENV = os.environ.get("LOOPLING_GMIX_RB")
+
+
+def _gmix_rb(B):
+    if _GMIX_RB_ENV is not None:
+        return min(B, max(1, int(_GMIX_RB_ENV)))
+    return min(B, 2)
 
 
 def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
@@ -1532,15 +1569,15 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
             uniq.append(s)
     nsg = 8
     nt = 36  # 2304 / 64 = 36 half-SG tiles (108 TGs for G=3 -> all 80 M3 Ultra cores busy, 1 pass!)
-    rb = min(B, max(1, _GMIX_RB))
+    rb = _gmix_rb(B)
     key = (B, rb, G, tuple(smap), tuple(slots))
     kern = _k3p.get(key)
     if kern is None:
         lines = [
             f"threadgroup bfloat16_t dn_s[{rb} * 64];",
             f"threadgroup float mix_s[{rb} * 64];",
-            "const uint t = threadgroup_position_in_grid.x;",
-            f"const uint b0 = threadgroup_position_in_grid.y * {rb};",
+            "const uint t = threadgroup_position_in_grid.y;",
+            f"const uint b0 = threadgroup_position_in_grid.x * {rb};",
             "const uint sg = simdgroup_index_in_threadgroup;",
             "const uint lane = thread_index_in_simdgroup;",
             f"const uint vs = t % {nt};",
@@ -1567,7 +1604,7 @@ def gate_mix_part_rows(down, ss, msg, slots, wf, wm):
     tg_t = nsg * 32
     return kern(
         inputs=[down, msg] + uniq + list(wf) + list(wm),
-        grid=(G * nt * tg_t, (B + rb - 1) // rb, 1),
+        grid=(((B + rb - 1) // rb) * tg_t, G * nt, 1),
         threadgroup=(tg_t, 1, 1),
         output_shapes=[(B, G, D), (B, G, 36)],
         output_dtypes=[mx.float32, mx.float32],
@@ -1602,14 +1639,14 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
     nsg = 2 if (G == 1 and D % 16 == 0) else 4
     rows_tg = nsg * 8
     nt = D // rows_tg
-    rb = min(B, max(1, _GMIX_RB))
+    rb = _gmix_rb(B)
     key = (B, rb, G, D, nsg, tuple(smap), tuple(slots))
     kern = _k3.get(key)
     if kern is None:
         lines = [
             f"threadgroup bfloat16_t dn_s[{rb} * 64];",
-            "const uint t = threadgroup_position_in_grid.x;",
-            f"const uint b0 = threadgroup_position_in_grid.y * {rb};",
+            "const uint t = threadgroup_position_in_grid.y;",
+            f"const uint b0 = threadgroup_position_in_grid.x * {rb};",
             "const uint sg = simdgroup_index_in_threadgroup;",
             "const uint lane = thread_index_in_simdgroup;",
             f"const uint row0 = (t % {nt}) * {rows_tg} + sg * 8;",
@@ -1636,7 +1673,7 @@ def gate_mix_rows(down, ss, msg, slots, wf, wm):
     tg_t = nsg * 32
     return kern(
         inputs=[down, msg] + uniq + list(wf) + list(wm),
-        grid=(G * nt * tg_t, (B + rb - 1) // rb, 1),
+        grid=(((B + rb - 1) // rb) * tg_t, G * nt, 1),
         threadgroup=(tg_t, 1, 1),
         output_shapes=[(B, G, D)],
         output_dtypes=[mx.float32],

@@ -240,6 +240,7 @@ _cw_tau_lut_cache: dict = {}
 _cw_tau_table_cache: dict = {}
 _cw_ar_cache: dict = {}
 _multi_conv_anc_cache: dict = {}
+_batch_st_infos_cache: dict = {}
 _update_kv_stage_k: dict = {}
 _stage_commit_multi_k: dict = {}
 
@@ -356,6 +357,8 @@ class _BatchKVStage:
             self.ks_main.append(ks_v)
             self.vs_main.append(vs_v)
             self._sigs.append(tuple(sig))
+        self._ks_flat_all = [x for ks_v in self.ks_main for x in ks_v]
+        self._vs_flat_all = [x for vs_v in self.vs_main for x in vs_v]
         self._full_visits = [v for v in range(self.nv) if not self._rot_flags[v]]
         if self._full_visits:
             f0 = tuple(int(self.caches[b][self._full_visits[0]][0].offset) for b in range(self.C))
@@ -1426,11 +1429,17 @@ class BatchDecoder:
         if layer.is_block_boundary:
             bs = [nr] if bs is None else (bs + [nr])
         if msg is None:
-            x_mlp = r10["mlp_x"]
+            x_mlp, mlp_mixed = r10["mlp_x"], None
+        elif (
+            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+        ):
+            x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
             mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), msg, (3,), (r10["mlp_gate_in"],))
             (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
-        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE)
+            mlp_mixed = None
+        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, mlp_mixed=mlp_mixed)
         conv_list[v] = [w0, w1, r10["w2"], e["w3"]]
         return e["out"], bs
 
@@ -1537,11 +1546,17 @@ class BatchDecoder:
         if layer.is_block_boundary:
             bs = [nr] if bs is None else (bs + [nr])
         if msg is None:
-            x_mlp = r10["mlp_x"]
+            x_mlp, mlp_mixed = r10["mlp_x"], None
+        elif (
+            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+        ):
+            x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
             mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), msg, (3,), (r10["mlp_gate_in"],))
             (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
-        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, skip_combine=skip_combine)
+            mlp_mixed = None
+        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, skip_combine=skip_combine, mlp_mixed=mlp_mixed)
         if skip_combine and "down" in e:
             conv_list[v] = [w0, w1, r10["w2"], None]
             return None, bs, e
@@ -1633,11 +1648,17 @@ class BatchDecoder:
         if layer.is_block_boundary:
             bs = [nr] if bs is None else (bs + [nr])
         if msg is None:
-            x_mlp = r10["mlp_x"]
+            x_mlp, mlp_mixed = r10["mlp_x"], None
+        elif (
+            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+        ):
+            x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
             mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), msg, (3,), (r10["mlp_gate_in"],))
             (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
-        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, causal=True, conv_anc=conv_anc, skip_combine=skip_combine)
+            mlp_mixed = None
+        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, causal=True, conv_anc=conv_anc, skip_combine=skip_combine, mlp_mixed=mlp_mixed)
         if skip_combine and "down" in e:
             conv_list[v] = [w0, w1, r10["w2"], None]
             return None, bs, e, h_before
@@ -1695,9 +1716,6 @@ class BatchDecoder:
                     if tau_cache is not None:
                         tau_cache[tkey] = tau_w
         rel_w_bf = FD._rel_w_bf(rel_proj)
-        q, kv_new, pb, w0, w1 = RM.mid_causal_w_flat(
-            layer, qkv_flat, qkv_lay, cs[0], cs[1], W, tau=tau_w, rel_w=rel_w_bf, conv_anc=conv_anc, w_act=w_act,
-        )
         if self._kv_stacked:
             is_ring, kv_layer_idx = self._kv_vmap[v]
             kv_buf = self._kv_ring if is_ring else self._kv_full
@@ -1710,25 +1728,54 @@ class BatchDecoder:
             cap = kv_buf.shape[2]
         S0 = min(end0, max_size) if rot else end0
         slot0 = (0 if kv._idx == max_size else kv._idx) if rot else end0
-        attn_out = RS.sdpa_causal_w_packed(
-            q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off,
-            S0, end0, slot0, rot, cap, max_size, W,
-            scale=scale, window=window, kv_layer_idx=kv_layer_idx, tree_meta=tree_meta, depths=depths,
-            meta_arr=meta_arr, s_bounds=s_bounds, kv_stage=kv_stage, w_act=w_act,
-            gate_stride=gate_stride, sink_stride=sink_stride,
-        )
+        if s_bounds is not None:
+            cw_smax = int(s_bounds[1])
+        else:
+            max_d = max(depths) if depths is not None else (W - 1)
+            cw_smax = min(end0 + max_d + 1, max_size) if rot else (S0 + max_d + 1)
+        if (
+            os.environ.get("LOOPLING_SDPA_MID_CW", "1") not in ("0", "")
+            and kv_stage is None
+            and 1 <= W <= 8
+            and cw_smax < RS._TWO_PASS_N
+            and hasattr(RS, "sdpa_mid_causal_w_packed")
+        ):
+            attn_out, kv_new, w0, w1 = RS.sdpa_mid_causal_w_packed(
+                layer, qkv_flat, qkv_lay, kv_buf, cs[0], cs[1], rel_w_bf,
+                S0, end0, slot0, rot, cap, max_size, W,
+                scale=scale, window=window, tau=tau_w, kv_layer_idx=kv_layer_idx,
+                tree_meta=tree_meta, conv_anc=conv_anc, depths=depths,
+                meta_arr=meta_arr, s_bounds=s_bounds, w_act=w_act,
+            )
+        else:
+            q, kv_new, pb, w0, w1 = RM.mid_causal_w_flat(
+                layer, qkv_flat, qkv_lay, cs[0], cs[1], W, tau=tau_w, rel_w=rel_w_bf, conv_anc=conv_anc, w_act=w_act,
+            )
+            attn_out = RS.sdpa_causal_w_packed(
+                q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off,
+                S0, end0, slot0, rot, cap, max_size, W,
+                scale=scale, window=window, kv_layer_idx=kv_layer_idx, tree_meta=tree_meta, depths=depths,
+                meta_arr=meta_arr, s_bounds=s_bounds, kv_stage=kv_stage, w_act=w_act,
+                gate_stride=gate_stride, sink_stride=sink_stride,
+            )
         op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
         r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False, causal=True, conv_anc=conv_anc, w_act=w_act)
         if layer.is_block_boundary:
             bs = [nr] if bs is None else (bs + [nr])
         if msg is None:
-            x_mlp = r10["mlp_x"]
+            x_mlp, mlp_mixed = r10["mlp_x"], None
+        elif (
+            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "1"))
+        ):
+            x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
         else:
             mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), msg, (3,), (r10["mlp_gate_in"],))
             (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
+            mlp_mixed = None
         e = RMo.moe_rows(
             layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, causal=True, conv_anc=conv_anc,
-            skip_combine=skip_combine, w_act=w_act,
+            skip_combine=skip_combine, w_act=w_act, mlp_mixed=mlp_mixed,
         )
         if skip_combine:
             return e, bs, kv_new, (w0, w1, r10["w2"]), prev_w3, h
@@ -2017,7 +2064,8 @@ class BatchDecoder:
         return h_out, h_ref_out
 
     def _get_batch_compiled(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, sdpa_mid=True):
-        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, bool(sdpa_mid))
+        fuse_mlp = os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid))
         ent = self._batch_compiled.get(key)
         if ent is not None:
             return ent
@@ -2121,6 +2169,102 @@ class BatchDecoder:
         if len(self._batch_compiled) >= 64:
             self._batch_compiled.clear()
         ent = self._batch_compiled[key] = (chunks, pre_n, n_bs_core, use_cd, ref_pass, bool(cfg.blend_bs))
+        return ent
+
+    def _get_batch_compiled_one(self, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, sdpa_mid=True):
+        fuse_mlp = os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+        key = ("one", self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid))
+        ent = self._batch_compiled.get(key)
+        if ent is not None:
+            return ent
+        tm = self.tm
+        layers_seq = tm.layer_visits
+        core = tm.args.loop_core
+        cfg = tm.loopcd
+        use_cd = cd_key is not None
+        ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+        blend_bs = bool(cfg.blend_bs)
+        C = self.C
+        nv = self.nv
+        pre_n = sum(1 for v in range(0, core.start) if layers_seq[v].is_block_boundary)
+        n_core = core.stop - core.start
+        use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
+        stage = self._stage_main
+        f_vs = [v for v in range(nv) if not self._batch_meta[id(layers_seq[v])][1]]
+        f_pos = {v: i for i, v in enumerate(f_vs)}
+        ss_all = list(step_Ss)
+        ranges = [(0, core.start, False, False)]
+        for p in range(num_passes):
+            v0 = core.start + p * n_core
+            ranges.append((v0, v0 + n_core, p > 0, False))
+        coda_v0 = core.start + num_passes * n_core
+        ranges.append((coda_v0, nv, False, use_cd))
+
+        @mx.compile
+        def fn(tokens, stage_buf, metas_in, st_infos_in, taus_in, ks_flat, vs_flat, *convs):
+            conv_local = [[convs[4 * v], convs[4 * v + 1], convs[4 * v + 2], convs[4 * v + 3]] for v in range(nv)]
+            kv_news = [None] * nv
+            h = tm.embed(tokens.reshape(C, 1)).reshape(C, 2304)
+            bs = None
+            h_pre = None
+            bs_pre = None
+            ref_h = None
+            ref_bs = None
+            for idx_r, (v0, v1, use_msg, apply_cd) in enumerate(ranges):
+                if use_msg:
+                    bank = (
+                        mx.stack(list(bs[pre_n + 1 :]), axis=0),
+                        L.unweighted_rms_norm(h.astype(mx.float32)),
+                    )
+                    if use_batch_msg:
+                        msgs = IK.depth_attention_batch(bank[0], bank[1], tm.message_input.query, scale=2304 ** -0.5)
+                        bank4 = None
+                    else:
+                        msgs = None
+                        bank4 = (bank[0][:, :, None, :], bank[1][:, None, :])
+                    h = h_pre
+                    bs = list(bs_pre)
+                else:
+                    msgs = None
+                    bank4 = None
+                    if apply_cd:
+                        h, bs = loopcd.apply_hidden(h, bs, ref_h, ref_bs, pre_n, cfg)
+                prev_moe = None
+                last_v = v1 - 1
+                for j, v in enumerate(range(v0, v1)):
+                    layer = layers_seq[v]
+                    if not use_msg:
+                        msg_v = None
+                    elif msgs is not None:
+                        msg_v = msgs[j]
+                    else:
+                        msg_v = tm.message_input(bank4, j).reshape(C, 4, 2304)
+                    next_gpar1 = v < last_v and (isinstance(layers_seq[v + 1], L.SlidingDecoderLayer) or use_msg)
+                    tau_v = taus_in[f_pos[v]] if v in f_pos else None
+                    ks_v = ks_flat[v * C : (v + 1) * C]
+                    vs_v = vs_flat[v * C : (v + 1) * C]
+                    h, bs, prev_moe = self._layer_batch(
+                        layer, v, h, bs, msg_v,
+                        stage, metas_in, ss_all, None, 0, kv_news,
+                        {}, conv_local, prev_moe=prev_moe, skip_combine=(fuse_ck1 and next_gpar1),
+                        tau_override=tau_v, st_info_arr=st_infos_in[v], stage_buf=stage_buf,
+                        ks_v=ks_v, vs_v=vs_v,
+                    )
+                if idx_r == 0:
+                    h_pre = h
+                    bs_pre = list(bs)
+                elif use_cd and (idx_r - 1) == ref_pass:
+                    ref_h = h
+                    ref_bs = list(bs) if blend_bs else None
+            h_out = RL.k1_pre(
+                h, bs, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps
+            )["q_in"].reshape(C, 1, 2304)
+            cws = [x for v in range(nv) for x in conv_local[v]]
+            return [h_out] + kv_news + cws
+
+        if len(self._batch_compiled) >= 64:
+            self._batch_compiled.clear()
+        ent = self._batch_compiled[key] = (fn, f_vs)
         return ent
 
     def _get_batch_cw_compiled(self, W, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, scap, tap_tuple, return_h_out):
@@ -2415,6 +2559,7 @@ class BatchDecoder:
             and self.nv == len(tm.layer_visits)
         ):
             stage = self._stage_main
+            sdpa_mid = os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
             regime_sig = tuple(
                 (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N), max(Ss) >= 256)
                 for Ss in step_Ss
@@ -2424,22 +2569,24 @@ class BatchDecoder:
                 os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
                 and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
             )
-            sdpa_mid = os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
-            chunks, pre_n, n_bs_core, cd_on, r_pass, blend_bs = self._get_batch_compiled(
-                regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap, sdpa_mid=sdpa_mid,
-            )
             layers_seq = tm.layer_visits
             conv_flat = [x for cs in self.conv for x in cs]
             tau_cache = {}
-            st_infos = []
-            for v in range(self.nv):
-                sk = (v, stage.scap, st_len)
-                si = RS._ST_INFO_CACHE.get(sk)
-                if si is None:
-                    if len(RS._ST_INFO_CACHE) >= 4096:
-                        RS._ST_INFO_CACHE.clear()
-                    si = RS._ST_INFO_CACHE[sk] = mx.array(sk, mx.int32)
-                st_infos.append(si)
+            st_key = (self.nv, stage.scap, st_len)
+            st_infos = _batch_st_infos_cache.get(st_key)
+            if st_infos is None:
+                if len(_batch_st_infos_cache) >= 512:
+                    _batch_st_infos_cache.clear()
+                st_infos = []
+                for v in range(self.nv):
+                    sk = (v, stage.scap, st_len)
+                    si = RS._ST_INFO_CACHE.get(sk)
+                    if si is None:
+                        if len(RS._ST_INFO_CACHE) >= 4096:
+                            RS._ST_INFO_CACHE.clear()
+                        si = RS._ST_INFO_CACHE[sk] = mx.array(sk, mx.int32)
+                    st_infos.append(si)
+                _batch_st_infos_cache[st_key] = st_infos
 
             def _taus_b(fvs):
                 out = []
@@ -2454,12 +2601,40 @@ class BatchDecoder:
                     out.append(tv)
                 return out
 
+            mid_eval = os.environ.get("LOOPLING_BATCH_MID_EVAL", "none")
+            if mid_eval == "none" and os.environ.get("LOOPLING_COMPILE_BATCH_ONE", "1") not in ("0", ""):
+                fn_one, fvs_all = self._get_batch_compiled_one(
+                    regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap, sdpa_mid=sdpa_mid,
+                )
+                o_all = fn_one(
+                    tokens, stage.buf, step_metas, st_infos, _taus_b(fvs_all),
+                    stage._ks_flat_all, stage._vs_flat_all, *conv_flat,
+                )
+                h_out = o_all[0]
+                kv_news = o_all[1 : 1 + self.nv]
+                cws = o_all[1 + self.nv :]
+                for v in range(self.nv):
+                    self.conv[v] = [cws[4 * v], cws[4 * v + 1], cws[4 * v + 2], cws[4 * v + 3]]
+                stage.commit_step(kv_news)
+                deps = [stage.buf]
+                if self._stage_dep_mode == "hidden":
+                    h_out = mx.depends(h_out, deps)
+                    self._pending_stage_deps = ()
+                elif self._stage_dep_mode == "step":
+                    self._pending_stage_deps = tuple(deps)
+                else:
+                    self._pending_stage_deps = ()
+                return h_out, None
+
+            chunks, pre_n, n_bs_core, cd_on, r_pass, blend_bs = self._get_batch_compiled(
+                regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap, sdpa_mid=sdpa_mid,
+            )
+
             def _kv_flat(v0, v1):
                 ks = [x for v in range(v0, v1) for x in stage.ks_main[v]]
                 vs = [x for v in range(v0, v1) for x in stage.vs_main[v]]
                 return ks, vs
 
-            mid_eval = os.environ.get("LOOPLING_BATCH_MID_EVAL", "none")
             outs_all = []
             fn0, v0, v1, nbs_pre, fvs0 = chunks[0]
             ks0, vs0 = _kv_flat(v0, v1)
@@ -2719,7 +2894,8 @@ class BatchDecoder:
         if fuse_k1 is None:
             fuse_k1 = (not use_dyn) and (os.environ.get("LOOPLING_FUSE_COMB_K1", "0") not in ("0", ""))
         md_key = None if use_tau_table else max_depth
-        key = (W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple, use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, return_h_out)
+        sdpa_mid_cw = os.environ.get("LOOPLING_SDPA_MID_CW", "1") not in ("0", "")
+        key = (W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple, use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, return_h_out, sdpa_mid_cw)
         ent = self._cw_compiled.get(key)
         if ent is not None:
             return ent
@@ -3073,9 +3249,10 @@ class BatchDecoder:
         ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
         cd_key = (cfg.mode, float(cfg.omega), int(ref_pass), bool(cfg.blend_bs)) if use_cd else None
         md_key = None if use_tau_table else max_depth
+        sdpa_mid_cw = os.environ.get("LOOPLING_SDPA_MID_CW", "1") not in ("0", "")
         key = (
             "loop", W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple,
-            use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, num_passes, cd_key, return_h_out,
+            use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, num_passes, cd_key, return_h_out, sdpa_mid_cw,
         )
         ent = self._cw_compiled.get(key)
         if ent is not None:

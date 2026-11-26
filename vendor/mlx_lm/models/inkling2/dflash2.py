@@ -22,7 +22,8 @@ from mlx_lm.models.inkling2.rows import qmv as RQ
 from mlx_lm.models.inkling2.rows import qmv4 as RQ4
 
 _USE_QMV4 = os.environ.get("LOOPLING_DFLASH2_QMV4", "0") not in ("0", "", "false", "False")
-_LOOKUP_BYPASS_MIN = int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_BYPASS", "6"))
+_LOOKUP_BYPASS_MIN = int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_BYPASS", "8"))
+_LOOKUP_W16_MIN = int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_W16_MIN", "14"))
 _LOOKUP_W = max(8, min(16, int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_W", "16"))))
 
 DFLASH2_DIR = os.environ.get(
@@ -1343,25 +1344,38 @@ class DFlash2Drafter:
         n_pos = W - 1
         hid = _rms(x.reshape(B_tot, self.H), self.final_norm).reshape(Cn, self.block, self.H)[:, 1 : 1 + n_pos, :]
         hid_flat = hid.reshape(Cn * n_pos, self.H)
-        if self._lm_q4 is not None:
-            wq4, sc4, bi4 = self._lm_q4
-            raw_logits = mx.quantized_matmul(
-                hid_flat, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
-            )
-        elif self._lm_aff8:
-            raw_logits = RQ.qmv_rows(hid_flat, *self._lm_t)[:, : self._unpadded_vocab]
-        else:
-            raw_logits = self.target.lm_head(hid_flat)[:, : self._unpadded_vocab]
         sel_h = self._lin(hid_flat, self.sel_proj).astype(mx.float32).reshape(Cn, n_pos, self.rank)
 
         if n_pos == 1:
+            if self._lm_q4 is not None:
+                wq4, sc4, bi4 = self._lm_q4
+                raw_logits = mx.quantized_matmul(
+                    hid_flat, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
+                )
+            elif self._lm_aff8:
+                raw_logits = RQ.qmv_rows(hid_flat, *self._lm_t)[:, : self._unpadded_vocab]
+            else:
+                raw_logits = self.target.lm_head(hid_flat)[:, : self._unpadded_vocab]
             nxt_tok = sel_n1(raw_logits, sel_h[:, 0], self.pred_cb, self.succ_cb, anc_nn, self.softcap)
             mx.eval(nxt_tok)
             for idx_c, nt in zip(nn_idx, nxt_tok.tolist()):
                 out_rows[idx_c] = [anc_list[idx_c], int(nt)]
         else:
-            top_idx = mx.argpartition(-raw_logits, 16, axis=-1)[:, :16]
-            unary = mx.take_along_axis(raw_logits, top_idx, axis=-1).astype(mx.float32)
+            if self._lm_q4 is not None and 1 <= Cn * n_pos <= 8:
+                wq4, sc4, bi4 = self._lm_q4
+                top_idx, unary = RQ4.qmv4_bf16_top16_rows(hid_flat, wq4, sc4, bi4)
+            else:
+                if self._lm_q4 is not None:
+                    wq4, sc4, bi4 = self._lm_q4
+                    raw_logits = mx.quantized_matmul(
+                        hid_flat, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
+                    )
+                elif self._lm_aff8:
+                    raw_logits = RQ.qmv_rows(hid_flat, *self._lm_t)[:, : self._unpadded_vocab]
+                else:
+                    raw_logits = self.target.lm_head(hid_flat)[:, : self._unpadded_vocab]
+                top_idx = mx.argpartition(-raw_logits, 16, axis=-1)[:, :16]
+                unary = mx.take_along_axis(raw_logits, top_idx, axis=-1).astype(mx.float32)
             top_idx_c = top_idx.reshape(Cn, n_pos, 16)
             unary_c = unary.reshape(Cn, n_pos, 16)
             sc0_list, sc16_list = [], []
@@ -1634,7 +1648,7 @@ def dflash2_exact_generate_step(
                 dr._ensure_cap(dr.n + max_tokens + 32)
         tau_cap = off_cpu + max_tokens + 32
 
-        pa_depth = max(1, min(2, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
+        pa_depth = max(1, min(3, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
         std_samp = None if is_greedy else _std_sampler_params(sampler)
         use_coupled = (
             use_pipe_ahead
@@ -1654,10 +1668,11 @@ def dflash2_exact_generate_step(
             _pa_c_ov = mx.array([float(x) for x in pa_costs_env.split(",")], mx.float32)
             pa_cost_map = {4: _pa_c_ov, 6: _pa_c_ov, 8: _pa_c_ov}
         else:
-            # Proven #85 empirical verify_w_gpu(W_max, w_act) + fused draft marginal cost curves on p3.
+            # Empirical verify_w_gpu(W_max, w_act) + fused draft marginal cost curves on p3.
             s = fscale / 2.0
+            _c4 = mx.array([c * s for c in (0.0, 9.6, 15.0, 16.3, 17.5, 20.5, 21.3, 22.1, 22.8)], mx.float32)
             _c_def = mx.array([c * s for c in (0.0, 9.6, 17.8, 18.7, 19.6, 20.5, 21.3, 22.1, 22.8)], mx.float32)
-            pa_cost_map = {4: _c_def, 6: _c_def, 8: _c_def}
+            pa_cost_map = {4: _c4, 6: _c_def, 8: _c_def}
         pa_priors_env = os.environ.get("LOOPLING_DFLASH2_PA_PRIORS")
         if pa_priors_env:
             pa_prior_cfg = mx.array([float(x) for x in pa_priors_env.split(",")], mx.float32)
@@ -1665,6 +1680,11 @@ def dflash2_exact_generate_step(
             pa_prior_cfg = mx.array([VerifyBudget.PRIOR_SLOPE, *VerifyBudget.PRIOR_INTERCEPTS], mx.float32)
 
         pa_adapt = bool(use_budget) and os.environ.get("LOOPLING_DFLASH2_PA_ADAPT", "1") not in ("0", "", "false", "False")
+        pa_ar_burst_en = os.environ.get("LOOPLING_DFLASH2_PA_AR_BURST", "0") not in ("0", "", "false", "False")
+        pa_promote = float(os.environ.get("LOOPLING_DFLASH2_PA_PROMOTE", "4.8"))
+        pa_demote = pa_promote - 0.6
+        pa_demote4 = float(os.environ.get("LOOPLING_DFLASH2_PA_DEMOTE4", "2.40"))
+        pa_promote4 = pa_demote4 + 0.50
         pa_w_run = min(W_cfg, 6) if (pa_adapt and W_cfg > 6) else W_cfg
         pa_ema_tpc = 3.0
         pa_ema_ms = 21.5 * (fscale / 2.0)
@@ -1786,12 +1806,25 @@ def dflash2_exact_generate_step(
                 return False, None
             return True, binfo
 
+        def _snapped_lookup_props(rem_now: int, w_base: int, in_pa: bool):
+            if lookup is None or _LOOKUP_BYPASS_MIN <= 0:
+                return None
+            l_len_now = lookup.match_len
+            if l_len_now < _LOOKUP_BYPASS_MIN:
+                return None
+            if _LOOKUP_W >= 16 and l_len_now >= max(_LOOKUP_BYPASS_MIN, _LOOKUP_W16_MIN) and rem_now >= 16:
+                p16 = lookup.proposals(15)
+                if len(p16) >= 15:
+                    return p16[:15]
+            if not in_pa and w_base >= 2 and rem_now >= w_base:
+                pw = lookup.proposals(w_base - 1)
+                if len(pw) >= w_base - 1:
+                    return pw[: w_base - 1]
+            return None
+
         while n < max_tokens:
             if use_pipe_ahead:
-                l_len_pa = lookup.match_len if lookup is not None else 0
-                want_lookup_bypass = (
-                    lookup is not None and _LOOKUP_BYPASS_MIN > 0 and l_len_pa >= _LOOKUP_BYPASS_MIN
-                )
+                want_lookup_bypass = _snapped_lookup_props(max_tokens - n, pa_w_run, in_pa=True) is not None
                 want_ar_burst = pa_ar_burst > 0 and not want_lookup_bypass
                 if not want_lookup_bypass and not want_ar_burst:
                     if deferred_feats:
@@ -1891,24 +1924,29 @@ def dflash2_exact_generate_step(
                         pa_ema_tpc = 0.72 * pa_ema_tpc + 0.28 * keep
                         if 4.0 <= cyc_ms <= 60.0:
                             pa_ema_ms = 0.75 * pa_ema_ms + 0.25 * cyc_ms
-                        # Keep W=6 as neural floor (proved 134.13 MEAN8 in #85); promote 6->8 only on high-tpc prompts.
-                        if W_cfg >= 8 and pa_w_run < 8 and pa_ema_tpc >= 4.4:
+                        # Adapt PA width across {4, 6, 8} with hysteresis: W=4 beats W=6 on low-tpc prompts (P1/P4/P7).
+                        if W_cfg >= 8 and pa_w_run == 6 and pa_ema_tpc >= pa_promote:
                             pa_w_run = 8
-                        elif pa_w_run == 8 and pa_ema_tpc < 3.8:
+                        elif pa_w_run == 8 and pa_ema_tpc < pa_demote:
                             pa_w_run = 6
-                        # AR fallback only on genuinely low-acceptance prompts (e.g. P1) where spec trails AR.
-                        spec_rate = pa_ema_tpc / max(1.0, pa_ema_ms)
-                        ar_rate = 1.0 / max(1.0, pa_t_ar)
-                        if keep <= 2 and pa_ema_tpc < 2.05 and spec_rate < 0.92 * ar_rate:
-                            pa_low_streak += 1
-                            if pa_low_streak >= 4:
-                                pa_ar_burst = pa_ar_backoff
-                                pa_ar_backoff = min(32, pa_ar_backoff + 8)
+                        elif pa_demote4 > 0.0 and W_cfg >= 6 and pa_w_run == 6 and pa_ema_tpc < pa_demote4:
+                            pa_w_run = 4
+                        elif pa_w_run == 4 and pa_ema_tpc >= pa_promote4:
+                            pa_w_run = min(W_cfg, 6)
+                        # Opt-in AR fallback only when explicitly enabled (default off: w_act tree beats sync AR).
+                        if pa_ar_burst_en:
+                            spec_rate = pa_ema_tpc / max(1.0, pa_ema_ms)
+                            ar_rate = 1.0 / max(1.0, pa_t_ar)
+                            if keep <= 2 and pa_ema_tpc < 2.05 and spec_rate < 0.92 * ar_rate:
+                                pa_low_streak += 1
+                                if pa_low_streak >= 4:
+                                    pa_ar_burst = pa_ar_backoff
+                                    pa_ar_backoff = min(32, pa_ar_backoff + 8)
+                                    pa_low_streak = 0
+                            elif spec_rate >= 1.00 * ar_rate:
                                 pa_low_streak = 0
-                        elif spec_rate >= 1.00 * ar_rate:
-                            pa_low_streak = 0
-                            if keep >= 3:
-                                pa_ar_backoff = 16
+                                if keep >= 3:
+                                    pa_ar_backoff = 16
                     anchor_int = em[keep - 1]
                     if not pa_queue:
                         anchor = anc_nxt
@@ -1951,8 +1989,12 @@ def dflash2_exact_generate_step(
             rem = max_tokens - n
             w_cur = max(1, min(W_cfg, dr.block, rem))
             l_len = lookup.match_len if lookup is not None else 0
-            w_lkp = max(w_cur, min(_LOOKUP_W, rem)) if (_LOOKUP_BYPASS_MIN > 0 and l_len >= _LOOKUP_BYPASS_MIN) else w_cur
-            l_props = lookup.proposals(w_lkp - 1) if (lookup is not None and l_len >= LookupIndex.MIN_MATCH) else []
+            byp_props = _snapped_lookup_props(rem, pa_w_run if use_pipe_ahead else w_cur, in_pa=use_pipe_ahead)
+            l_props = (
+                byp_props
+                if byp_props is not None
+                else (lookup.proposals(w_cur - 1) if (lookup is not None and l_len >= LookupIndex.MIN_MATCH) else [])
+            )
 
             in_cooldown = costs is not None and costs.ar_cooldown > 0 and l_len < 4
             if w_cur == 1 or in_cooldown:
@@ -1971,7 +2013,7 @@ def dflash2_exact_generate_step(
                 n += 1
                 continue
 
-            did_lookup_bypass = bool(l_props and _LOOKUP_BYPASS_MIN > 0 and l_len >= _LOOKUP_BYPASS_MIN)
+            did_lookup_bypass = byp_props is not None
             if not did_lookup_bypass:
                 flush_deferred()
             pf = prefetched_fwd if (prefetched_fwd is not None and prefetched_npos == w_cur - 1) else None
@@ -1979,7 +2021,7 @@ def dflash2_exact_generate_step(
             prefetched_fwd = None
             if did_lookup_bypass:
                 anc_int = int(anchor.item())
-                toks_lp = [anc_int] + l_props[: w_lkp - 1]
+                toks_lp = [anc_int] + byp_props
                 blk = mx.array(toks_lp, mx.int32)
                 parents = tuple(range(-1, len(toks_lp) - 1))
                 depths = tuple(range(len(toks_lp)))
@@ -2104,7 +2146,7 @@ def dflash2_exact_generate_step(
                 rem_next = max_tokens - (n + keep)
                 w_next = max(1, min(W_cfg, dr.block, rem_next))
                 l_next = lookup.match_len if lookup is not None else 0
-                byp_next = _LOOKUP_BYPASS_MIN > 0 and l_next >= _LOOKUP_BYPASS_MIN
+                byp_next = _snapped_lookup_props(rem_next, pa_w_run if use_pipe_ahead else w_next, in_pa=use_pipe_ahead) is not None
                 if did_lookup_bypass and byp_next:
                     # Defer drafter KV update while continuing zero-draft lookup streak (-0.5ms/cycle on P8!).
                     deferred_feats.append(f_keep)

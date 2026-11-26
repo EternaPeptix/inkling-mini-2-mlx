@@ -24,6 +24,7 @@ _FCONV = os.environ.get("LOOPLING_FUSED_CONV", "1") not in ("0", "")
 _FD_FUSED = os.environ.get("LOOPLING_FD_FUSED", "1") not in ("0", "")
 _QKV_MID_B1 = os.environ.get("LOOPLING_QKV_MID_B1", "0") not in ("0", "")
 _SDPA_MID_B1 = os.environ.get("LOOPLING_SDPA_MID_B1", "1") not in ("0", "")
+_FUSE_K3B_MLP = os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
 _ctx: dict = {}
 _tau: dict = {}
 _wpos_cache: dict = {}
@@ -354,6 +355,41 @@ def _fused_b1_ok_layer(layer) -> bool:
     if not L._use_kernels():
         return False
     a = layer["self_attn"]
+    sliding = "input_layernorm" in layer
+    ks, vs = a["k_sconv"], a["v_sconv"]
+    pac, pmc = layer["post_attention_convolution"], layer["post_mlp_convolution"]
+    ai = dict.get(layer, "attention_input")
+    mlp = layer["mlp"]
+    ex = mlp["experts"]
+    gu_m, dn_m = ex["gate_up_proj"], ex["down_proj"]
+    if sliding:
+        refs = (
+            a["q_proj"]["weight"], a["o_proj"]["weight"],
+            layer["input_layernorm"]["weight"], layer["post_attention_layernorm"]["weight"],
+            pac["conv1d"]["weight"], pmc["conv1d"]["weight"],
+            ks["conv1d"]["weight"], vs["conv1d"]["weight"],
+            mlp["gate"]["weight"], gu_m["weight"], dn_m["weight"],
+            a["q_l2_clip"]["scale"], a["rel_logits_proj"]["proj"],
+        )
+    else:
+        refs = (
+            a["q_proj"]["weight"], a["o_proj"]["weight"],
+            layer["q_input_layernorm"]["weight"], layer["k_input_layernorm"]["weight"],
+            layer["v_input_layernorm"]["weight"], layer["post_attention_layernorm"]["weight"],
+            pac["conv1d"]["weight"], pmc["conv1d"]["weight"],
+            ks["weight_proj"]["weight"], vs["weight_proj"]["weight"],
+            mlp["gate"]["weight"], gu_m["weight"], dn_m["weight"],
+            a["q_l2_clip"]["scale"], a["rel_logits_proj"]["proj"],
+        )
+    c = getattr(layer, "_fd_ok_cache", None)
+    if c is not None and len(c[0]) == len(refs) and all(x is y for x, y in zip(c[0], refs)):
+        return c[1]
+    ok = _fused_b1_ok_layer_slow(layer, L, a, ks, vs, pac, pmc, ai, mlp, gu_m, dn_m)
+    layer._fd_ok_cache = (refs, ok)
+    return ok
+
+
+def _fused_b1_ok_layer_slow(layer, L, a, ks, vs, pac, pmc, ai, mlp, gu_m, dn_m) -> bool:
     if a.num_heads != 24 or a.num_key_value_heads != 8 or a.head_dim != 128:
         return False
     if (
@@ -362,11 +398,8 @@ def _fused_b1_ok_layer(layer) -> bool:
         or a["rel_logits_proj"]["proj"].shape != (16, 1024)
     ):
         return False
-    ks, vs = a["k_sconv"], a["v_sconv"]
-    pac, pmc = layer["post_attention_convolution"], layer["post_mlp_convolution"]
     if ks.kernel_size != 4 or vs.kernel_size != 4 or pac.kernel_size != 4 or pmc.kernel_size != 4:
         return False
-    ai = dict.get(layer, "attention_input")
     if (
         pac["conv1d"]["weight"].dtype != mx.bfloat16
         or pmc["conv1d"]["weight"].dtype != mx.bfloat16
@@ -393,14 +426,11 @@ def _fused_b1_ok_layer(layer) -> bool:
         projs += [ks["weight_proj"], vs["weight_proj"]]
     if not all(_is_aff8(m) for m in projs):
         return False
-    mlp = layer["mlp"]
     if getattr(mlp, "sharding_group", None) is not None:
         return False
     gate = mlp["gate"]
     if gate["weight"].dtype != mx.float32 or gate["weight"].shape != (128, 2304) or gate.top_k != 8:
         return False
-    ex = mlp["experts"]
-    gu_m, dn_m = ex["gate_up_proj"], ex["down_proj"]
     if (
         getattr(gu_m, "mode", None) not in ("nvfp4", "mxfp8")
         or getattr(dn_m, "mode", None) != gu_m.mode
@@ -589,11 +619,14 @@ def _decode_layer_fused_b1(layer, h, bs, cache, messages):
         bs_new = bs
 
     if m2 is None:
-        x_mlp = r10["mlp_x"]
+        x_mlp, mlp_mixed = r10["mlp_x"], None
+    elif _FUSE_K3B_MLP and hasattr(RP, "mlp_msg_part"):
+        x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, m2)
     else:
         mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), m2, (3,), (r10["mlp_gate_in"],))
         (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
-    e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE)
+        mlp_mixed = None
+    e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, mlp_mixed=mlp_mixed)
     conv[0], conv[1], conv[2], conv[3] = w0, w1, r10["w2"], e["w3"]
     conv.advance(1)
     return e["out"].reshape(1, 1, 2304), bs_new

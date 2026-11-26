@@ -13,9 +13,9 @@ _PF_MOE_GMM = os.environ.get("LOOPLING_PF_MOE_GMM", "1") not in ("0", "")
 _PF_MOE_BM_ENV = int(os.environ.get("LOOPLING_PF_MOE_BM", "0"))
 _PF_MOE_CFG_ENV = os.environ.get("LOOPLING_PF_MOE_CFG", "")
 _PF_MOE_CFG = tuple(int(x) for x in _PF_MOE_CFG_ENV.split(",")) if _PF_MOE_CFG_ENV else None
-_PF_MOE_MIN_L = int(os.environ.get("LOOPLING_PF_MOE_MIN_L", "1024"))
+_PF_MOE_MIN_L = int(os.environ.get("LOOPLING_PF_MOE_MIN_L", "256"))
 _PF_AFF8_QMM = os.environ.get("LOOPLING_PF_AFF8_QMM", "1") not in ("0", "")
-_PF_AFF8_CFG_ENV = os.environ.get("LOOPLING_PF_AFF8_CFG", "64,64,2,2")
+_PF_AFF8_CFG_ENV = os.environ.get("LOOPLING_PF_AFF8_CFG", "64,32,32,2,1")
 _PF_AFF8_CFG = tuple(int(x) for x in _PF_AFF8_CFG_ENV.split(","))
 _SPLASH_MSGGATE = os.environ.get("LOOPLING_SPLASH_MSGGATE", "0") not in ("0", "", "false", "False")
 _D = 2304
@@ -269,8 +269,7 @@ _MOE_CSORT_TILES_SRC = r"""
 """
 
 _MOE_GMM_SRC = r"""
-    constexpr int BK = 32;
-    constexpr int LDX = 40;
+    constexpr int LDX = BK + 8;
     constexpr int TG = WM * WN * 32;
     constexpr int TM = (BM / WM) / 8;
     constexpr int TN = (BN / WN) / 8;
@@ -299,7 +298,6 @@ _MOE_GMM_SRC = r"""
     const ushort fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
     const ushort fn = ((lane >> 2) & 2) * 2 | ((lane & 1) * 2);
 
-    // Lean single-buffered TG SRAM (5.1 KB @ 32x32, 7.7 KB @ 32x64, 10.2 KB @ 64x64)
     threadgroup bfloat16_t Xs[BM * LDX];
     threadgroup bfloat16_t Ws[BN * LDX];
 
@@ -322,6 +320,7 @@ _MOE_GMM_SRC = r"""
     if constexpr (HGS) {
         inv_scale_enc = gsc[e] / (F8E4M3_MAX * F4E2M1_MAX);
     }
+    const float inv_sc_fold = inv_scale_enc * ((BITS == 4) ? 16384.0f : 256.0f);
 
     simdgroup_float8x8 C[TM][TN];
     for (int tm = 0; tm < TM; ++tm) {
@@ -332,13 +331,20 @@ _MOE_GMM_SRC = r"""
 
     threadgroup uint4* xd = (threadgroup uint4*)(Xs + x_mr * LDX + x_mk);
     threadgroup uint2* xd2 = (threadgroup uint2*)(Xs + x_mr * LDX + x_mk);
-    threadgroup uint2* wd = (threadgroup uint2*)(Ws + w_nr * LDX + w_koff);
+    threadgroup uint4* wd4 = (threadgroup uint4*)(Ws + w_nr * LDX + w_koff);
     const threadgroup bfloat16_t* as_base = Xs + (sg_m + fm) * LDX + fn;
     const threadgroup bfloat16_t* bs_base = Ws + (sg_n + fn) * LDX + fm;
 
     for (int k = 0; k < KK; k += BK) {
         // 1. Load X tile (coalesced)
-        if constexpr (XPT == 16) {
+        if constexpr (XPT == 32) {
+            if (x_ok) {
+                const device uint4* xp = (const device uint4*)(x_ptr + k);
+                xd[0] = xp[0]; xd[1] = xp[1]; xd[2] = xp[2]; xd[3] = xp[3];
+            } else {
+                xd[0] = uint4(0); xd[1] = uint4(0); xd[2] = uint4(0); xd[3] = uint4(0);
+            }
+        } else if constexpr (XPT == 16) {
             if (x_ok) {
                 const device uint4* xp = (const device uint4*)(x_ptr + k);
                 xd[0] = xp[0];
@@ -353,80 +359,117 @@ _MOE_GMM_SRC = r"""
             xd2[0] = x_ok ? ((const device uint2*)(x_ptr + k))[0] : uint2(0);
         }
 
-        // 2. Load + dequant W tile (exact fp_quantized.h arithmetic, register-only SIMD half4!)
-        const float sc = float(dequantize_scale<bfloat16_t, GS>(s_ptr[0])) * inv_scale_enc;
+        // 2. Load + dequant W tile (exact fp_quantized.h arithmetic, folded power-of-2 scale + 128-bit TGSM stores)
+        const device uint8_t* wp = w_ptr + (k * BITS / 8);
+        const device uint8_t* sp = s_ptr + (k / GS);
         if constexpr (BITS == 4) {
             if constexpr (WPT == 8) {
-                const uint v0 = ((const device uint*)w_ptr)[0];
+                const float sc = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
+                const uint v0 = ((const device uint*)wp)[0];
                 ushort4 u0 = ushort4(v0, v0 >> 4, v0 >> 8, v0 >> 12);
-                half4 h0 = as_type<half4>((u0 & ushort4(7)) << 9) * half(16384.0h);
+                half4 h0 = as_type<half4>((u0 & ushort4(7)) << 9);
                 h0 = select(h0, -h0, (u0 & ushort4(8)) != ushort4(0));
-                wd[0] = as_type<uint2>(bfloat4(float4(h0) * sc));
+                uint2 a2 = as_type<uint2>(bfloat4(float4(h0) * sc));
                 ushort4 u1 = ushort4(v0 >> 16, v0 >> 20, v0 >> 24, v0 >> 28);
-                half4 h1 = as_type<half4>((u1 & ushort4(7)) << 9) * half(16384.0h);
+                half4 h1 = as_type<half4>((u1 & ushort4(7)) << 9);
                 h1 = select(h1, -h1, (u1 & ushort4(8)) != ushort4(0));
-                wd[1] = as_type<uint2>(bfloat4(float4(h1) * sc));
+                uint2 b2 = as_type<uint2>(bfloat4(float4(h1) * sc));
+                wd4[0] = uint4(a2.x, a2.y, b2.x, b2.y);
+            } else if constexpr (WPT == 16) {
+                const float sc = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
+                const uint2 raw = ((const device uint2*)wp)[0];
+                const uint vs[2] = {raw.x, raw.y};
+                #pragma clang loop unroll(full)
+                for (int gi = 0; gi < 2; ++gi) {
+                    const uint vv = vs[gi];
+                    ushort4 ua = ushort4(vv, vv >> 4, vv >> 8, vv >> 12);
+                    half4 ha = as_type<half4>((ua & ushort4(7)) << 9);
+                    ha = select(ha, -ha, (ua & ushort4(8)) != ushort4(0));
+                    uint2 a2 = as_type<uint2>(bfloat4(float4(ha) * sc));
+                    ushort4 ub = ushort4(vv >> 16, vv >> 20, vv >> 24, vv >> 28);
+                    half4 hb = as_type<half4>((ub & ushort4(7)) << 9);
+                    hb = select(hb, -hb, (ub & ushort4(8)) != ushort4(0));
+                    uint2 b2 = as_type<uint2>(bfloat4(float4(hb) * sc));
+                    wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
+                }
             } else {
-                const uint2 raw = ((const device uint2*)w_ptr)[0];
-                const uint v0 = raw.x, v1 = raw.y;
-                ushort4 u0 = ushort4(v0, v0 >> 4, v0 >> 8, v0 >> 12);
-                half4 h0 = as_type<half4>((u0 & ushort4(7)) << 9) * half(16384.0h);
-                h0 = select(h0, -h0, (u0 & ushort4(8)) != ushort4(0));
-                wd[0] = as_type<uint2>(bfloat4(float4(h0) * sc));
-                ushort4 u1 = ushort4(v0 >> 16, v0 >> 20, v0 >> 24, v0 >> 28);
-                half4 h1 = as_type<half4>((u1 & ushort4(7)) << 9) * half(16384.0h);
-                h1 = select(h1, -h1, (u1 & ushort4(8)) != ushort4(0));
-                wd[1] = as_type<uint2>(bfloat4(float4(h1) * sc));
-                ushort4 u2 = ushort4(v1, v1 >> 4, v1 >> 8, v1 >> 12);
-                half4 h2 = as_type<half4>((u2 & ushort4(7)) << 9) * half(16384.0h);
-                h2 = select(h2, -h2, (u2 & ushort4(8)) != ushort4(0));
-                wd[2] = as_type<uint2>(bfloat4(float4(h2) * sc));
-                ushort4 u3 = ushort4(v1 >> 16, v1 >> 20, v1 >> 24, v1 >> 28);
-                half4 h3 = as_type<half4>((u3 & ushort4(7)) << 9) * half(16384.0h);
-                h3 = select(h3, -h3, (u3 & ushort4(8)) != ushort4(0));
-                wd[3] = as_type<uint2>(bfloat4(float4(h3) * sc));
+                const float sc0 = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
+                const float sc1 = float(dequantize_scale<bfloat16_t, GS>(sp[1])) * inv_sc_fold;
+                const uint4 raw = ((const device uint4*)wp)[0];
+                const uint vs[4] = {raw.x, raw.y, raw.z, raw.w};
+                #pragma clang loop unroll(full)
+                for (int gi = 0; gi < 4; ++gi) {
+                    const float sc = (gi < 2) ? sc0 : sc1;
+                    const uint vv = vs[gi];
+                    ushort4 ua = ushort4(vv, vv >> 4, vv >> 8, vv >> 12);
+                    half4 ha = as_type<half4>((ua & ushort4(7)) << 9);
+                    ha = select(ha, -ha, (ua & ushort4(8)) != ushort4(0));
+                    uint2 a2 = as_type<uint2>(bfloat4(float4(ha) * sc));
+                    ushort4 ub = ushort4(vv >> 16, vv >> 20, vv >> 24, vv >> 28);
+                    half4 hb = as_type<half4>((ub & ushort4(7)) << 9);
+                    hb = select(hb, -hb, (ub & ushort4(8)) != ushort4(0));
+                    uint2 b2 = as_type<uint2>(bfloat4(float4(hb) * sc));
+                    wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
+                }
             }
         } else {
+            const float sc = float(dequantize_scale<bfloat16_t, GS>(sp[0])) * inv_sc_fold;
             if constexpr (WPT == 8) {
-                const uint2 raw = ((const device uint2*)w_ptr)[0];
+                const uint2 raw = ((const device uint2*)wp)[0];
                 const uchar4 b0 = as_type<uchar4>(raw.x);
                 const uchar4 b1 = as_type<uchar4>(raw.y);
                 ushort4 u0 = ushort4(b0.x, b0.y, b0.z, b0.w);
-                half4 h0 = as_type<half4>((u0 & ushort4(127)) << 7) * half(256.0h);
+                half4 h0 = as_type<half4>((u0 & ushort4(127)) << 7);
                 h0 = select(h0, -h0, (u0 & ushort4(128)) != ushort4(0));
-                wd[0] = as_type<uint2>(bfloat4(float4(h0) * sc));
+                uint2 a2 = as_type<uint2>(bfloat4(float4(h0) * sc));
                 ushort4 u1 = ushort4(b1.x, b1.y, b1.z, b1.w);
-                half4 h1 = as_type<half4>((u1 & ushort4(127)) << 7) * half(256.0h);
+                half4 h1 = as_type<half4>((u1 & ushort4(127)) << 7);
                 h1 = select(h1, -h1, (u1 & ushort4(128)) != ushort4(0));
-                wd[1] = as_type<uint2>(bfloat4(float4(h1) * sc));
+                uint2 b2 = as_type<uint2>(bfloat4(float4(h1) * sc));
+                wd4[0] = uint4(a2.x, a2.y, b2.x, b2.y);
+            } else if constexpr (WPT == 16) {
+                const uint4 raw = ((const device uint4*)wp)[0];
+                const uint ws[4] = {raw.x, raw.y, raw.z, raw.w};
+                #pragma clang loop unroll(full)
+                for (int gi = 0; gi < 2; ++gi) {
+                    const uchar4 b0 = as_type<uchar4>(ws[gi * 2]);
+                    const uchar4 b1 = as_type<uchar4>(ws[gi * 2 + 1]);
+                    ushort4 u0 = ushort4(b0.x, b0.y, b0.z, b0.w);
+                    half4 h0 = as_type<half4>((u0 & ushort4(127)) << 7);
+                    h0 = select(h0, -h0, (u0 & ushort4(128)) != ushort4(0));
+                    uint2 a2 = as_type<uint2>(bfloat4(float4(h0) * sc));
+                    ushort4 u1 = ushort4(b1.x, b1.y, b1.z, b1.w);
+                    half4 h1 = as_type<half4>((u1 & ushort4(127)) << 7);
+                    h1 = select(h1, -h1, (u1 & ushort4(128)) != ushort4(0));
+                    uint2 b2 = as_type<uint2>(bfloat4(float4(h1) * sc));
+                    wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
+                }
             } else {
-                const uint4 raw = ((const device uint4*)w_ptr)[0];
-                const uchar4 b0 = as_type<uchar4>(raw.x);
-                const uchar4 b1 = as_type<uchar4>(raw.y);
-                const uchar4 b2 = as_type<uchar4>(raw.z);
-                const uchar4 b3 = as_type<uchar4>(raw.w);
-                ushort4 u0 = ushort4(b0.x, b0.y, b0.z, b0.w);
-                half4 h0 = as_type<half4>((u0 & ushort4(127)) << 7) * half(256.0h);
-                h0 = select(h0, -h0, (u0 & ushort4(128)) != ushort4(0));
-                wd[0] = as_type<uint2>(bfloat4(float4(h0) * sc));
-                ushort4 u1 = ushort4(b1.x, b1.y, b1.z, b1.w);
-                half4 h1 = as_type<half4>((u1 & ushort4(127)) << 7) * half(256.0h);
-                h1 = select(h1, -h1, (u1 & ushort4(128)) != ushort4(0));
-                wd[1] = as_type<uint2>(bfloat4(float4(h1) * sc));
-                ushort4 u2 = ushort4(b2.x, b2.y, b2.z, b2.w);
-                half4 h2 = as_type<half4>((u2 & ushort4(127)) << 7) * half(256.0h);
-                h2 = select(h2, -h2, (u2 & ushort4(128)) != ushort4(0));
-                wd[2] = as_type<uint2>(bfloat4(float4(h2) * sc));
-                ushort4 u3 = ushort4(b3.x, b3.y, b3.z, b3.w);
-                half4 h3 = as_type<half4>((u3 & ushort4(127)) << 7) * half(256.0h);
-                h3 = select(h3, -h3, (u3 & ushort4(128)) != ushort4(0));
-                wd[3] = as_type<uint2>(bfloat4(float4(h3) * sc));
+                const device uint4* wp4 = (const device uint4*)wp;
+                const uint4 r0 = wp4[0], r1 = wp4[1];
+                const uint ws[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+                #pragma clang loop unroll(full)
+                for (int gi = 0; gi < 4; ++gi) {
+                    const uchar4 b0 = as_type<uchar4>(ws[gi * 2]);
+                    const uchar4 b1 = as_type<uchar4>(ws[gi * 2 + 1]);
+                    ushort4 u0 = ushort4(b0.x, b0.y, b0.z, b0.w);
+                    half4 h0 = as_type<half4>((u0 & ushort4(127)) << 7);
+                    h0 = select(h0, -h0, (u0 & ushort4(128)) != ushort4(0));
+                    uint2 a2 = as_type<uint2>(bfloat4(float4(h0) * sc));
+                    ushort4 u1 = ushort4(b1.x, b1.y, b1.z, b1.w);
+                    half4 h1 = as_type<half4>((u1 & ushort4(127)) << 7);
+                    h1 = select(h1, -h1, (u1 & ushort4(128)) != ushort4(0));
+                    uint2 b2 = as_type<uint2>(bfloat4(float4(h1) * sc));
+                    wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
+                }
             }
         }
-        w_ptr += BK * BITS / 8;
-        s_ptr += BK / GS;
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (TG == 32) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
         // 3. Steel-scheduled MMA: explicit simdgroup_barrier(mem_none) + hoisted 32-bit TG loads
         #pragma clang loop unroll(full)
@@ -458,7 +501,11 @@ _MOE_GMM_SRC = r"""
         }
 
         if (k + BK < KK) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (TG == 32) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 
@@ -510,11 +557,10 @@ def _k_moe_gmm():
     return k
 
 
-# ---------------------------------------------------------------------------------------------------- Wave 6D: Steel-scheduled BMxBNx32 Affine-8 Dense qmm_t (gs=64)
+# ---------------------------------------------------------------------------------------------------- Wave 6D/8B: Steel-scheduled BMxBNxBK Affine-8 Dense qmm_t (gs=64)
 _AFF8_QMM_SRC = r"""
-    constexpr int BK = 32;
     constexpr int GS = 64;
-    constexpr int LDX = 40;
+    constexpr int LDX = BK + 8;
     constexpr int TG = WM * WN * 32;
     constexpr int TM = (BM / WM) / 8;
     constexpr int TN = (BN / WN) / 8;
@@ -559,13 +605,20 @@ _AFF8_QMM_SRC = r"""
 
     threadgroup uint4* xd = (threadgroup uint4*)(Xs + x_mr * LDX + x_mk);
     threadgroup uint2* xd2 = (threadgroup uint2*)(Xs + x_mr * LDX + x_mk);
-    threadgroup uint2* wd = (threadgroup uint2*)(Ws + w_nr * LDX + w_koff);
+    threadgroup uint4* wd4 = (threadgroup uint4*)(Ws + w_nr * LDX + w_koff);
     const threadgroup bfloat16_t* as_base = Xs + (sg_m + fm) * LDX + fn;
     const threadgroup bfloat16_t* bs_base = Ws + (sg_n + fn) * LDX + fm;
 
     float sc = 0.0f, bi = 0.0f;
     for (int k = 0; k < KK; k += BK) {
-        if constexpr (XPT == 16) {
+        if constexpr (XPT == 32) {
+            if (x_ok) {
+                const device uint4* xp = (const device uint4*)(x_ptr + k);
+                xd[0] = xp[0]; xd[1] = xp[1]; xd[2] = xp[2]; xd[3] = xp[3];
+            } else {
+                xd[0] = uint4(0); xd[1] = uint4(0); xd[2] = uint4(0); xd[3] = uint4(0);
+            }
+        } else if constexpr (XPT == 16) {
             if (x_ok) {
                 const device uint4* xp = (const device uint4*)(x_ptr + k);
                 xd[0] = xp[0];
@@ -580,32 +633,52 @@ _AFF8_QMM_SRC = r"""
             xd2[0] = x_ok ? ((const device uint2*)(x_ptr + k))[0] : uint2(0);
         }
 
-        if ((k & 32) == 0) {
-            sc = float(s_ptr[0]);
-            bi = float(b_ptr[0]);
-            s_ptr += 1;
-            b_ptr += 1;
+        if constexpr (BK == 64) {
+            sc = float(s_ptr[0]); bi = float(b_ptr[0]);
+            s_ptr += 1; b_ptr += 1;
+        } else if ((k & 63) == 0) {
+            sc = float(s_ptr[0]); bi = float(b_ptr[0]);
+            s_ptr += 1; b_ptr += 1;
         }
+        const device uint8_t* wp = w_ptr + k;
         if constexpr (WPT == 8) {
-            const uint2 raw = ((const device uint2*)w_ptr)[0];
+            const uint2 raw = ((const device uint2*)wp)[0];
             const uchar4 c0 = as_type<uchar4>(raw.x);
             const uchar4 c1 = as_type<uchar4>(raw.y);
-            wd[0] = as_type<uint2>(bfloat4(sc * float4(c0.x, c0.y, c0.z, c0.w) + bi));
-            wd[1] = as_type<uint2>(bfloat4(sc * float4(c1.x, c1.y, c1.z, c1.w) + bi));
-        } else {
-            const uint4 raw = ((const device uint4*)w_ptr)[0];
+            uint2 a2 = as_type<uint2>(bfloat4(sc * float4(c0.x, c0.y, c0.z, c0.w) + bi));
+            uint2 b2 = as_type<uint2>(bfloat4(sc * float4(c1.x, c1.y, c1.z, c1.w) + bi));
+            wd4[0] = uint4(a2.x, a2.y, b2.x, b2.y);
+        } else if constexpr (WPT == 16) {
+            const uint4 raw = ((const device uint4*)wp)[0];
             const uchar4 c0 = as_type<uchar4>(raw.x);
             const uchar4 c1 = as_type<uchar4>(raw.y);
             const uchar4 c2 = as_type<uchar4>(raw.z);
             const uchar4 c3 = as_type<uchar4>(raw.w);
-            wd[0] = as_type<uint2>(bfloat4(sc * float4(c0.x, c0.y, c0.z, c0.w) + bi));
-            wd[1] = as_type<uint2>(bfloat4(sc * float4(c1.x, c1.y, c1.z, c1.w) + bi));
-            wd[2] = as_type<uint2>(bfloat4(sc * float4(c2.x, c2.y, c2.z, c2.w) + bi));
-            wd[3] = as_type<uint2>(bfloat4(sc * float4(c3.x, c3.y, c3.z, c3.w) + bi));
+            uint2 a2 = as_type<uint2>(bfloat4(sc * float4(c0.x, c0.y, c0.z, c0.w) + bi));
+            uint2 b2 = as_type<uint2>(bfloat4(sc * float4(c1.x, c1.y, c1.z, c1.w) + bi));
+            wd4[0] = uint4(a2.x, a2.y, b2.x, b2.y);
+            uint2 c2u = as_type<uint2>(bfloat4(sc * float4(c2.x, c2.y, c2.z, c2.w) + bi));
+            uint2 d2u = as_type<uint2>(bfloat4(sc * float4(c3.x, c3.y, c3.z, c3.w) + bi));
+            wd4[1] = uint4(c2u.x, c2u.y, d2u.x, d2u.y);
+        } else {
+            const device uint4* wp4 = (const device uint4*)wp;
+            const uint4 r0 = wp4[0], r1 = wp4[1];
+            const uint ws[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+            #pragma clang loop unroll(full)
+            for (int gi = 0; gi < 4; ++gi) {
+                const uchar4 c0 = as_type<uchar4>(ws[gi * 2]);
+                const uchar4 c1 = as_type<uchar4>(ws[gi * 2 + 1]);
+                uint2 a2 = as_type<uint2>(bfloat4(sc * float4(c0.x, c0.y, c0.z, c0.w) + bi));
+                uint2 b2 = as_type<uint2>(bfloat4(sc * float4(c1.x, c1.y, c1.z, c1.w) + bi));
+                wd4[gi] = uint4(a2.x, a2.y, b2.x, b2.y);
+            }
         }
-        w_ptr += BK;
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (TG == 32) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
         #pragma clang loop unroll(full)
         for (int ks = 0; ks < BK; ks += 8) {
@@ -636,7 +709,11 @@ _AFF8_QMM_SRC = r"""
         }
 
         if (k + BK < KK) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (TG == 32) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 
@@ -684,15 +761,19 @@ def aff8_linear(mod, x: mx.array) -> mx.array:
     K = x.shape[-1]
     M = x.size // K
     N = mod["weight"].shape[0]
-    bm, bn, wm, wn = _PF_AFF8_CFG
-    if M < 1024 or M % bm != 0 or K % 64 != 0 or N % bn != 0 or mod["scales"].dtype != mx.bfloat16:
+    if len(_PF_AFF8_CFG) == 5:
+        bm, bn, bk, wm, wn = _PF_AFF8_CFG
+    else:
+        bm, bn, wm, wn = _PF_AFF8_CFG
+        bk = 32
+    if M < 1024 or N < 1024 or M % bm != 0 or K % 64 != 0 or N % bn != 0 or mod["scales"].dtype != mx.bfloat16:
         return mod(x)
     tg = wm * wn * 32
     ntm = (M + bm - 1) // bm
     k = _k_aff8_qmm()
     return k(
         inputs=[x, mod["weight"], mod["scales"], mod["biases"]],
-        template=[("BM", bm), ("BN", bn), ("WM", wm), ("WN", wn), ("MM", M), ("NN", N), ("KK", K)],
+        template=[("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn), ("MM", M), ("NN", N), ("KK", K)],
         grid=(tg * (N // bn), ntm, 1),
         threadgroup=(tg, 1, 1),
         output_shapes=[x.shape[:-1] + (N,)],
@@ -722,18 +803,31 @@ def moe_gmm_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> bool:
     )
 
 
-def moe_gmm_forward(ex, hidden_states: mx.array, selected_experts: mx.array, routing_weights: mx.array) -> mx.array:
-    """Wave 6B fused MoE prefill: 1-launch counting sort+tile_meta -> BMx64x32 gate_up+SwiGLU -> BMx64x32 down -> unsort_combine."""
+def moe_gmm_forward(
+    ex,
+    hidden_states: mx.array,
+    selected_experts: mx.array,
+    routing_weights: mx.array,
+) -> mx.array:
+    """Wave 6B/8 fused MoE prefill: 1-launch counting sort+tile_meta -> TG=32/64 gate_up+SwiGLU -> down -> unsort_combine."""
     B, L, D = hidden_states.shape
     gu, dn = ex.gate_up_proj, ex.down_proj
     E = gu.num_experts
     P = B * L * 8
     if _PF_MOE_CFG is not None:
-        bm, bn, wm, wn = _PF_MOE_CFG
-    elif _PF_MOE_BM_ENV in (32, 64):
-        bm, bn, wm, wn = (_PF_MOE_BM_ENV, 64, 2, 2)
+        if len(_PF_MOE_CFG) == 5:
+            bm, bn, bk, wm, wn = _PF_MOE_CFG
+        else:
+            bm, bn, wm, wn = _PF_MOE_CFG
+            bk = 32
+    elif _PF_MOE_BM_ENV in (16, 32, 64):
+        bm, bn, bk, wm, wn = (_PF_MOE_BM_ENV, 32, 32, 1, 1)
+    elif B * L < 1024:
+        bm, bn, bk, wm, wn = (16, 32, 32, 1, 1)
+    elif B * L < 3072:
+        bm, bn, bk, wm, wn = (32, 64, 32, 1, 2)
     else:
-        bm, bn, wm, wn = (32, 64, 2, 2)
+        bm, bn, bk, wm, wn = (32, 32, 32, 1, 1)
     tg = wm * wn * 32
     max_tiles = P // bm + E
 
@@ -766,7 +860,7 @@ def moe_gmm_forward(ex, hidden_states: mx.array, selected_experts: mx.array, rou
     act = kg(
         inputs=[hidden_states, lhs_idx, exp_off, tile_meta, gu["weight"], gu["scales"], gsc_gu, caps],
         template=[
-            ("BM", bm), ("BN", bn), ("WM", wm), ("WN", wn),
+            ("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn),
             ("BITS", gu.bits), ("GS", gu.group_size), ("HGS", hgs_gu),
             ("KK", K_gu), ("NN", N_gu), ("USE_LHS", 1), ("FUSED_SWIGLU", 1),
         ],
@@ -783,7 +877,7 @@ def moe_gmm_forward(ex, hidden_states: mx.array, selected_experts: mx.array, rou
     dn_s = kg(
         inputs=[act, lhs_idx, exp_off, tile_meta, dn["weight"], dn["scales"], gsc_dn, caps],
         template=[
-            ("BM", bm), ("BN", bn), ("WM", wm), ("WN", wn),
+            ("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn),
             ("BITS", dn.bits), ("GS", dn.group_size), ("HGS", hgs_dn),
             ("KK", K_dn), ("NN", N_dn), ("USE_LHS", 0), ("FUSED_SWIGLU", 0),
         ],

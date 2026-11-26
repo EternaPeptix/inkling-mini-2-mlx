@@ -271,9 +271,9 @@ METAL_FUNC void rows_qmv_rout(
     if constexpr (STG_X) {
       for (int b = (int)simd_gid; b < nb; b += NSG) {
         threadgroup uint4* dst_s = (threadgroup uint4*)(sx + b * block_size) + simd_lid;
-        dst_s[0] = ((const device uint4*)(x + size_t(b) * K))[0];
+        dst_s[0] = ((const device uint4*)(x + b * K))[0];
         thread U xtmp[8];
-        smb_s[b * 32 + simd_lid] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + size_t(b) * K, xtmp);
+        smb_s[b * 32 + simd_lid] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + b * K, xtmp);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (active) {
@@ -281,9 +281,9 @@ METAL_FUNC void rows_qmv_rout(
         for (int row = 0; row < RPS; row++) {
           int src = row;
           if (PR) src = min(row, last_row);
-          uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
-          U sc = scales[size_t(src) * in_vec_size_g];
-          U bi = biases[size_t(src) * in_vec_size_g];
+          uint2 wr = ((const device uint2*)(ws + src * in_vec_size_w))[0];
+          U sc = scales[src * in_vec_size_g];
+          U bi = biases[src * in_vec_size_g];
           float4 w0 = float4(as_type<uchar4>(wr.x));
           float4 w1 = float4(as_type<uchar4>(wr.y));
           _Pragma("clang loop unroll(full)")
@@ -309,12 +309,21 @@ METAL_FUNC void rows_qmv_rout(
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
     } else if constexpr (PACKX) {
+      thread uint2 wr_r[RPS];
+      thread bfloat16_t sc_r[RPS], bi_r[RPS];
+      _Pragma("clang loop unroll(full)")
+      for (int row = 0; row < RPS; row++) {
+        int src = PR ? min(row, last_row) : row;
+        wr_r[row] = ((const device uint2*)(ws + src * in_vec_size_w))[0];
+        sc_r[row] = scales[src * in_vec_size_g];
+        bi_r[row] = biases[src * in_vec_size_g];
+      }
       thread uint4 xpk[RB];
       thread U smb[RB];
       _Pragma("clang loop unroll(full)")
       for (int b = 0; b < RB; b++) {
         if (FULL || b < nb) {
-          uint4 xp = ((const device uint4*)(x + size_t(b) * K))[0];
+          uint4 xp = ((const device uint4*)(x + b * K))[0];
           xpk[b] = xp;
           bfloat4 v0 = as_type<bfloat4>(xp.xy);
           bfloat4 v1 = as_type<bfloat4>(xp.zw);
@@ -326,13 +335,10 @@ METAL_FUNC void rows_qmv_rout(
       }
       _Pragma("clang loop unroll(full)")
       for (int row = 0; row < RPS; row++) {
-        int src = row;
-        if (PR) src = min(row, last_row);
-        uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
-        U sc = scales[size_t(src) * in_vec_size_g];
-        U bi = biases[size_t(src) * in_vec_size_g];
-        float4 w0 = float4(as_type<uchar4>(wr.x));
-        float4 w1 = float4(as_type<uchar4>(wr.y));
+        float4 w0 = float4(as_type<uchar4>(wr_r[row].x));
+        float4 w1 = float4(as_type<uchar4>(wr_r[row].y));
+        U sc = static_cast<U>(sc_r[row]);
+        U bi = static_cast<U>(bi_r[row]);
         _Pragma("clang loop unroll(full)")
         for (int b = 0; b < RB; b++) {
           if (FULL || b < nb) {
@@ -352,23 +358,29 @@ METAL_FUNC void rows_qmv_rout(
         }
       }
     } else {
+      thread uint2 wr_r[RPS];
+      thread bfloat16_t sc_r[RPS], bi_r[RPS];
+      _Pragma("clang loop unroll(full)")
+      for (int row = 0; row < RPS; row++) {
+        int src = PR ? min(row, last_row) : row;
+        wr_r[row] = ((const device uint2*)(ws + src * in_vec_size_w))[0];
+        sc_r[row] = scales[src * in_vec_size_g];
+        bi_r[row] = biases[src * in_vec_size_g];
+      }
       thread U xtb[RB][8];
       thread U smb[RB];
       _Pragma("clang loop unroll(full)")
       for (int b = 0; b < RB; b++) {
         if (FULL || b < nb) {
-          smb[b] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + size_t(b) * K, xtb[b]);
+          smb[b] = load_vector<bfloat16_t, U, values_per_thread, bits>(x + b * K, xtb[b]);
         }
       }
       _Pragma("clang loop unroll(full)")
       for (int row = 0; row < RPS; row++) {
-        int src = row;
-        if (PR) src = min(row, last_row);
-        uint2 wr = ((const device uint2*)(ws + size_t(src) * in_vec_size_w))[0];
-        U sc = scales[size_t(src) * in_vec_size_g];
-        U bi = biases[size_t(src) * in_vec_size_g];
-        float4 w0 = float4(as_type<uchar4>(wr.x));
-        float4 w1 = float4(as_type<uchar4>(wr.y));
+        float4 w0 = float4(as_type<uchar4>(wr_r[row].x));
+        float4 w1 = float4(as_type<uchar4>(wr_r[row].y));
+        U sc = static_cast<U>(sc_r[row]);
+        U bi = static_cast<U>(bi_r[row]);
         _Pragma("clang loop unroll(full)")
         for (int b = 0; b < RB; b++) {
           if (FULL || b < nb) {
@@ -546,25 +558,31 @@ _CFG_DEFAULT = (4, 2, 4, 0)
 
 
 # Tuned per-(bucket, B) table for N <= 4096 (0), 4096 < N < 16384 (1), N >= 16384 (2):
-# entries are (mode, rps, nsg, rb) with mode 0=tile, 1=rout, 2=ro.
+# entries are (mode, rps, nsg, rb) with mode 0=tile, 1=rout(packx), 2=ro, 3=rout(f32x).
 _CFG_TABLE = {
     0: {  # N <= 4096 (e.g. o_proj N=2304)
-        1: (1, 1, 2, 1), 2: (0, 1, 2, 2), 3: (1, 2, 4, 3), 4: (1, 4, 4, 4),
+        1: (1, 1, 2, 1), 2: (0, 1, 2, 2), 3: (1, 2, 4, 3), 4: (1, 2, 2, 4),
         5: (0, 2, 4, 5), 6: (1, 2, 4, 6), 7: (1, 2, 4, 7), 8: (1, 4, 2, 4),
+        9: (0, 4, 2, 4), 10: (0, 4, 2, 4), 11: (0, 4, 2, 4), 12: (0, 4, 2, 4),
+        13: (0, 4, 2, 4), 14: (0, 4, 2, 4), 15: (0, 4, 2, 4), 16: (0, 4, 2, 4),
     },
     1: {  # 4096 < N < 16384 (e.g. QKV concat)
         1: (1, 4, 2, 1), 2: (2, 2, 4, 2), 3: (2, 2, 4, 3), 4: (2, 4, 2, 4),
         5: (2, 2, 4, 5), 6: (1, 2, 2, 6), 7: (1, 2, 2, 7), 8: (1, 4, 2, 4),
+        9: (0, 4, 2, 6), 10: (0, 4, 2, 6), 11: (0, 4, 2, 6), 12: (0, 4, 2, 6),
+        13: (0, 4, 2, 4), 14: (0, 4, 2, 4), 15: (0, 4, 2, 4), 16: (0, 4, 2, 4),
     },
     2: {  # N >= 16384 (e.g. lm_head)
         1: (1, 1, 2, 1), 2: (0, 1, 4, 2), 3: (0, 4, 2, 3), 4: (1, 2, 4, 4),
-        5: (1, 4, 4, 5), 6: (1, 2, 2, 6), 7: (0, 4, 1, 7), 8: (0, 4, 4, 8),
+        5: (1, 4, 4, 5), 6: (0, 4, 4, 6), 7: (0, 4, 1, 7), 8: (0, 4, 4, 8),
+        9: (0, 4, 2, 4), 10: (0, 4, 2, 4), 11: (0, 4, 2, 4), 12: (0, 4, 2, 4),
+        13: (0, 4, 4, 8), 14: (0, 4, 4, 8), 15: (0, 4, 4, 8), 16: (0, 4, 4, 8),
     },
 }
 
 
 def _cfg_bucket(B, tot_n, nw, pro):
-    if pro or B > 8 or (tot_n >= 16384 and nw != 1):
+    if pro or B > MAX_B or (tot_n >= 16384 and nw != 1):
         return None
     bkt = 2 if tot_n >= 16384 else (1 if tot_n > 4096 else 0)
     ov = os.environ.get(f"LOOPLING_QMV_BKT{bkt}")
@@ -586,8 +604,15 @@ def _use_rout(B, tot_n, nw, pro=False):
         return tot_n < 16384
     ent = _cfg_bucket(B, tot_n, nw, pro)
     if ent is not None:
-        return ent[0] == 1
+        return ent[0] in (1, 3)
     return B == 1 or (tot_n >= 16384 and nw == 1 and B in (4, 5, 7, 8))
+
+
+def _use_rout_f32x(B, tot_n, nw, pro=False):
+    if pro or os.environ.get("LOOPLING_QMV_PACKX") is not None:
+        return False
+    ent = _cfg_bucket(B, tot_n, nw, pro)
+    return ent is not None and ent[0] == 3
 
 
 def _use_ro(B, tot_n, pro=False, rout=False):
@@ -624,7 +649,7 @@ def _cfg(B, pro=False, N=0, rout=False, ro=False):
         return rps, nsg, min(rb, B), stg if pro else 0
     if not pro and not os.environ.get("LOOPLING_QMV_ROUT") and not os.environ.get("LOOPLING_QMV_RO"):
         ent = _cfg_bucket(B, N, 1, pro)
-        if ent is not None and ((ent[0] == 1) == bool(rout)) and ((ent[0] == 2) == bool(ro)):
+        if ent is not None and ((ent[0] in (1, 3)) == bool(rout)) and ((ent[0] == 2) == bool(ro)):
             return ent[1], ent[2], min(ent[3], B), 0
     if not pro and B == 1:
         return 1, 2, 1, 0
@@ -672,9 +697,10 @@ def _header():
 _kernels = {}
 
 
-def _kernel(nw, rout=False, ro=False, stg_x=False):
+def _kernel(nw, rout=False, ro=False, stg_x=False, f32x=False):
     stg_x = bool(stg_x and rout and not ro)
-    key = (nw, rout, ro, stg_x)
+    f32x = bool(f32x and rout and not ro and not stg_x)
+    key = (nw, rout, ro, stg_x, f32x)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -689,12 +715,12 @@ def _kernel(nw, rout=False, ro=False, stg_x=False):
         lines.append("threadgroup bfloat16_t* sx = (threadgroup bfloat16_t*)0;")
     lines += [
         "uint ty = threadgroup_position_in_grid.y;",
-        "uint rb0 = threadgroup_position_in_grid.z * RB;",
+        "uint rb0 = threadgroup_position_in_grid.x * RB;",
         "uint sg = simdgroup_index_in_threadgroup;",
         "uint sl = thread_index_in_simdgroup;",
     ]
     fn = "rows_qmv_ro" if ro else ("rows_qmv_rout" if rout else "rows_qmv_tile")
-    tail_t = (", true" if stg_x else "") if rout else ("" if ro else ", 0")
+    tail_t = (", true" if stg_x else (", false, false" if f32x else "")) if rout else ("" if ro else ", 0")
     prev = "0"
     for i in range(nw):
         end = f"{prev} + ((N{i} + RPS * NSG - 1) / (RPS * NSG))"
@@ -709,7 +735,7 @@ def _kernel(nw, rout=False, ro=False, stg_x=False):
             f"(w{i}, s{i}, b{i}, x, x, y{i}, N{i}, ty - ({prev}), rb0, sg, sl, sx); }}"
         )
         prev = end
-    suf = ("_rout_sx" if stg_x else "_rout") if rout else ("_ro" if ro else "")
+    suf = ("_rout_sx" if stg_x else ("_rout_fx" if f32x else "_rout")) if rout else ("_ro" if ro else "")
     k = mx.fast.metal_kernel(
         name=f"rows_qmv_aff8_gs64_n{nw}{suf}",
         input_names=ins,
@@ -739,6 +765,7 @@ def qmv_rows_multi(x, weights, group_size=64, bits=8):
     args = [x]
     tot_n = sum(w.shape[0] for w, _, _ in weights)
     rout = _use_rout(B, tot_n, nw, pro=False)
+    f32x = _use_rout_f32x(B, tot_n, nw, pro=False) if rout else False
     ro = _use_ro(B, tot_n, pro=False, rout=rout)
     stg_x = _use_stg_x(B, tot_n, rout, pro=False)
     rps, nsg, rb, _ = _cfg(B, N=tot_n, rout=rout, ro=ro)
@@ -753,10 +780,10 @@ def qmv_rows_multi(x, weights, group_size=64, bits=8):
         tmpl.append((f"N{i}", N))
         shapes.append((B, N))
         tiles += (N + rps * nsg - 1) // (rps * nsg)
-    return _kernel(nw, rout=rout, ro=ro, stg_x=stg_x)(
+    return _kernel(nw, rout=rout, ro=ro, stg_x=stg_x, f32x=f32x)(
         inputs=args,
         template=tmpl,
-        grid=(32, nsg * tiles, (B + rb - 1) // rb),
+        grid=(((B + rb - 1) // rb) * 32, nsg * tiles, 1),
         threadgroup=(32, nsg, 1),
         output_shapes=shapes,
         output_dtypes=[mx.bfloat16] * nw,
@@ -796,7 +823,7 @@ _ARG_P1_SRC = r"""
   constexpr bool FULL = (B % RB) == 0;
 
   uint sp = threadgroup_position_in_grid.y;
-  uint b0 = threadgroup_position_in_grid.z * RB;
+  uint b0 = threadgroup_position_in_grid.x * RB;
   uint simd_gid = simdgroup_index_in_threadgroup;
   uint simd_lid = thread_index_in_simdgroup;
 
@@ -1246,9 +1273,9 @@ _ARG_CFG_TABLE = {
     3: (1, 2, 2, 3, 1024),
     4: (1, 2, 2, 4, 2048),
     5: (1, 2, 2, 5, 1024),
-    6: (2, 2, 1, 6, 2048),
+    6: (0, 4, 4, 6, 2048),
     7: (1, 2, 4, 7, 4096),
-    8: (1, 2, 4, 8, 4096),
+    8: (0, 4, 4, 8, 2048),
 }
 
 
@@ -1312,7 +1339,7 @@ def qmv_softcap_argmax_rows(x, w, scales, biases, softcap=None, unpadded_vocab=N
             ("B", B), ("K", K), ("VV", VV), ("SP", sp), ("TOT_TILES", tot_tiles),
             ("MODE", mode), ("RPS", rps), ("NSG", nsg), ("RB", rb),
         ],
-        grid=(32, nsg * sp, (B + rb - 1) // rb),
+        grid=(((B + rb - 1) // rb) * 32, nsg * sp, 1),
         threadgroup=(32, nsg, 1),
         output_shapes=[(B, sp), (B, sp)],
         output_dtypes=[mx.float32, mx.uint32],
@@ -1359,7 +1386,7 @@ def qmv_softcap_argmax_walk_rows(
             ("B", B), ("K", K), ("VV", VV), ("SP", sp), ("TOT_TILES", tot_tiles),
             ("MODE", mode), ("RPS", rps), ("NSG", nsg), ("RB", rb),
         ],
-        grid=(32, nsg * sp, (B + rb - 1) // rb),
+        grid=(((B + rb - 1) // rb) * 32, nsg * sp, 1),
         threadgroup=(32, nsg, 1),
         output_shapes=[(B, sp), (B, sp)],
         output_dtypes=[mx.float32, mx.uint32],

@@ -58,16 +58,19 @@ def _router_tm1_src(B):
     const device float* wr = w + (size_t)row * 2304;
     float result[{B}];
     for (int b = 0; b < {B}; b++) result[b] = 0.0f;
-    for (int it = 0; it < 2; it++) {{
-      const int off = it * 1024 + bn0;
-      float4 wv = ((const device float4*)(wr + off))[0];
-      for (int b = 0; b < {B}; b++) {{
-        bfloat4 vv = as_type<bfloat4>(((const device uint2*)(x + (size_t)b * 2304 + off))[0]);
-        result[b] += wv.x * static_cast<float>(vv.x);
-        result[b] += wv.y * static_cast<float>(vv.y);
-        result[b] += wv.z * static_cast<float>(vv.z);
-        result[b] += wv.w * static_cast<float>(vv.w);
-      }}
+    float4 wv0 = ((const device float4*)(wr + bn0))[0];
+    float4 wv1 = ((const device float4*)(wr + 1024 + bn0))[0];
+    for (int b = 0; b < {B}; b++) {{
+      bfloat4 vv0 = as_type<bfloat4>(((const device uint2*)(x + (size_t)b * 2304 + bn0))[0]);
+      result[b] += wv0.x * static_cast<float>(vv0.x);
+      result[b] += wv0.y * static_cast<float>(vv0.y);
+      result[b] += wv0.z * static_cast<float>(vv0.z);
+      result[b] += wv0.w * static_cast<float>(vv0.w);
+      bfloat4 vv1 = as_type<bfloat4>(((const device uint2*)(x + (size_t)b * 2304 + 1024 + bn0))[0]);
+      result[b] += wv1.x * static_cast<float>(vv1.x);
+      result[b] += wv1.y * static_cast<float>(vv1.y);
+      result[b] += wv1.z * static_cast<float>(vv1.z);
+      result[b] += wv1.w * static_cast<float>(vv1.w);
     }}
     if (bn0 + 2048 < 2304) {{
       const int off = 2048 + bn0;
@@ -96,6 +99,108 @@ def _router_tm1_src(B):
       }}
     }}
 """
+
+
+_router_mixed_kernels = {}
+
+
+def _router_from_mixed_tm1_src(B, eps_lit):
+    return f"""
+    const int row = (int)threadgroup_position_in_grid.x;
+    const int sgN = (int)simdgroup_index_in_threadgroup;
+    const int thrN = (int)thread_index_in_simdgroup;
+    const int bn0 = (sgN * 32 + thrN) * 4;
+    float inv[{B}];
+    for (int b = 0; b < {B}; b++) {{
+      GL_NOFMA
+      const device float* pp = part + (size_t)b * 36u;
+      float pv = (thrN < 18) ? (pp[thrN * 2] + pp[thrN * 2 + 1]) : 0.0f;
+      float tot = simd_sum(pv);
+      inv[b] = metal::precise::rsqrt(tot / 2304.0f + {eps_lit});
+    }}
+    const device float* wr = w + (size_t)row * 2304;
+    float result[{B}];
+    for (int b = 0; b < {B}; b++) result[b] = 0.0f;
+    for (int it = 0; it < 2; it++) {{
+      const int off = it * 1024 + bn0;
+      float4 wv = ((const device float4*)(wr + off))[0];
+      bfloat4 lv = as_type<bfloat4>(((const device uint2*)(ln_w + off))[0]);
+      for (int b = 0; b < {B}; b++) {{
+        float4 mv = ((const device float4*)(mixed + (size_t)b * 2304 + off))[0];
+        bfloat4 vv = bfloat4(
+            bfloat16_t(glue_rms_apply<float>(mv.x, inv[b], lv.x)),
+            bfloat16_t(glue_rms_apply<float>(mv.y, inv[b], lv.y)),
+            bfloat16_t(glue_rms_apply<float>(mv.z, inv[b], lv.z)),
+            bfloat16_t(glue_rms_apply<float>(mv.w, inv[b], lv.w)));
+        if (row == 0) ((device uint2*)(x_out + (size_t)b * 2304 + off))[0] = as_type<uint2>(vv);
+        result[b] += wv.x * static_cast<float>(vv.x);
+        result[b] += wv.y * static_cast<float>(vv.y);
+        result[b] += wv.z * static_cast<float>(vv.z);
+        result[b] += wv.w * static_cast<float>(vv.w);
+      }}
+    }}
+    if (bn0 + 2048 < 2304) {{
+      const int off = 2048 + bn0;
+      float4 wv = ((const device float4*)(wr + off))[0];
+      bfloat4 lv = as_type<bfloat4>(((const device uint2*)(ln_w + off))[0]);
+      for (int b = 0; b < {B}; b++) {{
+        float4 mv = ((const device float4*)(mixed + (size_t)b * 2304 + off))[0];
+        bfloat4 vv = bfloat4(
+            bfloat16_t(glue_rms_apply<float>(mv.x, inv[b], lv.x)),
+            bfloat16_t(glue_rms_apply<float>(mv.y, inv[b], lv.y)),
+            bfloat16_t(glue_rms_apply<float>(mv.z, inv[b], lv.z)),
+            bfloat16_t(glue_rms_apply<float>(mv.w, inv[b], lv.w)));
+        if (row == 0) ((device uint2*)(x_out + (size_t)b * 2304 + off))[0] = as_type<uint2>(vv);
+        result[b] += wv.x * static_cast<float>(vv.x);
+        result[b] += wv.y * static_cast<float>(vv.y);
+        result[b] += wv.z * static_cast<float>(vv.z);
+        result[b] += wv.w * static_cast<float>(vv.w);
+      }}
+    }}
+    for (int b = 0; b < {B}; b++) {{
+      for (ushort sn = 16; sn >= 1; sn >>= 1) result[b] += simd_shuffle_down(result[b], sn);
+    }}
+    threadgroup float tgp[{B} * 8];
+    if (thrN == 0) {{
+      for (int b = 0; b < {B}; b++) tgp[b * 8 + sgN] = result[b];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgN == 0 && thrN == 0) {{
+      for (int b = 0; b < {B}; b++) {{
+        float s = result[b];
+        for (int k = 1; k < 8; k++) s += tgp[b * 8 + k];
+        o[(size_t)b * 128 + row] = s;
+      }}
+    }}
+"""
+
+
+def router_from_mixed_rows(mixed, part, ln_w, w, *, eps_ln=1e-6):
+    """Fused K3b(mlp) + K11 router: mixed (B,1,2304) f32, part (B,1,36) f32, ln_w (2304,) bf16, w (128,2304) f32
+    -> (logits (B,128) f32, x_mlp (B,2304) bf16); bitwise identical to k3b_norm_layer + router_rows."""
+    B = int(mixed.shape[0])
+    N, K = w.shape
+    if B < 1 or B > 16 or N != 128 or K != 2304 or mixed.dtype != mx.float32 or part.dtype != mx.float32 or w.dtype != mx.float32:
+        raise ValueError("router_from_mixed_rows: bad shapes/dtypes")
+    eps_lit = flit(eps_ln)
+    key = (B, eps_lit)
+    k = _router_mixed_kernels.get(key)
+    if k is None:
+        k = _router_mixed_kernels[key] = mx.fast.metal_kernel(
+            name="moe_router_mixed_b%d_%s" % (B, eps_lit.replace(".", "p").replace("-", "m")),
+            input_names=["w", "mixed", "part", "ln_w"],
+            output_names=["o", "x_out"],
+            source=_router_from_mixed_tm1_src(B, eps_lit),
+            header=GLUE_HEADER,
+            ensure_row_contiguous=True,
+        )
+    return k(
+        inputs=[w, mixed.reshape(B, 2304), part.reshape(B, 36), ln_w],
+        grid=(128 * 32, 8, 1),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(B, N), (B, K)],
+        output_dtypes=[mx.float32, mx.bfloat16],
+    )
 
 
 def router_rows(x, w):
@@ -425,7 +530,7 @@ def _router_route_tm1_src(ec, rc):
     const int bn0 = (int)(sgN * 32 + thrN) * 4;
 
     threadgroup float tg_x[2304];
-    threadgroup float tgp[4 * 8];
+    threadgroup float tgp[128 * 8];
     threadgroup float tg_logits[128];
 
     const device bfloat16_t* xb = x + (size_t)b * 2304;
@@ -454,16 +559,16 @@ def _router_route_tm1_src(ec, rc):
             result += wv.w * tg_x[off + 3];
         }}
         for (ushort sn = 16; sn >= 1; sn >>= 1) result += simd_shuffle_down(result, sn);
-        if (thrN == 0) tgp[grp * 8 + sgN] = result;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgN == 0 && thrN == 0) {{
-            float s = result;
-            for (int k = 1; k < 8; k++) s += tgp[grp * 8 + k];
-            tg_logits[row] = s;
-            logits_o[(size_t)b * 128 + row] = s;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thrN == 0) tgp[row * 8 + sgN] = result;
     }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 128) {{
+        float s = tgp[lid * 8 + 0];
+        for (int k = 1; k < 8; k++) s += tgp[lid * 8 + k];
+        tg_logits[lid] = s;
+        logits_o[(size_t)b * 128 + lid] = s;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {{
         moe_route_row(tg_logits, bias, lane, inds_o + b * 8, wts_o + b * 8, float({ec}), float({rc}));
     }}
@@ -786,12 +891,36 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                     uint4 x4 = ((const device uint4*)(x + xo + k_off))[0];
                     float4 xf0 = float4(as_type<bfloat4>(x4.xy));
                     float4 xf1 = float4(as_type<bfloat4>(x4.zw));
-                    #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
-                        thread U wv[VPT];
-                        dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                        U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                        result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
+                    if constexpr (BITS == 4) {
+                        thread uint32_t wr[ROWS];
+                        thread uint8_t sr[ROWS];
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                            sr[r] = (sc + r * in_g)[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[8];
+                            dequant_u32_fp4_8(wr[r], wv);
+                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
+                        }
+                    } else {
+                        thread uint2 wr[ROWS];
+                        thread uint8_t sr[ROWS];
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                            sr[r] = (sc + r * in_g)[0];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; r++) {
+                            thread U wv[8];
+                            dequant_u2_fp8_8(wr[r], wv);
+                            U sv = dequantize_scale<U, GS>(sr[r]);
+                            result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
+                        }
                     }
                 } else if constexpr (VPT == 4) {
                     uint2 x2 = ((const device uint2*)(x + xo + k_off))[0];
@@ -967,14 +1096,41 @@ def _k_body_lean(xoff_expr, epi_one_src, epi_multi_src, *, use_mask=False, has_s
                             for (int t = 0; t < TMAX; t++) {
                                 if (t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
                             }
-                            #pragma unroll
-                            for (int r = 0; r < ROWS; r++) {
-                                thread U wv[VPT];
-                                dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                                U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
+                            if constexpr (BITS == 4) {
+                                thread uint32_t wr[ROWS];
+                                thread uint8_t sr[ROWS];
                                 #pragma unroll
-                                for (int t = 0; t < TMAX; t++) {
-                                    if (t < nb) result[t][r] += dot_vals_bf16_u4val<BITS>(x4[t], wv, sv);
+                                for (int r = 0; r < ROWS; r++) {
+                                    wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                                    sr[r] = (sc + r * in_g)[0];
+                                }
+                                #pragma unroll
+                                for (int r = 0; r < ROWS; r++) {
+                                    thread U wv[8];
+                                    dequant_u32_fp4_8(wr[r], wv);
+                                    U sv = dequantize_scale<U, GS>(sr[r]);
+                                    #pragma unroll
+                                    for (int t = 0; t < TMAX; t++) {
+                                        if (t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
+                                    }
+                                }
+                            } else {
+                                thread uint2 wr[ROWS];
+                                thread uint8_t sr[ROWS];
+                                #pragma unroll
+                                for (int r = 0; r < ROWS; r++) {
+                                    wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                                    sr[r] = (sc + r * in_g)[0];
+                                }
+                                #pragma unroll
+                                for (int r = 0; r < ROWS; r++) {
+                                    thread U wv[8];
+                                    dequant_u2_fp8_8(wr[r], wv);
+                                    U sv = dequantize_scale<U, GS>(sr[r]);
+                                    #pragma unroll
+                                    for (int t = 0; t < TMAX; t++) {
+                                        if (t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
+                                    }
                                 }
                             }
                         }
@@ -1649,12 +1805,36 @@ def _gateup_b1_src(nsg_b1, dbg, gc, uc, ec, rc):
                 uint4 x4 = ((const device uint4*)(xp + k_off))[0];
                 float4 xf0 = float4(as_type<bfloat4>(x4.xy));
                 float4 xf1 = float4(as_type<bfloat4>(x4.zw));
-                #pragma unroll
-                for (int r = 0; r < ROWS; r++) {{
-                    thread U wv[VPT];
-                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                    result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
+                if constexpr (BITS == 4) {{
+                    thread uint32_t wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }}
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        thread U wv[8];
+                        dequant_u32_fp4_8(wr[r], wv);
+                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
+                    }}
+                }} else {{
+                    thread uint2 wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }}
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        thread U wv[8];
+                        dequant_u2_fp8_8(wr[r], wv);
+                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
+                    }}
                 }}
             }} else if constexpr (VPT == 4) {{
                 uint2 x2 = ((const device uint2*)(xp + k_off))[0];
@@ -1737,12 +1917,36 @@ def _down_b1_src(dbg, scale_lit):
                 uint4 x4 = ((const device uint4*)(xp + k_off))[0];
                 float4 xf0 = float4(as_type<bfloat4>(x4.xy));
                 float4 xf1 = float4(as_type<bfloat4>(x4.zw));
-                #pragma unroll
-                for (int r = 0; r < ROWS; r++) {{
-                    thread U wv[VPT];
-                    dequant_vals<BITS, VPT>(ws + r * in_w, wv);
-                    U sv = dequantize_scale<U, GS>((sc + r * in_g)[0]);
-                    result[r] += dot_vals_f4_8<BITS>(xf0, xf1, wv, sv);
+                if constexpr (BITS == 4) {{
+                    thread uint32_t wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }}
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        thread U wv[8];
+                        dequant_u32_fp4_8(wr[r], wv);
+                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        result[r] += dot_vals_f4_8<4>(xf0, xf1, wv, sv);
+                    }}
+                }} else {{
+                    thread uint2 wr[ROWS];
+                    thread uint8_t sr[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        wr[r] = ((const device uint2*)(ws + r * in_w))[0];
+                        sr[r] = (sc + r * in_g)[0];
+                    }}
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; r++) {{
+                        thread U wv[8];
+                        dequant_u2_fp8_8(wr[r], wv);
+                        U sv = dequantize_scale<U, GS>(sr[r]);
+                        result[r] += dot_vals_f4_8<8>(xf0, xf1, wv, sv);
+                    }}
                 }}
             }} else if constexpr (VPT == 4) {{
                 uint2 x2 = ((const device uint2*)(xp + k_off))[0];
@@ -2173,9 +2377,9 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
                   grid=(32, nsg * (C // 4), 1), threadgroup=(32, nsg, 1), output_shapes=shapes, output_dtypes=dts))
 
 
-def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False, conv_anc=None, skip_combine=False, w_act=None):
-    """The MoE half of a layer visit for B rows. x = mlp_x (B,D) bf16, residual (B,D) f32,
-    cs3 (B,3,D) [or (1,3,D) when causal=True] f32 (post-mlp conv state).
+def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False, conv_anc=None, skip_combine=False, w_act=None, mlp_mixed=None):
+    """The MoE half of a layer visit for B rows. x = mlp_x (B,D) bf16 (or None when mlp_mixed=(mixed,part,ln_w,eps) is given),
+    residual (B,D) f32, cs3 (B,3,D) [or (1,3,D) when causal=True] f32 (post-mlp conv state).
     Returns dict: out (B,D) bf16, w3, expert_inds, expert_w, swiglu, router_logits (+ gate_up, down, moe_out, post_mlp_conv if debug)."""
     if isinstance(layer, dict):
         moe = layer["mlp"]
@@ -2189,14 +2393,17 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
         ex = moe.experts
         gu, dn, act = ex.gate_up_proj, ex.down_proj, ex.act_fn
         cw = layer.post_mlp_convolution.conv1d.weight
-    B = x.shape[0]
+    B = int(mlp_mixed[0].shape[0]) if mlp_mixed is not None else x.shape[0]
     rows_gu = 2 if (2 <= B <= 16 and "MOE_ROWS_GU" not in os.environ) else None
     rows_dn = 2 if (2 <= B <= 16 and "MOE_ROWS_DN" not in os.environ) else None
     if w_act is not None:
         assert causal and B > 1
         route = "launch"
     elif route == "auto":
-        route = AUTO_ROUTE if (B > 1 or causal) else "kernel"
+        if "MOE_AUTO_ROUTE" in os.environ:
+            route = AUTO_ROUTE if (B > 1 or causal) else "kernel"
+        else:
+            route = "kernel" if (B <= 2 and not causal) else AUTO_ROUTE
     if B > 8 and route == "group":
         route = "launch"
 
@@ -2204,7 +2411,25 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
     bias = gate["e_score_correction_bias"]
     rscale = gate.routed_scaling_factor
     grp = None
-    if route == "group":
+    if mlp_mixed is not None:
+        m_mix, m_part, m_lw, m_eps = mlp_mixed
+        logits, x = router_from_mixed_rows(m_mix, m_part, m_lw, w_gate, eps_ln=m_eps)
+        if route == "group":
+            rg = route_group_rows(logits, bias, route_scale=rscale)
+            inds_arr, wts_arr = rg[0], rg[1]
+            grp = rg[2:]
+            r = gateup_rows(logits, bias, x, gu["weight"], gu["scales"], gu.get("global_scale"),
+                            mode=gu.mode, group_size=gu.group_size, bits=gu.bits, route_scale=rscale,
+                            gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route="group", inds=inds_arr, grp=grp,
+                            debug=debug, rows=rows_gu)
+            inds, wts, sw = inds_arr, wts_arr, r[2]
+        else:
+            r = gateup_rows(logits, bias, x, gu["weight"], gu["scales"], gu.get("global_scale"),
+                            mode=gu.mode, group_size=gu.group_size, bits=gu.bits, route_scale=rscale,
+                            gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route=route, debug=debug,
+                            rows=rows_gu, w_act=w_act)
+            inds, wts, sw = r[0], r[1], r[2]
+    elif route == "group":
         logits = router_rows(x, w_gate)
         rg = route_group_rows(logits, bias, route_scale=rscale)
         inds_arr, wts_arr = rg[0], rg[1]

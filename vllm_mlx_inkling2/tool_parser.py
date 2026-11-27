@@ -40,7 +40,27 @@ _STRUCTURAL_TAG_RE = re.compile(
 )
 
 _OPEN_TAGS = (_TAG_TOOL_JSON, _TAG_TOOL_TEXT)
-_MAX_OPEN_LEN = max(len(t) for t in _OPEN_TAGS)
+_HOLD_TAGS = (
+    _TAG_TOOL_JSON,
+    _TAG_TOOL_TEXT,
+    _TAG_END,
+    _TAG_EOS,
+    "<|message_model|>",
+    "<|content_text|>",
+    "<|content_thinking|>",
+)
+_MAX_HOLD_LEN = max(len(t) for t in _HOLD_TAGS)
+_CLOSE_MARKERS = (
+    (_TAG_END, len(_TAG_END)),
+    (_TAG_EOS, len(_TAG_EOS)),
+    (_TAG_TOOL_JSON, 0),
+    (_TAG_TOOL_TEXT, 0),
+)
+_MAX_CLOSE_LEN = max(len(m) for m, _ in _CLOSE_MARKERS)
+
+
+def _strip_structural_tags(text: str) -> str:
+    return _STRUCTURAL_TAG_RE.sub("", text) if "<|" in text else text
 
 
 def _gen_tool_id() -> str:
@@ -96,13 +116,14 @@ def _parse_json_payload(raw_payload: str) -> list[dict[str, str]]:
 
 def _partial_open_len(text: str) -> int:
     idx = text.rfind("<|")
-    if idx < 0:
-        return 0
-    tail = text[idx:]
-    if len(tail) >= _MAX_OPEN_LEN:
-        return 0
-    if any(t.startswith(tail) and t != tail for t in _OPEN_TAGS):
-        return len(tail)
+    if idx >= 0:
+        tail = text[idx:]
+        if len(tail) < _MAX_HOLD_LEN and any(
+            t.startswith(tail) and t != tail for t in _HOLD_TAGS
+        ):
+            return len(tail)
+    if text.endswith("<"):
+        return 1
     return 0
 
 
@@ -116,11 +137,19 @@ class Inkling2ToolParser(ToolParser):
 
     def __init__(self, tokenizer: Any | None = None) -> None:
         super().__init__(tokenizer)
-        self._cursor: int = 0
+        self._fed_len: int = 0
+        self._pending_text: str = ""
+        self._in_tool_kind: str | None = None
+        self._tool_chunks: list[str] = []
+        self._tool_tail: str = ""
 
     def reset(self) -> None:
         super().reset()
-        self._cursor = 0
+        self._fed_len = 0
+        self._pending_text = ""
+        self._in_tool_kind = None
+        self._tool_chunks = []
+        self._tool_tail = ""
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -142,69 +171,156 @@ class Inkling2ToolParser(ToolParser):
             content=cleaned or None,
         )
 
+    def _emit_tool_payload(self, payload: str, new_calls: list[dict[str, Any]]) -> None:
+        parsed = _parse_json_payload(payload)
+        for tc in parsed:
+            idx = len(self.prev_tool_call_arr)
+            self.prev_tool_call_arr.append(tc)
+            new_calls.append(
+                {
+                    "index": idx,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+            )
+
     def _scan_stream(self, current_text: str, *, allow_unclosed: bool) -> dict[str, Any] | None:
+        if len(current_text) < self._fed_len:
+            # Guard against callers resetting current_text externally.
+            self._fed_len = 0
+            self._pending_text = ""
+            self._in_tool_kind = None
+            self._tool_chunks = []
+            self._tool_tail = ""
+
+        new_slice = current_text[self._fed_len :]
+        self._fed_len = len(current_text)
+
+        # Ultra-fast path: outside tool block with no buffered prefix and no '<' in delta.
+        if (
+            self._in_tool_kind is None
+            and not self._pending_text
+            and not allow_unclosed
+            and new_slice
+            and "<" not in new_slice
+        ):
+            return {"content": new_slice}
+
         content_parts: list[str] = []
         new_calls: list[dict[str, Any]] = []
 
-        while self._cursor < len(current_text):
-            tail = current_text[self._cursor :]
-            j_pos = tail.find(_TAG_TOOL_JSON)
-            t_pos = tail.find(_TAG_TOOL_TEXT)
+        if self._in_tool_kind is not None:
+            window = self._tool_tail + new_slice
+            self._tool_tail = ""
+        else:
+            if new_slice:
+                self._pending_text += new_slice
+            window = ""
+
+        while True:
+            if self._in_tool_kind is not None:
+                close_pos = -1
+                close_len = 0
+                if "<|" in window:
+                    for marker, mlen in _CLOSE_MARKERS:
+                        mp = window.find(marker)
+                        if mp >= 0 and (close_pos < 0 or mp < close_pos):
+                            close_pos = mp
+                            close_len = mlen
+
+                if close_pos >= 0:
+                    if close_pos > 0:
+                        self._tool_chunks.append(window[:close_pos])
+                    if self._in_tool_kind == "json":
+                        payload = (
+                            self._tool_chunks[0]
+                            if len(self._tool_chunks) == 1
+                            else "".join(self._tool_chunks)
+                        )
+                        self._emit_tool_payload(payload, new_calls)
+                    self._in_tool_kind = None
+                    self._tool_chunks = []
+                    self._tool_tail = ""
+                    rem = window[close_pos + close_len :]
+                    window = ""
+                    if rem:
+                        self._pending_text += rem
+                    if not self._pending_text and not allow_unclosed:
+                        break
+                    continue
+
+                if allow_unclosed:
+                    if window:
+                        self._tool_chunks.append(window)
+                    if self._in_tool_kind == "json":
+                        payload = (
+                            self._tool_chunks[0]
+                            if len(self._tool_chunks) == 1
+                            else "".join(self._tool_chunks)
+                        )
+                        self._emit_tool_payload(payload, new_calls)
+                    self._in_tool_kind = None
+                    self._tool_chunks = []
+                    self._tool_tail = ""
+                    window = ""
+                    break
+
+                keep = _MAX_CLOSE_LEN - 1
+                if len(window) > keep:
+                    self._tool_chunks.append(window[:-keep])
+                    self._tool_tail = window[-keep:]
+                else:
+                    self._tool_tail = window
+                break
+
+            buf = self._pending_text
+            if not buf:
+                break
+
+            j_pos = buf.find(_TAG_TOOL_JSON) if "<|" in buf else -1
+            t_pos = buf.find(_TAG_TOOL_TEXT) if "<|" in buf else -1
             if j_pos < 0 and t_pos < 0:
                 if allow_unclosed:
-                    content_parts.append(_STRUCTURAL_TAG_RE.sub("", tail))
-                    self._cursor = len(current_text)
+                    cleaned = _strip_structural_tags(buf)
+                    if cleaned:
+                        content_parts.append(cleaned)
+                    self._pending_text = ""
                 else:
-                    hold = _partial_open_len(tail)
-                    emit_end = len(tail) - hold
+                    hold = _partial_open_len(buf)
+                    emit_end = len(buf) - hold
                     if emit_end > 0:
-                        content_parts.append(_STRUCTURAL_TAG_RE.sub("", tail[:emit_end]))
-                        self._cursor += emit_end
+                        cleaned = _strip_structural_tags(buf[:emit_end])
+                        if cleaned:
+                            content_parts.append(cleaned)
+                        self._pending_text = buf[emit_end:]
                 break
 
             if j_pos >= 0 and (t_pos < 0 or j_pos < t_pos):
-                tag_pos, tag_len, is_json = j_pos, len(_TAG_TOOL_JSON), True
+                tag_pos, tag_len, kind = j_pos, len(_TAG_TOOL_JSON), "json"
             else:
-                tag_pos, tag_len, is_json = t_pos, len(_TAG_TOOL_TEXT), False
+                tag_pos, tag_len, kind = t_pos, len(_TAG_TOOL_TEXT), "text"
 
             if tag_pos > 0:
-                content_parts.append(_STRUCTURAL_TAG_RE.sub("", tail[:tag_pos]))
-                self._cursor += tag_pos
+                cleaned = _strip_structural_tags(buf[:tag_pos])
+                if cleaned:
+                    content_parts.append(cleaned)
 
-            after_tag = current_text[self._cursor + tag_len :]
-            candidates: list[tuple[int, int]] = []
-            for marker, mlen in ((_TAG_END, len(_TAG_END)), (_TAG_EOS, len(_TAG_EOS)), (_TAG_TOOL_JSON, 0), (_TAG_TOOL_TEXT, 0)):
-                mp = after_tag.find(marker)
-                if mp >= 0:
-                    candidates.append((mp, mlen))
-            if candidates:
-                close_pos, close_len = min(candidates, key=lambda x: x[0])
-            elif allow_unclosed:
-                close_pos, close_len = len(after_tag), 0
-            else:
-                break
-
-            payload = after_tag[:close_pos]
-            if is_json:
-                parsed = _parse_json_payload(payload)
-                for tc in parsed:
-                    idx = len(self.prev_tool_call_arr)
-                    self.prev_tool_call_arr.append(tc)
-                    new_calls.append(
-                        {
-                            "index": idx,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                    )
-            self._cursor += tag_len + close_pos + close_len
+            self._in_tool_kind = kind
+            self._tool_chunks = []
+            self._tool_tail = ""
+            window = buf[tag_pos + tag_len :]
+            self._pending_text = ""
 
         out: dict[str, Any] = {}
-        joined = "".join(content_parts)
+        joined = (
+            content_parts[0]
+            if len(content_parts) == 1
+            else ("".join(content_parts) if content_parts else "")
+        )
         if joined:
             out["content"] = joined
         if new_calls:

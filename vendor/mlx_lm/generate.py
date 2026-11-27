@@ -93,16 +93,40 @@ def _df2_batch_enabled() -> bool:
     )
 
 
+def _df2_c1_enabled() -> bool:
+    return (
+        os.environ.get("LOOPLING_MTP") == "dflash2"
+        and os.environ.get("LOOPLING_DFLASH2_C1", "1") not in ("0", "", "false", "False")
+    )
+
+
+def _df2_c1_max_ctx() -> int:
+    return int(os.environ.get("LOOPLING_DFLASH2_MAX_CTX", "1048576"))
+
+
+def _df2_batch_auto_enabled() -> bool:
+    return (
+        os.environ.get("LOOPLING_MTP") == "dflash2"
+        and os.environ.get("LOOPLING_DFLASH2_BATCH", "1") not in ("0", "", "false", "False")
+    )
+
+
+def _df2_batch_min_ctx() -> int:
+    return int(os.environ.get("LOOPLING_DFLASH2_BATCH_MIN_CTX", "16384"))
+
+
 def _get_df2_batch_ctx(model: nn.Module):
     from .models.inkling2 import dflash2 as DF2
     from .models.inkling2.mtp import default_taps, parse_taps
 
+    if not os.path.isdir(DF2.DFLASH2_DIR):
+        return None
     tm = model.model.language_model
     passes = tm.args.loop_config["num_passes"]
     cfg = getattr(tm, "loopcd", None)
     if cfg is not None and cfg.enabled_for(passes) and cfg.mode != "hidden":
         return None
-    dr = DF2._get_drafter(model, DF2.DFLASH2_DIR)
+    dr = DF2._get_drafter(model, DF2.DFLASH2_DIR, reset=False)
     taps = parse_taps(os.environ.get("LOOPLING_MTP_TAPS", default_taps(passes)), passes)
     tap_keys = [t if t in ("F", "f", "o") else int(t[1:]) for t in taps]
     tap_set = {k for k in tap_keys if isinstance(k, int)}
@@ -1309,6 +1333,7 @@ class PromptProcessingBatch:
         max_tokens: Optional[List[int]] = None,
         need_logprobs: Optional[List[bool]] = None,
         df2_states: Optional[List[Any]] = None,
+        need_final_cache: Optional[List[bool]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1337,6 +1362,11 @@ class PromptProcessingBatch:
         self._df2_states = (
             list(df2_states) if df2_states is not None else [None] * len(self.uids)
         )
+        self.need_final_cache = (
+            list(need_final_cache)
+            if need_final_cache is not None
+            else [True] * len(self.uids)
+        )
 
     def __len__(self):
         return len(self.uids)
@@ -1357,6 +1387,7 @@ class PromptProcessingBatch:
         self.stop_sequences.extend(batch.stop_sequences)
         self.need_logprobs.extend(batch.need_logprobs)
         self._df2_states.extend(batch._df2_states)
+        self.need_final_cache.extend(batch.need_final_cache)
 
     def _copy(self):
         new_batch = self.__class__.__new__(self.__class__)
@@ -1372,6 +1403,7 @@ class PromptProcessingBatch:
         new_batch.max_tokens = list(self.max_tokens)
         new_batch.need_logprobs = list(self.need_logprobs)
         new_batch._df2_states = [None if s is None else s.clone() for s in self._df2_states]
+        new_batch.need_final_cache = list(self.need_final_cache)
         return new_batch
 
     def split(self, indices: List[int]):
@@ -1392,6 +1424,7 @@ class PromptProcessingBatch:
             new_batch.max_tokens = list(self.max_tokens)
             new_batch.need_logprobs = list(self.need_logprobs)
             new_batch._df2_states = list(self._df2_states)
+            new_batch.need_final_cache = list(self.need_final_cache)
             self.filter([])
             if indices != list(range(len(new_batch.uids))):
                 new_batch.filter(indices)
@@ -1416,6 +1449,7 @@ class PromptProcessingBatch:
         self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
         self.need_logprobs = [self.need_logprobs[idx] for idx in keep]
         self._df2_states = [self._df2_states[idx] for idx in keep]
+        self.need_final_cache = [self.need_final_cache[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
         """
@@ -1430,10 +1464,30 @@ class PromptProcessingBatch:
         if not tokens:
             return
 
+        lengths = [len(p) for p in tokens]
+        max_length = max(lengths)
         df2_ctx = None
-        if _df2_batch_enabled() and _is_inkling2_model(self.model):
+        df2_tail_only = False
+        if _is_inkling2_model(self.model) and (
+            _df2_batch_enabled()
+            or (
+                _df2_c1_enabled()
+                and len(self.uids) == 1
+                and (len(self.tokens[0]) + lengths[0]) <= _df2_c1_max_ctx()
+                and not self.need_logprobs[0]
+                and not self.logits_processors[0]
+            )
+            or (
+                _df2_batch_auto_enabled()
+                and 2 <= len(self.uids) <= 4
+                and min(len(self.tokens[i]) + lengths[i] for i in range(len(self.uids))) >= _df2_batch_min_ctx()
+                and not any(self.need_logprobs)
+                and not any(self.logits_processors)
+            )
+        ):
             df2_ctx = _get_df2_batch_ctx(self.model)
             if df2_ctx is not None:
+                df2_tail_only = not _df2_batch_enabled()
                 dr = df2_ctx[0]
                 for i, ti in enumerate(tokens):
                     st = self._df2_states[i]
@@ -1448,8 +1502,6 @@ class PromptProcessingBatch:
             sti += ti
 
         # Calculate if we need to pad
-        lengths = [len(p) for p in tokens]
-        max_length = max(lengths)
         padding = [max_length - l for l in lengths]
         max_padding = max(padding)
 
@@ -1468,25 +1520,37 @@ class PromptProcessingBatch:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             if df2_ctx is not None:
                 dr, tm, tap_keys, tap_set, _ = df2_ctx
-                tm.tap_visits = tap_set
-                tm.tap_buf = {}
+                # Only the final `dr.window` (1024) tokens enter DFlash2's sliding window.
+                need_taps_chunk = (not df2_tail_only) or any(
+                    chunk_off + n_to_process > max(0, l_i - dr.window) for l_i in lengths
+                )
+                if need_taps_chunk:
+                    tm.tap_visits = tap_set
+                    tm.tap_buf = {}
                 try:
                     self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
                 finally:
-                    tm.tap_visits = None
-                    tb = tm.tap_buf
-                    tm.tap_buf = {}
+                    if need_taps_chunk:
+                        tm.tap_visits = None
+                        tb = tm.tap_buf
+                        tm.tap_buf = {}
+                    else:
+                        tb = None
                 v_states, v_feats = [], []
-                for i, l_i in enumerate(lengths):
-                    valid_i = max(0, min(n_to_process, l_i - chunk_off))
-                    if valid_i > 0:
-                        v_states.append(self._df2_states[i])
-                        v_feats.append(
-                            mx.concatenate(
-                                [tb[k][i, :valid_i].reshape(valid_i, 1, dr.H) for k in tap_keys],
-                                axis=1,
-                            )[None]
-                        )
+                if tb is not None:
+                    for i, l_i in enumerate(lengths):
+                        valid_i = max(0, min(n_to_process, l_i - chunk_off))
+                        if valid_i > 0:
+                            start_j = max(0, l_i - dr.window - chunk_off) if df2_tail_only else 0
+                            if start_j < valid_i:
+                                n_take = valid_i - start_j
+                                v_states.append(self._df2_states[i])
+                                v_feats.append(
+                                    mx.concatenate(
+                                        [tb[k][i, start_j:valid_i].reshape(n_take, 1, dr.H) for k in tap_keys],
+                                        axis=1,
+                                    )[None]
+                                )
                 if v_states:
                     dr.append_ctx_batch(v_states, v_feats)
                     mx.eval(
@@ -1536,6 +1600,7 @@ class PromptProcessingBatch:
             self.max_tokens,
             self.need_logprobs,
             df2_states=self._df2_states,
+            need_final_cache=self.need_final_cache,
         )
 
         self.uids = []
@@ -1546,6 +1611,7 @@ class PromptProcessingBatch:
         self.max_tokens = []
         self.need_logprobs = []
         self._df2_states = []
+        self.need_final_cache = []
 
         return generation
 
@@ -1568,6 +1634,7 @@ class PromptProcessingBatch:
             max_tokens=[],
             stop_sequences=[],
             need_logprobs=[],
+            need_final_cache=[],
         )
 
 
@@ -1603,6 +1670,7 @@ class GenerationBatch:
         need_logprobs: Optional[List[bool]] = None,
         df2_states: Optional[List[Any]] = None,
         per_caches: Optional[List[List[Any]]] = None,
+        need_final_cache: Optional[List[bool]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1620,7 +1688,13 @@ class GenerationBatch:
         self._df2_states = (
             list(df2_states) if df2_states is not None else [None] * len(self.uids)
         )
+        self.need_final_cache = (
+            list(need_final_cache)
+            if need_final_cache is not None
+            else [True] * len(self.uids)
+        )
         self._df2_ctx = None
+        self._df2_c1_runner = None
 
         if self.samplers and len(self.samplers) != len(self.uids):
             raise ValueError("Insufficient number of samplers provided")
@@ -1657,7 +1731,41 @@ class GenerationBatch:
             self.prompt_cache = _merge_caches(per_caches)
 
         if self.uids:
-            self._step()
+            df2_c1_ctx = self._df2_c1_eligible()
+            if df2_c1_ctx is not None:
+                self._step_init_df2_c1(df2_c1_ctx)
+            else:
+                self._step()
+
+    def _step_init_df2_c1(self, df2_c1_ctx) -> None:
+        """Initial prompt[-1] step for C=1 DFlash 2: captures last-prompt tap into drafter state."""
+        from .models.inkling2.mtp import _feats_from_dict
+
+        dr, _tm, tap_keys, tap_set, _ = df2_c1_ctx
+        self._current_tokens = self._next_tokens
+        self._current_logprobs = self._next_logprobs
+        inputs = self._current_tokens
+        base_sampler = (
+            self.fallback_sampler
+            if (not self.samplers or self.samplers[0] is None)
+            else self.samplers[0]
+        )
+        y, tap0 = self._bd.step_with_taps(inputs, tap_visits=tap_set, sampler=base_sampler)
+        st = self._df2_states[0]
+        if st is None:
+            st = self._df2_states[0] = dr.new_stream_state(allocate=True)
+            st.lookup.append(self.tokens[0])
+        f0 = _feats_from_dict(tap0, tap_keys)
+        dr.append_ctx_batch([st], [f0])
+        self._next_tokens = y.reshape(1).astype(mx.uint32)
+        self._next_logprobs = [None]
+        mx.async_eval(self._next_tokens, *st.ck, *st.cv)
+        mx.eval(inputs)
+        in_list = inputs.tolist()
+        for sti, ti in zip(self.tokens, in_list):
+            sti.append(ti)
+        st.lookup.append_one(int(in_list[0]))
+        st.lookup.set_prompt_end(len(st.lookup.tokens))
 
     def _activate_bd(self, per_caches: List[List[Any]]) -> None:
         from .models.inkling2.batchdecode import BatchDecoder
@@ -1665,19 +1773,19 @@ class GenerationBatch:
         self._bd = BatchDecoder(self.model, per_caches)
         self.prompt_cache = []
 
-    def _flush_bd(self) -> None:
+    def _flush_bd(self, *, keep_cascade_split: bool = False) -> None:
         if self._bd is None:
             return
         if self._next_tokens is not None:
             nlp = [lp for lp in self._next_logprobs if lp is not None]
             mx.eval(self._next_tokens, nlp) if nlp else mx.eval(self._next_tokens)
-        self._bd.flush()
+        self._bd.flush(keep_cascade_split=keep_cascade_split)
 
-    def _extract_all_caches(self) -> List[List[Any]]:
+    def _extract_all_caches(self, *, keep_cascade_split: bool = False) -> List[List[Any]]:
         if not self.uids:
             return []
         if self._bd is not None:
-            self._flush_bd()
+            self._flush_bd(keep_cascade_split=keep_cascade_split)
             return list(self._bd.caches)
         return [self.extract_cache(i) for i in range(len(self.uids))]
 
@@ -1692,6 +1800,16 @@ class GenerationBatch:
 
     def extend(self, batch):
         """Extend this batch with another generation batch."""
+        if self._df2_c1_runner is not None:
+            nxt = self._df2_c1_runner.handoff_to_ar(need_next_token=True)
+            self._df2_c1_runner = None
+            self._next_tokens = nxt
+            self._next_logprobs = [None]
+        if getattr(batch, "_df2_c1_runner", None) is not None:
+            nxt_b = batch._df2_c1_runner.handoff_to_ar(need_next_token=True)
+            batch._df2_c1_runner = None
+            batch._next_tokens = nxt_b
+            batch._next_logprobs = [None]
         was_empty = len(self.uids) == 0
         if was_empty:
             self.uids.extend(batch.uids)
@@ -1719,7 +1837,7 @@ class GenerationBatch:
                         pend.extend(lp for lp in gb._next_logprobs if lp is not None)
                 if pend:
                     mx.eval(*pend)
-            all_caches = self._extract_all_caches() + batch._extract_all_caches()
+            all_caches = self._extract_all_caches(keep_cascade_split=True) + batch._extract_all_caches(keep_cascade_split=True)
             self.uids.extend(batch.uids)
             if self._bd is not None:
                 self._bd.release_stage()
@@ -1743,6 +1861,7 @@ class GenerationBatch:
         self.stop_sequences.extend(batch.stop_sequences)
         self.need_logprobs.extend(batch.need_logprobs)
         self._df2_states.extend(batch._df2_states)
+        self.need_final_cache.extend(batch.need_final_cache)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1772,6 +1891,22 @@ class GenerationBatch:
         self._current_logprobs = self._next_logprobs
         inputs = self._current_tokens
 
+        # D3: When all active sequences hit max_tokens on the token we are about to emit
+        # and no caller needs the post-completion cache, skip the wasted max_tokens+1 forward pass.
+        if (
+            self.uids
+            and not any(self.need_final_cache)
+            and all(nt + 1 >= mt for nt, mt in zip(self._num_tokens, self.max_tokens))
+        ):
+            self._next_tokens = None
+            self._next_logprobs = [None] * len(self.uids)
+            cur_lp = [lp for lp in self._current_logprobs if lp is not None]
+            mx.eval(inputs, cur_lp) if cur_lp else mx.eval(inputs)
+            inputs = inputs.tolist()
+            for sti, ti in zip(self.tokens, inputs):
+                sti.append(ti)
+            return inputs, self._current_logprobs
+
         samplers = [
             self.fallback_sampler if s is None else s
             for s in (self.samplers or [None] * len(self.uids))
@@ -1789,17 +1924,23 @@ class GenerationBatch:
             and not need_lp
             and not any(self.logits_processors)
             and same_sampler
-            and base_sampler is greedy_sampler
         ):
-            self._next_tokens = self._bd.step(inputs)
-            self._next_logprobs = [None] * len(self.uids)
-            mx.async_eval(self._next_tokens)
-            cur_lp = [lp for lp in self._current_logprobs if lp is not None]
-            mx.eval(inputs, cur_lp) if cur_lp else mx.eval(inputs)
-            inputs = inputs.tolist()
-            for sti, ti in zip(self.tokens, inputs):
-                sti.append(ti)
-            return inputs, self._current_logprobs
+            if base_sampler is greedy_sampler:
+                sampled_fast = self._bd.step(inputs)
+            elif self._bd.can_fast_sample(base_sampler):
+                sampled_fast = self._bd.sample_step(inputs, base_sampler)
+            else:
+                sampled_fast = None
+            if sampled_fast is not None:
+                self._next_tokens = sampled_fast
+                self._next_logprobs = [None] * len(self.uids)
+                mx.async_eval(self._next_tokens)
+                cur_lp = [lp for lp in self._current_logprobs if lp is not None]
+                mx.eval(inputs, cur_lp) if cur_lp else mx.eval(inputs)
+                inputs = inputs.tolist()
+                for sti, ti in zip(self.tokens, inputs):
+                    sti.append(ti)
+                return inputs, self._current_logprobs
 
         # Forward pass + logprobs
         has_lp_proc = any(self.logits_processors)
@@ -1870,25 +2011,46 @@ class GenerationBatch:
         return inputs, self._current_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
+        if self._df2_c1_runner is not None:
+            self._df2_c1_runner.rollback_unemitted()
         if self._bd is not None:
-            self._flush_bd()
-            return copy.deepcopy(self._bd.caches[idx])
+            return self._bd.snapshot_cache(idx)
         return [c.extract(idx) for c in self.prompt_cache]
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
+        if self._df2_c1_runner is not None:
+            if not keep:
+                self._df2_c1_runner.discard()
+                self._df2_c1_runner = None
+            else:
+                nxt = self._df2_c1_runner.handoff_to_ar(need_next_token=True)
+                self._df2_c1_runner = None
+                self._next_tokens = nxt
+                self._next_logprobs = [None]
         self.uids = [self.uids[idx] for idx in keep]
         if self._bd is not None:
-            self._flush_bd()
-            kept = [self._bd.caches[idx] for idx in keep]
-            self._bd.release_stage()
-            self._bd = None
-            if not kept:
-                self.prompt_cache = []
-            elif not _inkling2_bd_caches_ok(self.model, kept):
-                self.prompt_cache = _merge_caches(kept)
+            if keep:
+                self._flush_bd(keep_cascade_split=True)
+                kept = [self._bd.caches[idx] for idx in keep]
+                self._bd.release_stage()
+                self._bd = None
+                if not _inkling2_bd_caches_ok(self.model, kept):
+                    self.prompt_cache = _merge_caches(kept)
+                else:
+                    self._activate_bd(kept)
             else:
-                self._activate_bd(kept)
+                if any(self.need_final_cache):
+                    self._flush_bd()
+                    self._bd.release_stage()
+                elif self._next_tokens is None:
+                    self._bd.release_stage()
+                else:
+                    # Drop stage without returning live in-flight buffers to the reuse pool.
+                    self._bd._stage_main = None
+                    self._bd._stage_ref = None
+                self._bd = None
+                self.prompt_cache = []
         elif not keep:
             self.prompt_cache.clear()
         else:
@@ -1900,45 +2062,252 @@ class GenerationBatch:
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
         self.need_logprobs = [self.need_logprobs[idx] for idx in keep]
+        self.need_final_cache = [self.need_final_cache[idx] for idx in keep]
 
-        self._next_tokens = self._next_tokens[keep] if keep else None
+        self._next_tokens = (
+            self._next_tokens[keep] if (keep and self._next_tokens is not None) else None
+        )
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matchers = [self._matchers[idx] for idx in keep]
         self._df2_states = [self._df2_states[idx] for idx in keep]
 
-    def _df2_eligible(self) -> Optional[Tuple[Any, ...]]:
-        if self._bd is None or len(self.uids) < 2:
+    def _df2_c1_eligible(self) -> Optional[Tuple[Any, ...]]:
+        if self._bd is None or not self._bd._b1_fast or len(self.uids) != 1:
             return None
-        if not _df2_batch_enabled() or not _is_inkling2_model(self.model):
+        if not _df2_c1_enabled() or not _is_inkling2_model(self.model):
             return None
-        if any(self.need_logprobs) or any(self.logits_processors):
+        if self.need_logprobs[0] or self.logits_processors[0]:
             return None
-        samplers = [
-            self.fallback_sampler if s is None else s
-            for s in (self.samplers or [None] * len(self.uids))
-        ]
-        if not all(
-            s is greedy_sampler or getattr(s, "_sampler_key", None) == ("greedy",)
-            for s in samplers
-        ):
+        if int(self._bd.caches[0][0][0].offset) > _df2_c1_max_ctx():
             return None
+        s = self.fallback_sampler if (not self.samplers or self.samplers[0] is None) else self.samplers[0]
+        is_greedy = s is greedy_sampler or getattr(s, "_sampler_key", None) == ("greedy",)
+        if not is_greedy:
+            from .models.inkling2.batchdecode import _fast_sample_enabled, _std_sampler_params
+
+            if (
+                not _fast_sample_enabled()
+                or _std_sampler_params(s) is None
+                or os.environ.get("LOOPLING_DFLASH2_COUPLED_SAMPLE", "1") in ("0", "", "false", "False")
+            ):
+                return None
         if self._df2_ctx is None:
             self._df2_ctx = _get_df2_batch_ctx(self.model)
             if self._df2_ctx is None:
                 return None
-        max_c = self._df2_ctx[4]
-        if len(self.uids) > max_c:
+        return self._df2_ctx
+
+    def _next_df2_c1(self, df2_ctx) -> List["GenerationBatch.Response"]:
+        from .models.inkling2 import dflash2 as DF2
+
+        dr, _tm, tap_keys, tap_set, _ = df2_ctx
+        uid = self.uids[0]
+        base_sampler = (
+            self.fallback_sampler
+            if (not self.samplers or self.samplers[0] is None)
+            else self.samplers[0]
+        )
+
+        # First token (or first token right after C>=2 -> C=1 shrink): emit already-computed `_next_tokens`
+        # without launching a redundant AR step, then arm `_DFlash2C1Runner` if >=2 tokens remain.
+        if self._df2_c1_runner is None:
+            tok_arr = self._next_tokens
+            mx.eval(tok_arr)
+            tok0 = int(tok_arr.tolist()[0])
+            self._num_tokens[0] += 1
+            self.tokens[0].append(tok0)
+            finish_reason = None
+            if self._num_tokens[0] >= self.max_tokens[0]:
+                finish_reason = "length"
+            if self._matchers[0].advance(tok0):
+                finish_reason = "stop"
+            if finish_reason is not None:
+                pc = None
+                if self.need_final_cache[0]:
+                    # Commit tok0 into KV so returned prompt_cache covers all_tokens exactly.
+                    _ = self._bd.step(tok_arr.reshape(1).astype(mx.uint32))
+                    mx.eval(_)
+                    self._bd.flush()
+                    pc = self._bd.caches[0]
+                resp = self.Response(
+                    uid=uid,
+                    token=tok0,
+                    logprobs=None,
+                    finish_reason=finish_reason,
+                    prompt_cache=pc,
+                    all_tokens=self.tokens[0],
+                )
+                self._next_tokens = None
+                self.filter([])
+                return [resp]
+
+            rem = self.max_tokens[0] - self._num_tokens[0]
+            if rem >= 2:
+                st = self._df2_states[0]
+                if st is None:
+                    st = self._df2_states[0] = dr.new_stream_state(allocate=True)
+                self._df2_c1_runner = DF2._DFlash2C1Runner(
+                    self._bd,
+                    dr,
+                    st,
+                    tok_arr,
+                    tok0,
+                    all_tokens=self.tokens[0],
+                    tap_keys=tap_keys,
+                    tap_set=tap_set,
+                    sampler=base_sampler,
+                    max_tokens=self.max_tokens[0],
+                    num_tokens=self._num_tokens[0],
+                    track_cache_rb=bool(self.need_final_cache[0]),
+                )
+                self._df2_c1_runner.prefetch()
+                self._next_tokens = None
+                self._next_logprobs = [None]
+            else:
+                # Only 1 token left: run 1 AR step on tok0 and let next() emit & finish.
+                anc = tok_arr.reshape(1).astype(mx.uint32)
+                if base_sampler is greedy_sampler:
+                    nxt = self._bd.step(anc)
+                elif self._bd.can_fast_sample(base_sampler):
+                    nxt = self._bd.sample_step(anc, base_sampler)
+                else:
+                    lp = self._bd.logprobs(self._bd._hidden_pair(anc))
+                    nxt = base_sampler(lp).astype(mx.uint32)
+                self._next_tokens = nxt
+                self._next_logprobs = [None]
+                mx.async_eval(self._next_tokens)
+            return [
+                self.Response(
+                    uid=uid,
+                    token=tok0,
+                    logprobs=None,
+                    finish_reason=None,
+                    prompt_cache=None,
+                    all_tokens=None,
+                )
+            ]
+
+        # Steady-state DFlash 2 C=1 cycle.
+        em = self._df2_c1_runner.step()
+        responses = []
+        for j, tok in enumerate(em):
+            tok_i = int(tok)
+            self._num_tokens[0] += 1
+            self.tokens[0].append(tok_i)
+            finish_reason = None
+            if self._num_tokens[0] >= self.max_tokens[0]:
+                finish_reason = "length"
+            if self._matchers[0].advance(tok_i):
+                finish_reason = "stop"
+            if finish_reason is not None:
+                pc = None
+                if self.need_final_cache[0]:
+                    self._df2_c1_runner.finalize_exact_cache(
+                        emitted_kept=j + 1, total_in_burst=len(em), em_burst=em
+                    )
+                    pc = self._bd.caches[0]
+                else:
+                    self._df2_c1_runner.discard()
+                self._df2_c1_runner = None
+                responses.append(
+                    self.Response(
+                        uid=uid,
+                        token=tok_i,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                        prompt_cache=pc,
+                        all_tokens=self.tokens[0],
+                    )
+                )
+                self._next_tokens = None
+                self.filter([])
+                return responses
+            responses.append(
+                self.Response(
+                    uid=uid,
+                    token=tok_i,
+                    logprobs=None,
+                    finish_reason=None,
+                    prompt_cache=None,
+                    all_tokens=None,
+                )
+            )
+        return responses
+
+    def _df2_eligible(self) -> Optional[Tuple[Any, ...]]:
+        if self._bd is None or not self._bd._batch_fast or len(self.uids) < 2:
+            return None
+        if not _is_inkling2_model(self.model):
+            return None
+        explicit_batch = _df2_batch_enabled()
+        auto_batch = _df2_batch_auto_enabled()
+        if not explicit_batch and not auto_batch:
+            return None
+        if any(self.need_logprobs) or any(self.logits_processors):
+            return None
+        C = len(self.uids)
+        if not explicit_batch:
+            if C > 4:
+                return None
+            # Gate automatic C=2..4 DFlash2 on min_ctx >= LOOPLING_DFLASH2_BATCH_MIN_CTX (default 16384).
+            st = self._bd._stage_main
+            if st is None or not st._full_visits:
+                return None
+            fv0 = st._full_visits[0]
+            min_ctx = min(int(self._bd.caches[c][fv0][0].offset) + int(st.st_lens[c]) for c in range(C))
+            if min_ctx < _df2_batch_min_ctx():
+                return None
+        samplers = [
+            self.fallback_sampler if s is None else s
+            for s in (self.samplers or [None] * C)
+        ]
+        all_greedy = all(
+            s is greedy_sampler or getattr(s, "_sampler_key", None) == ("greedy",)
+            for s in samplers
+        )
+        if not all_greedy:
+            from .models.inkling2.batchdecode import _fast_sample_enabled, _std_sampler_params
+
+            if (
+                not _fast_sample_enabled()
+                or os.environ.get("LOOPLING_DFLASH2_COUPLED_SAMPLE", "1") in ("0", "", "false", "False")
+            ):
+                return None
+            p0 = _std_sampler_params(samplers[0])
+            if p0 is None or not all(_std_sampler_params(s) == p0 for s in samplers[1:]):
+                return None
+        if self._df2_ctx is None:
+            self._df2_ctx = _get_df2_batch_ctx(self.model)
+            if self._df2_ctx is None:
+                return None
+        max_c = self._df2_ctx[4] if explicit_batch else min(4, self._df2_ctx[4])
+        if C > max_c:
             return None
         return self._df2_ctx
 
     def _next_df2_batch(self, df2_ctx) -> List["GenerationBatch.Response"]:
         from .models.inkling2 import dflash2 as DF2
+        from .models.inkling2.batchdecode import _std_sampler_params
 
         dr, _tm, tap_keys, tap_set, _ = df2_ctx
         C = len(self.uids)
-        W = min(dr.block, DF2._default_batch_w(C))
+        w_env = os.environ.get("LOOPLING_DFLASH2_BATCH_W")
+        if w_env:
+            W = max(2, min(dr.block, int(w_env), 16 // C))
+        elif _df2_batch_enabled():
+            W = min(dr.block, DF2._default_batch_w(C))
+        else:
+            # Phase 3b default for C=2..4 long context: W=4 (C*W <= 16, QPS=4 scalar ALU sweet spot).
+            W = min(dr.block, 4, 16 // C)
+
+        base_sampler = (
+            self.fallback_sampler
+            if (not self.samplers or self.samplers[0] is None)
+            else self.samplers[0]
+        )
+        is_greedy = base_sampler is greedy_sampler or getattr(base_sampler, "_sampler_key", None) == ("greedy",)
 
         anc_arr = self._next_tokens
         mx.eval(anc_arr)
@@ -1955,25 +2324,47 @@ class GenerationBatch:
             if len(st.lookup.tokens) == n_toks:
                 st.lookup.append_one(anc_list[c])
 
-        blk = dr.draft_batch_chains(self._df2_states, anc_list, W)
-        t_cw, kv_news, conv_ws, tap_buf = self._bd.verify_batch_w(blk, W, tap_visits=tap_set)
-        mx.eval(t_cw)
-        tl = t_cw.tolist()
-        bl = blk.tolist()
+        if is_greedy:
+            blk = dr.draft_batch_chains(self._df2_states, anc_list, W)
+            t_cw, kv_news, conv_ws, tap_buf = self._bd.verify_batch_w(blk, W, tap_visits=tap_set)
+            mx.eval(t_cw)
+            tl = t_cw.tolist()
+            bl = blk.tolist()
+            keeps_raw = []
+            bonus_next = []
+            for c in range(C):
+                row = bl[c]
+                t_row = tl[c]
+                k_raw = 1
+                while k_raw < W and t_row[k_raw - 1] == row[k_raw]:
+                    k_raw += 1
+                keeps_raw.append(k_raw)
+                bonus_next.append(int(t_row[k_raw - 1]))
+        else:
+            std_p = _std_sampler_params(base_sampler)
+            dt_env = os.environ.get("LOOPLING_DFLASH2_DRAFT_TEMP", "")
+            draft_temp = float(dt_env) if dt_env else min(std_p[0], 0.25)
+            blk, q_ids_c, q_probs_c = dr.draft_batch_chains_coupled(
+                self._df2_states, anc_list, W, temp=draft_temp
+            )
+            h_out_cw, kv_news, conv_ws, tap_buf = self._bd.verify_batch_w(
+                blk, W, tap_visits=tap_set, return_h_out=True
+            )
+            keeps_raw, bonus_next = DF2._coupled_verify_chains(
+                self.model, h_out_cw, blk, q_ids_c, q_probs_c, base_sampler
+            )
+            bl = blk.tolist()
 
         keeps_eff = [1] * C
         next_anc = [0] * C
         emitted: List[List[Tuple[int, Optional[str]]]] = [[] for _ in range(C)]
         keep: List[int] = []
         any_finished = False
+        need_any_fin_cache = False
 
         for c in range(C):
             row = bl[c]
-            t_row = tl[c]
-            k_raw = 1
-            while k_raw < W and t_row[k_raw - 1] == row[k_raw]:
-                k_raw += 1
-
+            k_raw = keeps_raw[c]
             finished_c = False
             for j in range(k_raw):
                 tok = int(row[j])
@@ -1991,27 +2382,31 @@ class GenerationBatch:
                     keeps_eff[c] = j + 1
                     finished_c = True
                     any_finished = True
+                    if self.need_final_cache[c]:
+                        need_any_fin_cache = True
                     break
             if not finished_c:
                 keeps_eff[c] = k_raw
-                next_anc[c] = int(t_row[k_raw - 1])
+                next_anc[c] = int(bonus_next[c])
                 keep.append(c)
 
-        self._bd.commit_batch_w(kv_news, conv_ws, keeps_eff, W)
-        if any_finished:
-            self._bd.flush()
+        if keep or need_any_fin_cache:
+            self._bd.commit_batch_w(kv_news, conv_ws, keeps_eff, W)
+        if any_finished and (keep or need_any_fin_cache):
+            self._bd.flush(keep_cascade_split=not need_any_fin_cache)
 
         responses = []
         for c in range(C):
             for tok, finish_reason in emitted[c]:
                 if finish_reason is not None:
+                    pc = self._bd.caches[c] if self.need_final_cache[c] else None
                     responses.append(
                         self.Response(
                             uid=self.uids[c],
                             token=tok,
                             logprobs=None,
                             finish_reason=finish_reason,
-                            prompt_cache=self._bd.caches[c],
+                            prompt_cache=pc,
                             all_tokens=self.tokens[c],
                         )
                     )
@@ -2056,6 +2451,16 @@ class GenerationBatch:
         if not self.uids:
             return []
 
+        df2_c1_ctx = self._df2_c1_eligible()
+        if df2_c1_ctx is not None:
+            return self._next_df2_c1(df2_c1_ctx)
+        if self._df2_c1_runner is not None:
+            # E.g. context crossed `_df2_c1_max_ctx()` mid-generation: seamless handoff to AR.
+            nxt = self._df2_c1_runner.handoff_to_ar(need_next_token=True)
+            self._df2_c1_runner = None
+            self._next_tokens = nxt
+            self._next_logprobs = [None]
+
         df2_ctx = self._df2_eligible()
         if df2_ctx is not None:
             return self._next_df2_batch(df2_ctx)
@@ -2081,13 +2486,21 @@ class GenerationBatch:
             else:
                 keep.append(i)
 
-        if any_finished and self._bd is not None:
+        need_any_fin_cache = any(
+            self.need_final_cache[i]
+            for i, fr in enumerate(finish_reasons)
+            if fr is not None
+        )
+        if any_finished and self._bd is not None and (keep or need_any_fin_cache):
             self._flush_bd()
 
         responses = []
         for i, finish_reason in enumerate(finish_reasons):
             if finish_reason is not None:
-                pc = self._bd.caches[i] if self._bd is not None else self.extract_cache(i)
+                if self.need_final_cache[i]:
+                    pc = self._bd.caches[i] if self._bd is not None else self.extract_cache(i)
+                else:
+                    pc = None
                 responses.append(
                     self.Response(
                         uid=self.uids[i],
@@ -2111,10 +2524,6 @@ class GenerationBatch:
                 )
 
         if len(keep) < len(self.uids):
-            if not keep and self._bd is not None:
-                self._bd.release_stage()
-                self._bd = None
-                self.prompt_cache = []
             self.filter(keep)
 
         return responses
@@ -2137,6 +2546,7 @@ class GenerationBatch:
             max_tokens=[],
             stop_sequences=[],
             need_logprobs=[],
+            need_final_cache=[],
         )
 
 
@@ -2239,6 +2649,7 @@ class BatchGenerator:
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
         need_logprobs: Optional[List[bool]] = None,
+        need_final_cache: Optional[List[bool]] = None,
     ):
         return self.insert_segments(
             [[p] for p in prompts],
@@ -2249,6 +2660,7 @@ class BatchGenerator:
             logits_processors,
             stop_sequences,
             need_logprobs=need_logprobs,
+            need_final_cache=need_final_cache,
         )
 
     def insert_segments(
@@ -2261,6 +2673,7 @@ class BatchGenerator:
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
         need_logprobs: Optional[List[bool]] = None,
+        need_final_cache: Optional[List[bool]] = None,
     ):
         num_segments = len(segments)
 
@@ -2277,6 +2690,11 @@ class BatchGenerator:
         need_logprobs = (
             list(need_logprobs) if need_logprobs is not None else [True] * num_segments
         )
+        need_final_cache = (
+            list(need_final_cache)
+            if need_final_cache is not None
+            else [True] * num_segments
+        )
 
         caches = caches or [None] * num_segments
 
@@ -2289,6 +2707,7 @@ class BatchGenerator:
             "logits_processors": logits_processors,
             "stop_sequences": stop_sequences,
             "need_logprobs": need_logprobs,
+            "need_final_cache": need_final_cache,
         }
         for k, v in opts.items():
             if len(v) != num_segments:
@@ -2299,7 +2718,7 @@ class BatchGenerator:
 
         uids = list(range(self._uid_count, self._uid_count + num_segments))
         pending = []
-        for uid, seq, m, c, at, s, lp, sm, nl in zip(
+        for uid, seq, m, c, at, s, lp, sm, nl, nfc in zip(
             uids,
             segments,
             max_tokens,
@@ -2309,6 +2728,7 @@ class BatchGenerator:
             logits_processors,
             stop_sequences,
             need_logprobs,
+            need_final_cache,
         ):
             seq = [segment for segment in seq if segment]
             if not seq:
@@ -2320,7 +2740,7 @@ class BatchGenerator:
                 seq[-2] = seq[-2][:-1]
             if c is None:
                 c = make_prompt_cache(self.model, self.max_kv_size)
-            pending.append((uid, seq, m, c, at, s, lp, sm, nl))
+            pending.append((uid, seq, m, c, at, s, lp, sm, nl, nfc))
 
         self._unprocessed_sequences.extend(pending)
         self._uid_count += num_segments
@@ -2401,6 +2821,7 @@ class BatchGenerator:
         max_tokens = []
         stop_sequences = []
         need_logprobs = []
+        need_final_cache = []
         for _ in range(n):
             sequence = self._unprocessed_sequences.popleft()
             uids.append(sequence[0])
@@ -2411,6 +2832,7 @@ class BatchGenerator:
             max_tokens.append(sequence[2])
             stop_sequences.append(sequence[7])
             need_logprobs.append(sequence[8])
+            need_final_cache.append(sequence[9])
             self._currently_processing.append(
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
@@ -2427,6 +2849,7 @@ class BatchGenerator:
             stop_sequences=stop_sequences,
             max_tokens=max_tokens,
             need_logprobs=need_logprobs,
+            need_final_cache=need_final_cache,
         )
 
     def _next(self):
@@ -2504,6 +2927,7 @@ class BatchGenerator:
                 r_max = [s[2] for s in ready_seqs]
                 r_stops = [s[7] for s in ready_seqs]
                 r_nlp = [s[8] for s in ready_seqs]
+                r_nfc = [s[9] for s in ready_seqs]
                 gen_batch = GenerationBatch(
                     self.model,
                     r_uids,
@@ -2517,6 +2941,7 @@ class BatchGenerator:
                     r_max,
                     r_nlp,
                     per_caches=r_caches,
+                    need_final_cache=r_nfc,
                 )
                 for uid in r_uids:
                     prompt_responses.append(
@@ -2670,6 +3095,7 @@ def batch_generate(
         max_tokens,
         caches=prompt_caches,
         need_logprobs=[return_logprobs] * len(prompts),
+        need_final_cache=[return_prompt_caches] * len(prompts),
     )
     results = {uid: [] for uid in uids}
     logprob_results = {uid: [] for uid in uids} if return_logprobs else None

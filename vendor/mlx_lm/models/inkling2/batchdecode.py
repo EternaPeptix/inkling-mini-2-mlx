@@ -27,7 +27,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2 import fastdecode as FD
 from mlx_lm.models.inkling2 import kernels as IK
 from mlx_lm.models.inkling2 import layers as L
@@ -266,7 +266,169 @@ def build_multi_chain_conv_anc(C: int, W: int):
         arr = _multi_conv_anc_cache[key] = mx.array(rows, mx.int32)
     return arr
 KV_STAGE_CAP = 32
-_BATCH_KV_STAGE_CAP = int(os.environ.get("LOOPLING_KV_STAGE_CAP", "64"))
+_BATCH_KV_STAGE_CAP = int(os.environ.get("LOOPLING_KV_STAGE_CAP", "128"))
+_KV_STACK_MAX_CAP = int(os.environ.get("LOOPLING_KV_STACK_MAX_CAP", "131072"))
+
+
+def _kv_stack_max_cap() -> int:
+    return int(os.environ.get("LOOPLING_KV_STACK_MAX_CAP", str(_KV_STACK_MAX_CAP)))
+
+
+def _multi_long_min_s() -> int:
+    return int(os.environ.get("LOOPLING_MULTI_LONG_MIN_S", "32768"))
+
+
+def _cascade_min_tokens() -> int:
+    return int(os.environ.get("LOOPLING_CASCADE_MIN_TOKENS", "32768"))
+
+
+def _fast_sample_enabled() -> bool:
+    return os.environ.get("LOOPLING_FAST_SAMPLE", "1") not in ("0", "", "false", "False")
+
+
+def _batch_full_attn_long_or_cascade(
+    q, kv_new_ml, pb, qkv_flat, gate_off, gate_stride, sink_off, sink_stride,
+    stage, v, C, W, scale, *, ks_v=None, vs_v=None, stage_buf=None, tree_meta=None,
+):
+    """Route C=2..8 full-attention (W=1..8, C*W<=32) to Cascade or Multi-Stream Split-K when eligible."""
+    if not isinstance(stage, _BatchKVStage) or not (2 <= C <= 8) or C * W > 32:
+        return None
+    st_buf = stage.buf if stage_buf is None else stage_buf
+    sig = stage._sigs[v]
+    st_lens = stage.st_lens
+    c_groups = stage._cascade_groups
+    valid_groups = [g for g in c_groups if 2 <= len(g[2]) <= 8 and len(g[2]) * W <= 32]
+    if valid_groups:
+        # Fast path: all C streams share one cascade prefix (zero row slicing).
+        if len(valid_groups) == 1 and len(valid_groups[0][2]) == C:
+            _, L_sh, _ = valid_groups[0]
+            k_sh, v_sh = stage._casc_shared[v][0]
+            ks_pr = stage._casc_k_priv[v]
+            vs_pr = stage._casc_v_priv[v]
+            S0s = [sig[b][0] + st_lens[b] for b in range(C)]
+            pkcaps = [int(ks_pr[b].shape[2]) for b in range(C)]
+            pvcaps = [int(vs_pr[b].shape[2]) for b in range(C)]
+            slot_m_pr = [sig[b][0] - L_sh for b in range(C)]
+            return RS.sdpa_cascade_long_full(
+                q, k_sh, v_sh, L_sh, ks_pr, vs_pr, st_buf, kv_new_ml, pb, qkv_flat,
+                gate_off, gate_stride, sink_off, sink_stride,
+                S0s, pkcaps, pvcaps, slot_m_pr, st_lens, C, W,
+                scale=scale, kv_layer_idx=v, scap=stage.scap, tree_meta=tree_meta,
+            )
+        # Mixed batch: run each cascade group via sdpa_cascade_long_full and remaining streams via multi/single long-full.
+        B = C * W
+        Hq_dim = int(q.shape[-1]) * int(q.shape[-2]) if q.ndim == 3 else int(q.shape[-1])
+        Hq_n = Hq_dim // 128
+        q_r = q.reshape(C, W, -1)
+        pb_r = pb.reshape(C, W, pb.shape[-1]) if pb.ndim == 2 else pb.reshape(C, W, pb.shape[1], pb.shape[2])
+        # Extract per-row gate (B, Hq*128) and sinks (B, Hq) from qkv_flat regardless of grouped/flat layout.
+        qkv_1d = qkv_flat.reshape(-1)
+        gate_rows = mx.stack(
+            [qkv_1d[gate_off + r * gate_stride : gate_off + r * gate_stride + Hq_dim] for r in range(B)], axis=0
+        ).reshape(C, W, Hq_dim)
+        sink_rows = mx.stack(
+            [qkv_1d[sink_off + r * sink_stride : sink_off + r * sink_stride + Hq_n] for r in range(B)], axis=0
+        ).reshape(C, W, Hq_n)
+        kvn_r = kv_new_ml.reshape(2, kv_new_ml.shape[1], C, W, 128)
+        parts_by_stream = [None] * C
+        covered = set()
+        for g_idx, (_, L_sh, grp) in enumerate(valid_groups):
+            cg = len(grp)
+            g_arr = mx.array(grp, mx.int32)
+            k_sh, v_sh = stage._casc_shared[v][g_idx]
+            ks_pr = [stage._casc_k_priv[v][b] for b in grp]
+            vs_pr = [stage._casc_v_priv[v][b] for b in grp]
+            S0s = [sig[b][0] + st_lens[b] for b in grp]
+            pkcaps = [int(k.shape[2]) for k in ks_pr]
+            pvcaps = [int(x.shape[2]) for x in vs_pr]
+            slot_m_pr = [sig[b][0] - L_sh for b in grp]
+            st_l_g = [st_lens[b] for b in grp]
+            st_g = mx.contiguous(st_buf[v : v + 1, g_arr])
+            q_g = mx.contiguous(q_r[g_arr].reshape(cg * W, -1))
+            pb_g = mx.contiguous(pb_r[g_arr].reshape(cg * W, *pb_r.shape[2:]))
+            qkv_g = mx.concatenate([gate_rows[g_arr].reshape(-1), sink_rows[g_arr].reshape(-1)], axis=0)
+            go_g, so_g = 0, cg * W * Hq_dim
+            kvn_g = mx.contiguous(kvn_r[:, :, g_arr, :, :].reshape(2, kv_new_ml.shape[1], cg * W, 128))
+            out_g = RS.sdpa_cascade_long_full(
+                q_g, k_sh, v_sh, L_sh, ks_pr, vs_pr, st_g, kvn_g, pb_g, qkv_g,
+                go_g, Hq_dim, so_g, Hq_n,
+                S0s, pkcaps, pvcaps, slot_m_pr, st_l_g, cg, W,
+                scale=scale, kv_layer_idx=0, scap=stage.scap, tree_meta=tree_meta,
+            ).reshape(cg, W, -1)
+            for j, b in enumerate(grp):
+                parts_by_stream[b] = out_g[j]
+                covered.add(b)
+        rem = [b for b in range(C) if b not in covered]
+        ks_all = stage.ks_main[v] if ks_v is None else ks_v
+        vs_all = stage.vs_main[v] if vs_v is None else vs_v
+        if rem:
+            cr = len(rem)
+            r_arr = mx.array(rem, mx.int32)
+            S0s_r = [sig[b][0] + st_lens[b] for b in rem]
+            st_r = mx.contiguous(st_buf[v : v + 1, r_arr])
+            q_m = mx.contiguous(q_r[r_arr].reshape(cr * W, -1))
+            pb_m = mx.contiguous(pb_r[r_arr].reshape(cr * W, *pb_r.shape[2:]))
+            qkv_m = mx.concatenate([gate_rows[r_arr].reshape(-1), sink_rows[r_arr].reshape(-1)], axis=0)
+            go_m, so_m = 0, cr * W * Hq_dim
+            kvn_m = mx.contiguous(kvn_r[:, :, r_arr, :, :].reshape(2, kv_new_ml.shape[1], cr * W, 128))
+            if W == 1 and max(S0s_r) + 1 < _multi_long_min_s():
+                # Short non-cascade streams (<32K) use sdpa_rows_staged for bitwise parity with generate_step.
+                kvn_b = mx.contiguous(kvn_m.reshape(2, kv_new_ml.shape[1], cr, 128).transpose(2, 0, 1, 3))
+                mt_r = np.empty((cr, RS._SMW), np.int32)
+                ss_r = []
+                for j, b in enumerate(rem):
+                    end_m, _, rot_i, kcap, vcap, slot_m, rot_w, max_s = sig[b]
+                    end_now = end_m + st_lens[b] + 1
+                    mt_r[j] = (end_now, end_now, 0, 0, kcap, vcap, slot_m, 0, 0)
+                    ss_r.append(end_now)
+                out_r = RS.sdpa_rows_staged(
+                    q_m.reshape(cr, -1, 128), [ks_all[b] for b in rem], [vs_all[b] for b in rem],
+                    st_r, kvn_b, pb_m, qkv_m, go_m, Hq_dim, so_m, Hq_n, None,
+                    scale=scale, window=0, kv_layer_idx=0, st_len=st_lens[rem[0]], scap=stage.scap,
+                    meta_arr=mx.array(mt_r), Ss=tuple(ss_r),
+                ).reshape(cr, 1, -1)
+                for j, b in enumerate(rem):
+                    parts_by_stream[b] = out_r[j]
+            elif cr >= 2:
+                kcaps = [sig[b][3] for b in rem]
+                vcaps = [sig[b][4] for b in rem]
+                slot_ms = [sig[b][5] for b in rem]
+                st_l_r = [st_lens[b] for b in rem]
+                out_r = RS.sdpa_multi_long_full_staged(
+                    q_m, [ks_all[b] for b in rem], [vs_all[b] for b in rem], st_r, kvn_m, pb_m, qkv_m,
+                    go_m, Hq_dim, so_m, Hq_n,
+                    S0s_r, kcaps, vcaps, slot_ms, st_l_r, cr, W,
+                    scale=scale, kv_layer_idx=0, scap=stage.scap, tree_meta=tree_meta,
+                ).reshape(cr, W, -1)
+                for j, b in enumerate(rem):
+                    parts_by_stream[b] = out_r[j]
+            else:
+                b = rem[0]
+                s_pref = sig[b][0] + st_lens[b]
+                st_b = mx.contiguous(st_buf[v, b])
+                parts_by_stream[b] = RS.sdpa_long_full_staged_unpacked(
+                    q_m, ks_all[b], vs_all[b], kvn_m, pb_m, qkv_m, go_m, so_m,
+                    s_pref, s_pref + W, sig[b][3], sig[b][4], W,
+                    scale=scale, kv_layer_idx=0, tree_meta=tree_meta,
+                    kv_stage=st_b, slot_main=sig[b][5], st_len=st_lens[b],
+                    gate_stride=Hq_dim, sink_stride=Hq_n,
+                ).reshape(W, -1)
+        return mx.concatenate(parts_by_stream, axis=0).reshape(B, -1)
+
+    S0s = [sig[b][0] + st_lens[b] for b in range(C)]
+    if max(S0s) + W < _multi_long_min_s():
+        return None
+    ks_use = stage.ks_main[v] if ks_v is None else ks_v
+    vs_use = stage.vs_main[v] if vs_v is None else vs_v
+    kcaps = [sig[b][3] for b in range(C)]
+    vcaps = [sig[b][4] for b in range(C)]
+    slot_mains = [sig[b][5] for b in range(C)]
+    return RS.sdpa_multi_long_full_staged(
+        q, ks_use, vs_use, st_buf, kv_new_ml, pb, qkv_flat,
+        gate_off, gate_stride, sink_off, sink_stride,
+        S0s, kcaps, vcaps, slot_mains, st_lens, C, W,
+        scale=scale, kv_layer_idx=v, scap=stage.scap, tree_meta=tree_meta,
+    )
 
 
 def _batch_cache_ok(caches, nv) -> bool:
@@ -399,21 +561,29 @@ def _layer_batch_body(
             layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv_b=True
         )
         kv_news[v] = kv_new
-        sdpa_kw = dict(
-            scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
-            meta_arr=step_metas[v], Ss=step_Ss[v],
-        )
-        if st_info_arr is not None:
-            sdpa_kw["st_info_arr"] = st_info_arr
-        attn_out = RS.sdpa_rows_staged(
-            q,
-            stage.ks_main[v] if ks_v is None else ks_v,
-            stage.vs_main[v] if vs_v is None else vs_v,
-            stage.buf if stage_buf is None else stage_buf,
-            kv_new, pb, qkv_flat,
-            gate_off, gate_stride, sink_off, sink_stride, None,
-            **sdpa_kw,
-        )
+        attn_out = None
+        if not sliding and isinstance(stage, _BatchKVStage):
+            kv_new_ml = mx.contiguous(kv_new.transpose(1, 2, 0, 3))
+            attn_out = _batch_full_attn_long_or_cascade(
+                q, kv_new_ml, pb, qkv_flat, gate_off, gate_stride, sink_off, sink_stride,
+                stage, v, stage.C, 1, scale, ks_v=ks_v, vs_v=vs_v, stage_buf=stage_buf,
+            )
+        if attn_out is None:
+            sdpa_kw = dict(
+                scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
+                meta_arr=step_metas[v], Ss=step_Ss[v],
+            )
+            if st_info_arr is not None:
+                sdpa_kw["st_info_arr"] = st_info_arr
+            attn_out = RS.sdpa_rows_staged(
+                q,
+                stage.ks_main[v] if ks_v is None else ks_v,
+                stage.vs_main[v] if vs_v is None else vs_v,
+                stage.buf if stage_buf is None else stage_buf,
+                kv_new, pb, qkv_flat,
+                gate_off, gate_stride, sink_off, sink_stride, None,
+                **sdpa_kw,
+            )
     op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
     r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False)
     if layer.is_block_boundary:
@@ -470,7 +640,8 @@ class _BatchKVStage:
                 target = ((max(cap, 1) + step - 1) // step) * step
                 if is_rot:
                     target = min(target, int(kv.max_size))
-                if cap < target:
+                # Never copy/pad large full-attn caches or cascade-pinned caches (kernels take runtime kcap/vcap).
+                if cap < target and (is_rot or (cap < 4096 and getattr(kv, "_cascade_ref", None) is None)):
                     add = target - cap
                     kv._keys = mx.concatenate(
                         [kv._keys, mx.zeros((1, kv._keys.shape[1], add, kv._keys.shape[3]), kv._keys.dtype)],
@@ -559,6 +730,94 @@ class _BatchKVStage:
         self._meta_cache.clear()
         self._off_arr_cache.clear()
         self._verify_meta_cache.clear()
+        self._refresh_cascade_meta()
+
+    def _refresh_cascade_meta(self):
+        """Detect streams sharing a pinned `kv._cascade_ref` prefix and build tiny private suffix buffers (0 GiB copy)."""
+        self._cascade_groups = []
+        self._casc_shared = {}
+        self._casc_k_priv = {}
+        self._casc_v_priv = {}
+        self._casc_priv_len = {}
+        self._casc_stream_info = {}
+        if not self._full_visits or not (2 <= self.C <= 8):
+            return
+        min_toks = _cascade_min_tokens()
+        by_key = {}
+        for b in range(self.C):
+            ref0 = getattr(self.caches[b][self._full_visits[0]][0], "_cascade_ref", None)
+            if ref0 is None or len(ref0) != 4:
+                continue
+            pid0, l_sh0, _, _ = ref0
+            l_sh0 = int(l_sh0)
+            if l_sh0 < min_toks or (l_sh0 % 256) != 0:
+                continue
+            ok = True
+            for v in self._full_visits:
+                kv = self.caches[b][v][0]
+                rf = getattr(kv, "_cascade_ref", None)
+                if (
+                    rf is None
+                    or len(rf) != 4
+                    or rf[0] != pid0
+                    or int(rf[1]) != l_sh0
+                    or int(kv.offset) < l_sh0
+                    or int(rf[2].shape[-2]) < l_sh0
+                    or int(rf[3].shape[-2]) < l_sh0
+                ):
+                    ok = False
+                    break
+            if ok:
+                by_key.setdefault((pid0, l_sh0), []).append(b)
+
+        groups = [(pid, l_sh, grp) for (pid, l_sh), grp in by_key.items() if 2 <= len(grp) <= 8]
+        if not groups:
+            return
+        Hkv = int(self.caches[0][self._full_visits[0]][0]._keys.shape[1])
+        dummy_pr = mx.zeros((1, Hkv, 1, 128), mx.bfloat16)
+        to_eval = []
+        self._cascade_groups = groups
+        for v in self._full_visits:
+            self._casc_shared[v] = []
+            self._casc_k_priv[v] = [None] * self.C
+            self._casc_v_priv[v] = [None] * self.C
+            self._casc_priv_len[v] = [0] * self.C
+            for pid, l_sh, grp in groups:
+                rf_g = self.caches[grp[0]][v][0]._cascade_ref
+                self._casc_shared[v].append((rf_g[2], rf_g[3]))
+                for b in grp:
+                    self._casc_stream_info[b] = (pid, l_sh)
+                    kv = self.caches[b][v][0]
+                    priv_len = int(kv.offset) - l_sh
+                    self._casc_priv_len[v][b] = priv_len
+                    cp = getattr(kv, "_cascade_priv", None)
+                    if cp is not None and cp[0] == pid and int(cp[1]) == l_sh and int(cp[4]) == priv_len:
+                        self._casc_k_priv[v][b] = cp[2]
+                        self._casc_v_priv[v][b] = cp[3]
+                    elif priv_len <= 0:
+                        self._casc_k_priv[v][b] = dummy_pr
+                        self._casc_v_priv[v][b] = dummy_pr
+                    else:
+                        kp = mx.contiguous(kv._keys[:, :, l_sh : int(kv.offset), :])
+                        vp = mx.contiguous(kv._values[:, :, l_sh : int(kv.offset), :])
+                        self._casc_k_priv[v][b] = kp
+                        self._casc_v_priv[v][b] = vp
+                        to_eval.append(kp)
+                        to_eval.append(vp)
+        if to_eval:
+            mx.eval(to_eval)
+
+    def needs_long_or_cascade(self, W: int = 1) -> bool:
+        if not self._full_visits or not (2 <= self.C <= 8) or self.C * int(W) > 32:
+            return False
+        if any(2 <= len(g[2]) <= 8 and len(g[2]) * int(W) <= 32 for g in self._cascade_groups):
+            return True
+        min_s = _multi_long_min_s()
+        for v in self._full_visits:
+            sig = self._sigs[v]
+            if max(sig[b][0] + self.st_lens[b] for b in range(self.C)) + int(W) >= min_s:
+                return True
+        return False
 
     def maybe_flush_before_step(self):
         st_max = max(self.st_lens) if self.st_lens else self.st_len
@@ -572,7 +831,7 @@ class _BatchKVStage:
                     need_flush = True
                     break
         if need_flush and st_max > 0:
-            self.flush()
+            self.flush(materialize_cascade=False)
         # Handle RotatingKVCache with cap < max_size when st_len == 0 (e.g. right after short prefill)
         grew = False
         for v, b, end_m, _ in list(self._need_grow_check):
@@ -599,7 +858,7 @@ class _BatchKVStage:
                     need_flush = True
                     break
         if need_flush and st_max > 0:
-            self.flush()
+            self.flush(materialize_cascade=False)
         grew = False
         for v, b, end_m, _ in list(self._need_grow_check):
             kv = self.caches[b][v][0]
@@ -786,21 +1045,72 @@ class _BatchKVStage:
         self.st_lens = [st_t[c] + k_t[c] for c in range(C)]
         self.st_len = max(self.st_lens)
 
-    def flush(self):
-        if max(self.st_lens) <= 0:
+    def flush(self, *, materialize_cascade: bool = True):
+        has_st = max(self.st_lens) > 0
+        if not has_st and not (materialize_cascade and self._casc_stream_info):
             return
+        to_eval = []
+        full_set = set(self._full_visits)
         for b in range(self.C):
             k = int(self.st_lens[b])
-            if k <= 0:
+            c_info = self._casc_stream_info.get(b)
+            if k <= 0 and not (materialize_cascade and c_info is not None):
                 continue
-            src = self.buf[:, b : b + 1, :, :, :k, :]
+            src = self.buf[:, b : b + 1, :, :, :k, :] if k > 0 else None
             for v in range(self.nv):
                 kv = self.caches[b][v][0]
-                kv.commit_unpacked_w(src[v, :, 0], src[v, :, 1])
-        mx.eval(
-            [self.caches[b][v][0]._keys for b in range(self.C) for v in range(self.nv)],
-            [self.caches[b][v][0]._values for b in range(self.C) for v in range(self.nv)],
-        )
+                if c_info is not None and v in full_set:
+                    pid, l_sh = c_info
+                    kp = self._casc_k_priv[v][b]
+                    vp = self._casc_v_priv[v][b]
+                    pl = int(self._casc_priv_len[v][b])
+                    if k > 0:
+                        k_add = src[v, :, 0]
+                        v_add = src[v, :, 1]
+                        if pl == 0:
+                            cap_new = ((k + 255) // 256) * 256
+                            kp_new = mx.zeros((1, k_add.shape[1], cap_new, 128), k_add.dtype)
+                            vp_new = mx.zeros((1, v_add.shape[1], cap_new, 128), v_add.dtype)
+                            kp = mx.slice_update(kp_new, k_add, FD._wpos(0), axes=(2,))
+                            vp = mx.slice_update(vp_new, v_add, FD._wpos(0), axes=(2,))
+                        else:
+                            cap_cur = int(kp.shape[2])
+                            if pl + k > cap_cur:
+                                target = max(((pl + k + 255) // 256) * 256, cap_cur * 2)
+                                ext_k = mx.zeros((1, kp.shape[1], target - cap_cur, 128), kp.dtype)
+                                ext_v = mx.zeros((1, vp.shape[1], target - cap_cur, 128), vp.dtype)
+                                kp = mx.concatenate([kp, ext_k], axis=2)
+                                vp = mx.concatenate([vp, ext_v], axis=2)
+                            kp = mx.slice_update(kp, k_add, FD._wpos(pl), axes=(2,))
+                            vp = mx.slice_update(vp, v_add, FD._wpos(pl), axes=(2,))
+                        pl += k
+                        kv.offset = int(kv.offset) + k
+                        self._casc_k_priv[v][b] = kp
+                        self._casc_v_priv[v][b] = vp
+                        self._casc_priv_len[v][b] = pl
+                    if materialize_cascade:
+                        rf = kv._cascade_ref
+                        k_sh, v_sh = rf[2], rf[3]
+                        if pl > 0:
+                            kv._keys = mx.concatenate([k_sh[:, :, :l_sh, :], kp[:, :, :pl, :]], axis=2)
+                            kv._values = mx.concatenate([v_sh[:, :, :l_sh, :], vp[:, :, :pl, :]], axis=2)
+                        else:
+                            kv._keys = k_sh
+                            kv._values = v_sh
+                        if hasattr(kv, "_cascade_priv"):
+                            delattr(kv, "_cascade_priv")
+                        to_eval.append(kv._keys)
+                        to_eval.append(kv._values)
+                    else:
+                        kv._cascade_priv = (pid, l_sh, kp, vp, pl)
+                        to_eval.append(kp)
+                        to_eval.append(vp)
+                elif k > 0:
+                    kv.commit_unpacked_w(src[v, :, 0], src[v, :, 1])
+                    to_eval.append(kv._keys)
+                    to_eval.append(kv._values)
+        if to_eval:
+            mx.eval(to_eval)
         self.st_len = 0
         self.st_lens = [0] * self.C
         self._prev_step = None
@@ -952,6 +1262,7 @@ def _layer_causal_w_body(
     layer, v, h, bs, msg, W, tau_cache=None, depths=None, conv_anc=None, tree_meta=None,
     depths_arr=None, tau_lut=None, tau_table=None, meta_arr=None, s_bounds=None,
     prev_moe=None, skip_combine=False, emit_h=False, use_stage=False, w_act=None, kv=None,
+    b1_unp_full=None,
 ):
     a, sliding, op_m, rel_proj, scale, window, rot, max_size = cw_meta[v]
     cs = conv_list[v]
@@ -998,53 +1309,67 @@ def _layer_causal_w_body(
                 if tau_cache is not None:
                     tau_cache[tkey] = tau_w
     rel_w_bf = FD._rel_w_bf(rel_proj)
-    if kv_vmap is not None:
-        is_ring, kv_layer_idx = kv_vmap[v]
-        kv_buf = kv_ring if is_ring else kv_full
-        kv_stage = (kv_ring_st if is_ring else kv_full_st) if use_stage else None
-        cap = kv_buf.shape[3]
-    else:
-        kv_layer_idx = 0
-        kv_buf = kv._packed
-        kv_stage = None
-        cap = kv_buf.shape[2]
-    if meta_arr is not None and s_bounds is not None:
-        S0 = end0 = slot0 = 0
-        cw_smax = int(s_bounds[1])
-    else:
-        end0 = kv.offset
-        S0 = min(end0, max_size) if rot else end0
-        slot0 = (0 if kv._idx == max_size else kv._idx) if rot else end0
-        if s_bounds is not None:
-            cw_smax = int(s_bounds[1])
-        else:
-            max_d = max(depths) if depths is not None else (W - 1)
-            cw_smax = min(end0 + max_d + 1, max_size) if rot else (S0 + max_d + 1)
-    if (
-        os.environ.get("LOOPLING_SDPA_MID_CW", "1") not in ("0", "")
-        and kv_stage is None
-        and 1 <= W <= 8
-        and cw_smax < RS._TWO_PASS_N
-        and hasattr(RS, "sdpa_mid_causal_w_packed")
-    ):
-        attn_out, kv_new, w0, w1 = RS.sdpa_mid_causal_w_packed(
-            layer, qkv_flat, qkv_lay, kv_buf, cs[0], cs[1], rel_w_bf,
-            S0, end0, slot0, rot, cap, max_size, W,
-            scale=scale, window=window, tau=tau_w, kv_layer_idx=kv_layer_idx,
-            tree_meta=tree_meta, conv_anc=conv_anc, depths=depths,
-            meta_arr=meta_arr, s_bounds=s_bounds, w_act=w_act,
-        )
-    else:
+    if not sliding and b1_unp_full is not None and kv is not None and kv._packed is None:
         q, kv_new, pb, w0, w1 = RM.mid_causal_w_flat(
             layer, qkv_flat, qkv_lay, cs[0], cs[1], W, tau=tau_w, rel_w=rel_w_bf, conv_anc=conv_anc, w_act=w_act,
         )
-        attn_out = RS.sdpa_causal_w_packed(
-            q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off,
-            S0, end0, slot0, rot, cap, max_size, W,
-            scale=scale, window=window, kv_layer_idx=kv_layer_idx, tree_meta=tree_meta, depths=depths,
-            meta_arr=meta_arr, s_bounds=s_bounds, kv_stage=kv_stage, w_act=w_act,
+        unp_st, unp_lidx, unp_slot0, unp_len = b1_unp_full
+        s_pref = int(kv.offset)
+        attn_out = RS.sdpa_long_full_staged_unpacked(
+            q, kv._keys, kv._values, kv_new, pb, qkv_flat, gate_off, sink_off,
+            s_pref, s_pref + int(W), int(kv._keys.shape[2]), int(kv._values.shape[2]), int(W),
+            scale=scale, kv_layer_idx=unp_lidx, tree_meta=tree_meta,
+            kv_stage=unp_st, slot_main=unp_slot0, st_len=unp_len, w_act=w_act,
             gate_stride=gate_stride, sink_stride=sink_stride,
         )
+    else:
+        if kv_vmap is not None:
+            is_ring, kv_layer_idx = kv_vmap[v]
+            kv_buf = kv_ring if is_ring else kv_full
+            kv_stage = (kv_ring_st if is_ring else kv_full_st) if use_stage else None
+            cap = kv_buf.shape[3]
+        else:
+            kv_layer_idx = 0
+            kv_buf = kv._packed
+            kv_stage = None
+            cap = kv_buf.shape[2]
+        if meta_arr is not None and s_bounds is not None:
+            S0 = end0 = slot0 = 0
+            cw_smax = int(s_bounds[1])
+        else:
+            end0 = kv.offset
+            S0 = min(end0, max_size) if rot else end0
+            slot0 = (0 if kv._idx == max_size else kv._idx) if rot else end0
+            if s_bounds is not None:
+                cw_smax = int(s_bounds[1])
+            else:
+                max_d = max(depths) if depths is not None else (W - 1)
+                cw_smax = min(end0 + max_d + 1, max_size) if rot else (S0 + max_d + 1)
+        if (
+            os.environ.get("LOOPLING_SDPA_MID_CW", "1") not in ("0", "")
+            and kv_stage is None
+            and 1 <= W <= 8
+            and cw_smax < RS._TWO_PASS_N
+            and hasattr(RS, "sdpa_mid_causal_w_packed")
+        ):
+            attn_out, kv_new, w0, w1 = RS.sdpa_mid_causal_w_packed(
+                layer, qkv_flat, qkv_lay, kv_buf, cs[0], cs[1], rel_w_bf,
+                S0, end0, slot0, rot, cap, max_size, W,
+                scale=scale, window=window, tau=tau_w, kv_layer_idx=kv_layer_idx,
+                tree_meta=tree_meta, conv_anc=conv_anc, depths=depths,
+                meta_arr=meta_arr, s_bounds=s_bounds, w_act=w_act,
+            )
+        else:
+            q, kv_new, pb, w0, w1 = RM.mid_causal_w_flat(
+                layer, qkv_flat, qkv_lay, cs[0], cs[1], W, tau=tau_w, rel_w=rel_w_bf, conv_anc=conv_anc, w_act=w_act,
+            )
+            attn_out = RS.sdpa_causal_w_packed(
+                q, kv_buf, kv_new, pb, qkv_flat, gate_off, sink_off,
+                S0, end0, slot0, rot, cap, max_size, W,
+                scale=scale, window=window, kv_layer_idx=kv_layer_idx, tree_meta=tree_meta, depths=depths,
+                meta_arr=meta_arr, s_bounds=s_bounds, kv_stage=kv_stage, w_act=w_act,
+                gate_stride=gate_stride, sink_stride=sink_stride,
+            )
     op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
     r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False, causal=True, conv_anc=conv_anc, w_act=w_act)
     if layer.is_block_boundary:
@@ -1173,16 +1498,47 @@ class BatchDecoder:
         self._sdpa_staged_has_st_info = "st_info_arr" in inspect.signature(RS.sdpa_rows_staged).parameters
         self._cw_meta = None
         self._static_kv_vmap = None
+        self._b1_unpacked_full = False
+        self._b1_full_unp_visits = ()
+        self._b1_full_unp_map = {}
+        self._b1_full_unp_st = None
+        self._b1_full_unp_len = 0
+        self._b1_full_unp_slot0 = 0
         if self._b1_fast:
             self.conv = [[caches[0][v][1].cache[j] for j in range(4)] for v in range(self.nv)]
-            for v in range(self.nv):
-                caches[0][v][0].pack_b1()
             rot_sig = tuple(
                 (1 if hasattr(caches[0][v][0], "_idx") else 0, getattr(caches[0][v][0], "max_size", 0) if hasattr(caches[0][v][0], "_idx") else 0)
                 for v in range(self.nv)
             )
             ring_v = tuple(v for v, (rot, _) in enumerate(rot_sig) if rot)
             full_v = tuple(v for v, (rot, _) in enumerate(rot_sig) if not rot)
+            max_stack = _kv_stack_max_cap()
+            use_unp_full = (
+                bool(full_v)
+                and max_stack > 0
+                and all(
+                    caches[0][v][0]._packed is None
+                    and caches[0][v][0]._keys is not None
+                    and caches[0][v][0]._values is not None
+                    and int(caches[0][v][0].offset) == int(caches[0][full_v[0]][0].offset)
+                    for v in full_v
+                )
+                and any(
+                    int(caches[0][v][0]._keys.shape[2]) >= max_stack or int(caches[0][v][0].offset) >= max_stack
+                    for v in full_v
+                )
+            )
+            if use_unp_full:
+                self._b1_unpacked_full = True
+                self._b1_full_unp_visits = full_v
+                self._b1_full_unp_map = {v: i for i, v in enumerate(full_v)}
+                self._b1_full_unp_slot0 = int(caches[0][full_v[0]][0].offset)
+                # Pack only the 40 sliding-window visits (~160 MiB); leave the 8 full visits unpacked (0 GiB copy!).
+                for v in ring_v:
+                    caches[0][v][0].pack_b1()
+            else:
+                for v in range(self.nv):
+                    caches[0][v][0].pack_b1()
             v_map = [None] * self.nv
             for i, v in enumerate(ring_v):
                 v_map[v] = (True, i)
@@ -1318,8 +1674,15 @@ class BatchDecoder:
                     return False
             return True
 
+        if self._b1_unpacked_full:
+            return False
         if not _group_uniform(ring_v) or not _group_uniform(full_v):
             return False
+        max_stack = _kv_stack_max_cap()
+        if full_v and max_stack > 0:
+            kf0 = kvs[full_v[0]]
+            if int(kf0._packed.shape[2]) >= max_stack or int(kf0.offset) >= max_stack:
+                return False
         v_map = [None] * self.nv
         if ring_v:
             self._kv_ring = mx.contiguous(mx.stack([kvs[v]._packed for v in ring_v], axis=0))
@@ -1594,7 +1957,73 @@ class BatchDecoder:
             if self._kv_full is not None:
                 out.append(self._kv_full)
             return out
+        if self._b1_unpacked_full:
+            out = [c[0]._packed for c in self.caches[0] if c[0]._packed is not None]
+            if self._b1_full_unp_st is not None:
+                out.append(self._b1_full_unp_st)
+            return out
         return [c[0]._packed for c in self.caches[0]]
+
+    def _ensure_b1_full_unp_stage(self, extra_w: int = 1) -> None:
+        """Ensure small 5D staging buffer for unpacked C=1 full-attn visits (grows 256..4096, 0 GiB copy of main KV)."""
+        nf = len(self._b1_full_unp_visits)
+        kv0 = self.caches[0][self._b1_full_unp_visits[0]][0]
+        Hkv = int(kv0._keys.shape[1])
+        if self._b1_full_unp_st is None:
+            scap = max(256, ((int(extra_w) + 255) // 256) * 256)
+            self._b1_full_unp_st = mx.zeros((nf, 2, Hkv, scap, 128), kv0._keys.dtype)
+            self._b1_full_unp_len = 0
+            self._b1_full_unp_slot0 = int(kv0.offset)
+            mx.eval(self._b1_full_unp_st)
+            return
+        cur_cap = int(self._b1_full_unp_st.shape[3])
+        if self._b1_full_unp_len + int(extra_w) <= cur_cap:
+            return
+        if cur_cap < 4096:
+            new_cap = min(4096, max(cur_cap * 2, ((self._b1_full_unp_len + int(extra_w) + 255) // 256) * 256))
+            buf = self._b1_full_unp_st
+            self._b1_full_unp_st = None
+            ext = mx.zeros((nf, 2, Hkv, new_cap - cur_cap, 128), buf.dtype)
+            self._b1_full_unp_st = mx.concatenate([buf, ext], axis=3)
+            mx.eval(self._b1_full_unp_st)
+            return
+        self._flush_b1_full_unpacked()
+
+    def _commit_b1_full_unpacked(self, kv_news_full: dict, keep: int) -> None:
+        """Commit `keep` tokens for all unpacked C=1 full-attn visits into tiny 5D stage (0 GiB copy)."""
+        k = int(keep)
+        self._ensure_b1_full_unp_stage(k)
+        src = mx.stack([kv_news_full[v][:, :, :k, :] for v in self._b1_full_unp_visits], axis=0)
+        buf = self._b1_full_unp_st
+        self._b1_full_unp_st = None
+        pos = int(self._b1_full_unp_len)
+        self._b1_full_unp_st = mx.slice_update(buf, src, FD._wpos(pos), axes=(3,))
+        self._b1_full_unp_len = pos + k
+        new_off = self._b1_full_unp_slot0 + self._b1_full_unp_len
+        for v in self._b1_full_unp_visits:
+            self.caches[0][v][0].offset = new_off
+
+    def _flush_b1_full_unpacked(self) -> None:
+        """Flush staged tokens for unpacked C=1 full-attn visits into `kv._keys`/`kv._values`."""
+        k = int(self._b1_full_unp_len)
+        if k <= 0 or self._b1_full_unp_st is None:
+            self._b1_full_unp_len = 0
+            if self._b1_full_unp_visits:
+                self._b1_full_unp_slot0 = int(self.caches[0][self._b1_full_unp_visits[0]][0].offset)
+            return
+        st = self._b1_full_unp_st
+        to_eval = []
+        for i, v in enumerate(self._b1_full_unp_visits):
+            kv = self.caches[0][v][0]
+            kv.offset = int(self._b1_full_unp_slot0)
+            k_add = st[i, 0, :, :k, :][None]
+            v_add = st[i, 1, :, :k, :][None]
+            kv.commit_unpacked_w(k_add, v_add)
+            to_eval.append(kv._keys)
+            to_eval.append(kv._values)
+        mx.eval(to_eval)
+        self._b1_full_unp_len = 0
+        self._b1_full_unp_slot0 = int(self.caches[0][self._b1_full_unp_visits[0]][0].offset)
 
     def kv_packed(self, v):
         """Return 4D packed KV buffer view (2, Hkv, cap, 128) for visit `v` (for tests/inspection)."""
@@ -1606,31 +2035,120 @@ class BatchDecoder:
             return (self._kv_ring if is_ring else self._kv_full)[lidx]
         return self.caches[0][v][0]._packed
 
-    def _flush_group(self, caches, conv, kv, stage=None):
+    def _flush_group(self, caches, conv, kv, stage=None, *, keep_cascade_split: bool = False):
         nv = len(conv)
         if self._b1_fast:
             self._flush_b1_pending(caches)
             if caches is self.caches:
                 self.unstack_kv()
+                if self._b1_unpacked_full:
+                    self._flush_b1_full_unpacked()
             for v in range(nv):
                 for j in range(4):
                     caches[0][v][1][j] = conv[v][j]
-                caches[0][v][0].unpack_b1()
+                if caches[0][v][0]._packed is not None:
+                    caches[0][v][0].unpack_b1()
             return
         for v in range(nv):
             for i, c in enumerate(caches):
                 for j in range(4):
                     c[v][1][j] = conv[v][j][i : i + 1]
         if stage is not None:
-            stage.flush()
+            stage.flush(materialize_cascade=not keep_cascade_split)
         elif kv is not None:
             for st in kv:
                 st.to_caches()
 
-    def flush(self):
-        self._flush_group(self.caches, self.conv, self.kv, stage=self._stage_main)
+    def flush(self, *, keep_cascade_split: bool = False):
+        self._flush_group(
+            self.caches, self.conv, self.kv, stage=self._stage_main, keep_cascade_split=keep_cascade_split
+        )
         if self._ref_caches is not None:
             self._flush_group(self._ref_caches, self._ref_conv, self._ref_kv, stage=self._stage_ref)
+
+    def snapshot_cache(self, idx: int):
+        """Return a detached CacheList snapshot for stream `idx` without destroying live `_packed` or flushing other streams."""
+        import copy as _copy
+
+        if self._b1_fast:
+            assert idx == 0
+            self._flush_b1_pending()
+            if self._kv_stacked and self._kv_st_len > 0:
+                self.flush_kv_stage()
+            out = []
+            for v in range(self.nv):
+                kv = self.caches[0][v][0]
+                is_rot = hasattr(kv, "_idx")
+                kv_c = RotatingKVCache(max_size=kv.max_size, keep=kv.keep) if is_rot else KVCache()
+                kv_c.step = kv.step
+                kv_c.offset = int(kv.offset)
+                if is_rot:
+                    kv_c._idx = int(kv._idx)
+                if self._b1_unpacked_full and v in self._b1_full_unp_map:
+                    kv_c._keys = kv._keys
+                    kv_c._values = kv._values
+                    if self._b1_full_unp_len > 0 and self._b1_full_unp_st is not None:
+                        fi = self._b1_full_unp_map[v]
+                        k = int(self._b1_full_unp_len)
+                        kv_c.offset = int(self._b1_full_unp_slot0)
+                        kv_c.commit_unpacked_w(
+                            self._b1_full_unp_st[fi, 0, :, :k, :][None],
+                            self._b1_full_unp_st[fi, 1, :, :k, :][None],
+                        )
+                else:
+                    if self._kv_stacked:
+                        is_ring, lidx = self._kv_vmap[v]
+                        pk = (self._kv_ring if is_ring else self._kv_full)[lidx]
+                    else:
+                        pk = kv._packed
+                    if pk is not None:
+                        kv_c._keys = mx.contiguous(pk[0][None])
+                        kv_c._values = mx.contiguous(pk[1][None])
+                    else:
+                        kv_c._keys = kv._keys
+                        kv_c._values = kv._values
+                ac = ArraysCache(4)
+                ac.cache = [self.conv[v][j] for j in range(4)]
+                out.append(CacheList(kv_c, ac))
+            return out
+
+        if self._batch_fast and self._stage_main is not None:
+            st = self._stage_main
+            k_st = int(st.st_lens[idx])
+            src_all = st.buf[:, idx : idx + 1, :, :, :k_st, :] if k_st > 0 else None
+            c_info = st._casc_stream_info.get(idx)
+            full_set = set(st._full_visits)
+            out = []
+            for v in range(self.nv):
+                kv = self.caches[idx][v][0]
+                is_rot = hasattr(kv, "_idx")
+                kv_c = RotatingKVCache(max_size=kv.max_size, keep=kv.keep) if is_rot else KVCache()
+                kv_c.step = kv.step
+                kv_c.offset = int(kv.offset)
+                if is_rot:
+                    kv_c._idx = int(kv._idx)
+                if c_info is not None and v in full_set:
+                    _, l_sh = c_info
+                    rf = kv._cascade_ref
+                    pl = int(st._casc_priv_len[v][idx])
+                    if pl > 0:
+                        kv_c._keys = mx.concatenate([rf[2][:, :, :l_sh, :], st._casc_k_priv[v][idx][:, :, :pl, :]], axis=2)
+                        kv_c._values = mx.concatenate([rf[3][:, :, :l_sh, :], st._casc_v_priv[v][idx][:, :, :pl, :]], axis=2)
+                    else:
+                        kv_c._keys = rf[2]
+                        kv_c._values = rf[3]
+                else:
+                    kv_c._keys = kv._keys
+                    kv_c._values = kv._values
+                if k_st > 0:
+                    kv_c.commit_unpacked_w(src_all[v, :, 0], src_all[v, :, 1])
+                ac = ArraysCache(4)
+                ac.cache = [self.conv[v][j][idx : idx + 1] for j in range(4)]
+                out.append(CacheList(kv_c, ac))
+            return out
+
+        self.flush()
+        return _copy.deepcopy(self.caches[idx])
 
     def _segs(self, layer, k, gated=False):
         key = (id(layer), k, gated)
@@ -1706,7 +2224,7 @@ class BatchDecoder:
         conv_list[v] = states
         return o, bs_new
 
-    def _layer_b1(self, layer, v, h, bs, msg, tau_cache=None, caches=None, conv=None, b1_stage=None):
+    def _layer_b1(self, layer, v, h, bs, msg, tau_cache=None, caches=None, conv=None, b1_stage=None, b1_unp_news=None):
         a = layer["self_attn"]
         sliding = "input_layernorm" in layer
         c_list = self.caches if caches is None else caches
@@ -1835,6 +2353,17 @@ class BatchDecoder:
                         gate_stride=gate_stride, sink_stride=sink_stride,
                     )
                     b1_stage[6][v] = kv_new
+                elif self._b1_unpacked_full and not sliding and b1_unp_news is not None and kv._packed is None:
+                    fi = self._b1_full_unp_map[v]
+                    s_pref = int(kv.offset)
+                    attn_out = RS.sdpa_long_full_staged_unpacked(
+                        q, kv._keys, kv._values, kv_new, pb, qkv_flat, gate_off, sink_off,
+                        s_pref, s_pref + 1, int(kv._keys.shape[2]), int(kv._values.shape[2]), 1,
+                        scale=a.scaling, kv_layer_idx=fi,
+                        kv_stage=self._b1_full_unp_st, slot_main=self._b1_full_unp_slot0, st_len=self._b1_full_unp_len,
+                        gate_stride=gate_stride, sink_stride=sink_stride,
+                    )
+                    b1_unp_news[v] = kv_new
                 else:
                     kv_buf, S, end, idx, rot, cap = kv.update_packed_b1(kv_new, FD._wpos)
                     attn_out = RS.sdpa_b1_packed(
@@ -1872,12 +2401,15 @@ class BatchDecoder:
     ):
         kv_vmap = self._kv_vmap if self._kv_stacked else None
         kv = self.caches[0][v][0]
+        b1_unp = None
+        if self._b1_unpacked_full and v in self._b1_full_unp_map:
+            b1_unp = (self._b1_full_unp_st, self._b1_full_unp_map[v], self._b1_full_unp_slot0, self._b1_full_unp_len)
         return _layer_causal_w_body(
             self._cw_meta, kv_vmap, self._kv_ring, self._kv_full, self._kv_ring_st, self._kv_full_st,
             self.conv, layer, v, h, bs, msg, W, tau_cache=tau_cache, depths=depths, conv_anc=conv_anc,
             tree_meta=tree_meta, depths_arr=depths_arr, tau_lut=tau_lut, tau_table=tau_table,
             meta_arr=meta_arr, s_bounds=s_bounds, prev_moe=prev_moe, skip_combine=skip_combine,
-            emit_h=emit_h, use_stage=use_stage, w_act=w_act, kv=kv,
+            emit_h=emit_h, use_stage=use_stage, w_act=w_act, kv=kv, b1_unp_full=b1_unp,
         )
 
     def _layer_batch(
@@ -1979,16 +2511,23 @@ class BatchDecoder:
             layer, qkv_flat, qkv_lay, cs[0], cs[1], B, tau=tau_1d, rel_w=rel_w_bf, conv_anc=conv_anc,
         )
         kv_news[v] = kv_new
-        attn_out = RS.sdpa_multi_causal_w_staged(
-            q,
-            stage.ks_main[v] if ks_v is None else ks_v,
-            stage.vs_main[v] if vs_v is None else vs_v,
-            stage.buf if stage_buf is None else stage_buf,
-            kv_new, pb, qkv_flat,
-            gate_off, gate_stride, sink_off, sink_stride,
-            step_metas[v], step_Ss[v], C, W,
-            scale=scale, window=window, kv_layer_idx=v, scap=stage.scap,
-        )
+        attn_out = None
+        if not sliding and isinstance(stage, _BatchKVStage):
+            attn_out = _batch_full_attn_long_or_cascade(
+                q, kv_new, pb, qkv_flat, gate_off, gate_stride, sink_off, sink_stride,
+                stage, v, C, W, scale, ks_v=ks_v, vs_v=vs_v, stage_buf=stage_buf,
+            )
+        if attn_out is None:
+            attn_out = RS.sdpa_multi_causal_w_staged(
+                q,
+                stage.ks_main[v] if ks_v is None else ks_v,
+                stage.vs_main[v] if vs_v is None else vs_v,
+                stage.buf if stage_buf is None else stage_buf,
+                kv_new, pb, qkv_flat,
+                gate_off, gate_stride, sink_off, sink_stride,
+                step_metas[v], step_Ss[v], C, W,
+                scale=scale, window=window, kv_layer_idx=v, scap=stage.scap,
+            )
         op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
         r10 = RL.k10_post_layer(layer, op, h_before, nr, bs, cs[2], msg, debug=False, causal=True, conv_anc=conv_anc)
         if layer.is_block_boundary:
@@ -2226,6 +2765,7 @@ class BatchDecoder:
         h = tm.embed(tokens.reshape(1, 1)).reshape(1, 2304)
         use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
         kv_news = [None] * self.nv if b1_staged else None
+        b1_unp_news = {} if (self._b1_unpacked_full and not b1_staged) else None
         b1_stage_base = None
         if b1_staged:
             _, b1_tree_meta = RS._default_tree_meta(1)
@@ -2239,7 +2779,9 @@ class BatchDecoder:
                 if tap_buf is not None and rec and self._v in tap_set:
                     tap_buf[self._v] = h.reshape(1, 2304)
                 msg = None if bank is None else (msgs[i] if msgs is not None else tm.message_input(bank, i))
-                h, bs = self._layer_b1(layer, self._v, h, bs, msg, tau_cache, b1_stage=b1_stage_base)
+                h, bs = self._layer_b1(
+                    layer, self._v, h, bs, msg, tau_cache, b1_stage=b1_stage_base, b1_unp_news=b1_unp_news
+                )
                 self._v += 1
             return h, bs
 
@@ -2267,6 +2809,8 @@ class BatchDecoder:
         assert self._v == self.nv
         if b1_staged:
             self._commit_b1_kv_stage(kv_news)
+        elif b1_unp_news:
+            self._commit_b1_full_unpacked(b1_unp_news, 1)
         if tap_buf is not None and "o" in tap_set:
             tap_buf["o"] = h.reshape(1, 2304)
         h_out = RL.k1_pre(h, bs, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps)[
@@ -2650,7 +3194,7 @@ class BatchDecoder:
         ent = cw_cache[key] = (chunks, pre_n, n_bs_core, use_cd, ref_pass, bool(cfg.blend_bs))
         return ent
 
-    def verify_batch_w(self, tokens_cw, W: int, *, tap_visits=None, sampler=None):
+    def verify_batch_w(self, tokens_cw, W: int, *, tap_visits=None, sampler=None, return_h_out: bool = False):
         """Non-mutating multi-stream causal W-token verify for C streams (`2<=C<=8, 2<=W<=8, C*W<=16`)."""
         assert self._batch_fast and 2 <= self.C <= 8 and 2 <= W <= 8 and self.C * W <= 16
         tm = self.tm
@@ -2664,6 +3208,109 @@ class BatchDecoder:
         stage.maybe_flush_before_verify(W)
         step_metas, step_Ss, full_offs = stage.verify_view(W)
 
+        is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
+        want_h = bool(return_h_out) or (not is_greedy)
+        tap_set = set(tap_visits) if tap_visits is not None else set()
+        conv_anc = build_multi_chain_conv_anc(self.C, W)
+
+        if stage.needs_long_or_cascade(W):
+            # Direct uncompiled path for long-context Split-K / Shared-Prefix Cascade (0 JIT recompiles on split changes).
+            core = tm.args.loop_core
+            layers = tm.layers
+            use_cd = cfg.enabled_for(num_passes)
+            ref_pass = cfg.resolved_ref_pass(num_passes) if use_cd else -1
+            skip_mask = (
+                mx.repeat(self._loopcd_skip_mask(cfg), int(W))
+                if (use_cd and self._loopcd_skip_mask(cfg) is not None)
+                else None
+            )
+            fuse_ck1 = os.environ.get("LOOPLING_FUSE_COMB_K1_BATCH", "0") not in ("0", "")
+            use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
+            conv_local = [list(cs) for cs in self.conv]
+            kv_news = [None] * self.nv
+            tap_buf = {} if tap_visits is not None else None
+            tau_cache = {}
+            v_idx = 0
+            h = tm.embed(tokens_cw.reshape(B, 1)).reshape(B, 2304)
+
+            def run_bcw(ls, h, bs, bank=None):
+                nonlocal v_idx
+                msgs = None
+                bank4 = None
+                if bank is not None:
+                    if use_batch_msg:
+                        msgs = IK.depth_attention_batch(bank[0], bank[1], tm.message_input.query, scale=2304 ** -0.5)
+                    else:
+                        bank4 = (bank[0][:, :, None, :], bank[1][:, None, :])
+                prev_moe = None
+                last_i = len(ls) - 1
+                for i, layer in enumerate(ls):
+                    if bank is None:
+                        msg_v = None
+                    elif msgs is not None:
+                        msg_v = msgs[i]
+                    else:
+                        msg_v = tm.message_input(bank4, i).reshape(B, 4, 2304)
+                    next_gpar1 = i < last_i and (isinstance(ls[i + 1], L.SlidingDecoderLayer) or bank is not None)
+                    h, bs, prev_moe, h_before_v = self._layer_batch_causal_w(
+                        layer, v_idx, h, bs, msg_v,
+                        stage, step_metas, step_Ss, full_offs, kv_news,
+                        tau_cache, conv_local, conv_anc, self.C, int(W),
+                        prev_moe=prev_moe, skip_combine=(fuse_ck1 and next_gpar1),
+                    )
+                    if tap_buf is not None and v_idx in tap_set:
+                        tap_buf[v_idx] = h_before_v
+                    v_idx += 1
+                return h, bs
+
+            prelude = run_bcw(layers[: core.start], h, None)
+            h, bs = prelude
+            mx.async_eval(h)
+            pre_n = len(prelude[1])
+            ref_state = None
+            for p in range(num_passes):
+                bank = None
+                if p > 0:
+                    bank = (
+                        mx.stack(bs[pre_n + 1 :], axis=0),
+                        L.unweighted_rms_norm(h.astype(mx.float32)),
+                    )
+                    h, bs = prelude
+                h, bs = run_bcw(layers[core.start : core.stop], h, bs, bank)
+                mx.async_eval(h)
+                if use_cd and p == ref_pass:
+                    ref_state = (h, list(bs) if cfg.blend_bs else None)
+            if use_cd:
+                h, bs = loopcd.apply_hidden(
+                    h, bs, ref_state[0], ref_state[1], pre_n, cfg, skip_mask=skip_mask
+                )
+            h, bs = run_bcw(layers[core.stop :], h, bs)
+            assert v_idx == self.nv
+            if tap_buf is not None and "o" in tap_set:
+                tap_buf["o"] = h
+            h_out = RL.k1_pre(
+                h, bs, None, tm.final_input.query, [tm.norm.weight], sliding=True, eps_ln=tm.norm.eps
+            )["q_in"].reshape(B, 2304)
+            if tap_buf is not None:
+                tap_buf["F"] = h_out
+            conv_ws = [tuple(cs) for cs in conv_local]
+            if return_h_out:
+                return h_out, kv_news, conv_ws, tap_buf
+            if not is_greedy:
+                ret = self._sample_verify_tokens(h_out, sampler)
+            else:
+                lm = self.model.lm_head
+                text = self.model.args.text
+                if "head" in _FUSED and "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
+                    ret = RQ.qmv_softcap_argmax_rows(
+                        h_out, lm["weight"], lm["scales"], lm["biases"],
+                        text.final_logit_softcapping, text.unpadded_vocab_size,
+                    )
+                else:
+                    lg = RQ.qmv_rows(h_out, lm["weight"], lm["scales"], lm["biases"])
+                    ret = RH.softcap_argmax_rows(lg, text.final_logit_softcapping, text.unpadded_vocab_size)
+            return ret.reshape(self.C, int(W)), kv_news, conv_ws, tap_buf
+
         regime_sig = tuple(
             (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N), max(Ss) >= 256)
             for Ss in step_Ss
@@ -2676,20 +3323,16 @@ class BatchDecoder:
             os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
             and B <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
         )
-        tap_set = set(tap_visits) if tap_visits is not None else set()
         tap_tuple = (
             tuple(sorted(tap_set, key=lambda k: (0, k) if isinstance(k, int) else (1, str(k))))
             if tap_visits is not None
             else None
         )
-        is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
-        return_h_out = not is_greedy
         chunks, pre_n, n_bs_core, cd_on, r_pass, blend_bs = self._get_batch_cw_compiled(
-            W, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap, tap_tuple, return_h_out,
+            W, regime_sig, step_Ss, num_passes, cd_key, fuse_ck1, fuse_k3b, stage.scap, tap_tuple, want_h,
         )
         layers_seq = tm.layer_visits
         conv_flat = [x for cs in self.conv for x in cs]
-        conv_anc = build_multi_chain_conv_anc(self.C, W)
         tau_cache = {}
 
         def _taus_b(fvs):
@@ -2766,6 +3409,8 @@ class BatchDecoder:
         conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
         ret = o_c[0]
         if return_h_out:
+            return ret, kv_news, conv_ws, tap_buf
+        if not is_greedy:
             ret = self._sample_verify_tokens(ret, sampler)
         return ret.reshape(self.C, int(W)), kv_news, conv_ws, tap_buf
 
@@ -2798,6 +3443,7 @@ class BatchDecoder:
         if (
             self._sdpa_staged_has_st_info
             and not do_logits_cd
+            and not self._stage_main.needs_long_or_cascade(1)
             and os.environ.get("LOOPLING_COMPILE_BATCH", "1") not in ("0", "")
             and self.nv == len(tm.layer_visits)
         ):
@@ -3666,9 +4312,9 @@ class BatchDecoder:
 
     def verify_w(
         self, tokens, *, tap_visits=None, parents=None, depths=None, depths_arr=None, max_depth=None,
-        conv_anc=None, tree_meta=None, sampler=None,
+        conv_anc=None, tree_meta=None, sampler=None, return_h_out: bool = False,
     ):
-        """Bit-exact causal W-token/tree verify (W in 2..8) without mutating caches or conv state."""
+        """Bit-exact causal W-token/tree verify (W in 2..16) without mutating caches or conv state."""
         assert self._b1_fast
         tm = self.tm
         num_passes = tm.args.loop_config["num_passes"]
@@ -3681,7 +4327,7 @@ class BatchDecoder:
         W = int(tokens.shape[0])
         assert 2 <= W <= 16
         is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
-        return_h_out = not is_greedy
+        want_h = bool(return_h_out) or (not is_greedy)
         if conv_anc is None or tree_meta is None or (depths is None and depths_arr is None):
             if parents is None:
                 parents = tuple(range(-1, W - 1))
@@ -3714,7 +4360,7 @@ class BatchDecoder:
                 if num_passes == 1 and self.nv == 24:
                     (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
                         W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-                        return_h_out=return_h_out,
+                        return_h_out=want_h,
                     )
                     tluts0 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
                     tluts1 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs1]
@@ -3726,13 +4372,13 @@ class BatchDecoder:
                     mx.async_eval(o1[0])
                     o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts2, [], [], *conv_flat[56:])
                     ret, kv_news, conv_ws, tap_buf = self._unpack_cw_outputs(o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None)
-                    if return_h_out:
+                    if not return_h_out and want_h:
                         ret = self._sample_verify_tokens(ret, sampler)
                     return ret, kv_news, conv_ws, tap_buf
 
                 chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
                     W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-                    return_h_out=return_h_out,
+                    return_h_out=want_h,
                 )
                 outs_all = []
                 # Prelude
@@ -3790,7 +4436,7 @@ class BatchDecoder:
                             tap_buf[k] = arr
                 conv_ws = [tuple(conv_ws[4 * j : 4 * j + 4]) for j in range(self.nv)]
                 ret = o_c[0]
-                if return_h_out:
+                if not return_h_out and want_h:
                     ret = self._sample_verify_tokens(ret, sampler)
                 return ret, kv_news, conv_ws, tap_buf
 
@@ -3860,6 +4506,8 @@ class BatchDecoder:
         m = self.model
         lm = m.lm_head
         text = m.args.text
+        if return_h_out:
+            return h_out, kv_news, conv_ws, tap_buf
         if not is_greedy:
             next_toks = self._sample_verify_tokens(h_out, sampler)
         elif "head" in _FUSED and "head" not in _PLAIN and FD._is_aff8(lm) and h_out.dtype == mx.bfloat16:
@@ -3881,6 +4529,17 @@ class BatchDecoder:
         else:
             last_node = keep - 1
             p_idx = None
+        if self._b1_unpacked_full:
+            full_news = {}
+            for v in range(self.nv):
+                kvn = kv_news[v] if p_idx is None else kv_news[v][:, :, p_idx, :]
+                if v in self._b1_full_unp_map:
+                    full_news[v] = kvn
+                else:
+                    self.caches[0][v][0].commit_packed_w(kvn, keep, FD._wpos)
+                self.conv[v] = [w[last_node : last_node + 1] for w in conv_ws[v]]
+            self._commit_b1_full_unpacked(full_news, keep)
+            return
         if self._ensure_stacked_kv():
             if self._kv_st_len > 0:
                 self.flush_kv_stage()
@@ -4169,6 +4828,51 @@ class BatchDecoder:
         if argmax:
             return mx.argmax(lp, axis=-1), lp
         return lp
+
+    def can_fast_sample(self, sampler) -> bool:
+        """Return True if `sample_step` can run 0-sync fused GPU sampling for `sampler`."""
+        if not _fast_sample_enabled() or _std_sampler_params(sampler) is None:
+            return False
+        if "head" in _PLAIN or not (1 <= self.C <= RQ.MAX_B):
+            return False
+        if not (self._b1_fast or self._batch_fast or "qmv" in _USE):
+            return False
+        if not FD._is_aff8(self.model.lm_head):
+            return False
+        lc = self.tm.args.loop_config
+        cfg = self.tm.loopcd
+        if lc is not None and cfg.mode == "logits" and cfg.enabled_for(lc["num_passes"]):
+            return False
+        return True
+
+    def sample_step(self, tokens, sampler):
+        """Zero-sync exact-distribution fused GPU sampling step returning `(C,) uint32`."""
+        h, h_ref = self._hidden_pair(tokens)
+        std = _std_sampler_params(sampler)
+        m = self.model
+        lm = m.lm_head
+        if (
+            h_ref is None
+            and std is not None
+            and "head" not in _PLAIN
+            and (self._b1_fast or self._batch_fast or "qmv" in _USE)
+            and 1 <= self.C <= RQ.MAX_B
+            and FD._is_aff8(lm)
+            and h.dtype == mx.bfloat16
+        ):
+            text = m.args.text
+            raw_bf16 = RQ.qmv_rows(h.reshape(self.C, 2304), lm["weight"], lm["scales"], lm["biases"])
+            toks = RH.softcap_sample_rows_nosync(
+                raw_bf16,
+                text.final_logit_softcapping,
+                text.unpadded_vocab_size,
+                temp=std[0],
+                top_p=std[1],
+                min_p=std[2],
+            )
+            return self._with_stage_deps(toks)
+        lp = self.logprobs((h, h_ref))
+        return self._with_stage_deps(sampler(lp).astype(mx.uint32))
 
     def step(self, tokens):
         h, h_ref = self._hidden_pair(tokens)

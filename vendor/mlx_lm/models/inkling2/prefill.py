@@ -102,6 +102,8 @@ def _k_mma(name, ins, outs, src, extra_hdr=""):
 # ---------------------------------------------------------------------------------------------------- Fused bf16 -> f32 Router GEMM
 _ROUTER_BF16_SRC = r"""
     constexpr int BM = 32, BN = 64, BK = 32, LDX = 40, TG = 128, TM = 2, TN = 4;
+    uint MM = 1u;
+    for (int di = 0; di < x_ndim - 1; ++di) MM *= uint(x_shape[di]);
     const uint tgn = threadgroup_position_in_grid.x;
     const uint tgm = threadgroup_position_in_grid.y;
     const uint m0 = tgm * BM, n0 = tgn * BN;
@@ -180,7 +182,7 @@ def router_logits_bf16(x: mx.array, w: mx.array) -> mx.array:
     k = _k_mma("pf_router_bf16", ("x", "w"), ("out",), _ROUTER_BF16_SRC)
     return k(
         inputs=[x, w],
-        template=[("MM", M), ("KK", 2304)],
+        template=[("KK", 2304)],
         grid=(128 * 2, (M + 31) // 32, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[x.shape[:-1] + (128,)],
@@ -191,6 +193,8 @@ def router_logits_bf16(x: mx.array, w: mx.array) -> mx.array:
 # ---------------------------------------------------------------------------------------------------- Wave 6B: Custom BMx64x32 Grouped-GEMM MoE (NVFP4 & MXFP8)
 _MOE_CSORT_TILES_SRC = r"""
     constexpr uint NSG = 32;
+    const uint PP = uint(inds_shape[0]);
+    const uint MAX_TILES = PP / uint(BM) + uint(EE);
     uint tid = thread_position_in_threadgroup.x;
     uint lane = thread_index_in_simdgroup;
     uint sg = simdgroup_index_in_threadgroup;
@@ -638,6 +642,8 @@ _AFF8_QMM_SRC = r"""
     constexpr int XPT = (BM * BK) / TG;
     constexpr int WPT = (BN * BK) / TG;
 
+    uint MM = 1u;
+    for (int di = 0; di < x_ndim - 1; ++di) MM *= uint(x_shape[di]);
     const uint tgn = threadgroup_position_in_grid.x;
     const uint tgm = threadgroup_position_in_grid.y;
     const uint m0 = tgm * uint(BM);
@@ -813,6 +819,8 @@ _AFF8_WK_SRC = r"""
     constexpr int XPT = (BM * BK) / (NSG_MN * 32);
     constexpr int WPT = (BN * BK) / (NSG_MN * 32);
 
+    uint MM = 1u;
+    for (int di = 0; di < x_ndim - 1; ++di) MM *= uint(x_shape[di]);
     const uint tgn = threadgroup_position_in_grid.x;
     const uint tgm = threadgroup_position_in_grid.y;
     const uint m0 = tgm * uint(BM), n0 = tgn * uint(BN);
@@ -1008,7 +1016,7 @@ def aff8_linear(mod, x: mx.array) -> mx.array:
                 inputs=[x, mod["weight"], mod["scales"], mod["biases"]],
                 template=[
                     ("BM", bm), ("BN", bn), ("BK", bk), ("WM", 1), ("WN", 1), ("WK", spk),
-                    ("MM", M), ("NN", N), ("KK", K),
+                    ("NN", N), ("KK", K),
                 ],
                 grid=(tg * (N // bn), ntm, 1),
                 threadgroup=(tg, 1, 1),
@@ -1021,7 +1029,7 @@ def aff8_linear(mod, x: mx.array) -> mx.array:
             ntm = (M + bm - 1) // bm
             return _k_aff8_qmm()(
                 inputs=[x, mod["weight"], mod["scales"], mod["biases"]],
-                template=[("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn), ("MM", M), ("NN", N), ("KK", K)],
+                template=[("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn), ("NN", N), ("KK", K)],
                 grid=(tg * (N // bn), ntm, 1),
                 threadgroup=(tg, 1, 1),
                 output_shapes=[x.shape[:-1] + (N,)],
@@ -1033,14 +1041,14 @@ def aff8_linear(mod, x: mx.array) -> mx.array:
     else:
         bm, bn, wm, wn = _PF_AFF8_CFG
         bk = 32
-    if M < 1024 or N < 1024 or M % bm != 0 or N % bn != 0:
+    if M < 1024 or N < 1024 or N % bn != 0:
         return mod(x)
     tg = wm * wn * 32
     ntm = (M + bm - 1) // bm
     k = _k_aff8_qmm()
     return k(
         inputs=[x, mod["weight"], mod["scales"], mod["biases"]],
-        template=[("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn), ("MM", M), ("NN", N), ("KK", K)],
+        template=[("BM", bm), ("BN", bn), ("BK", bk), ("WM", wm), ("WN", wn), ("NN", N), ("KK", K)],
         grid=(tg * (N // bn), ntm, 1),
         threadgroup=(tg, 1, 1),
         output_shapes=[x.shape[:-1] + (N,)],
@@ -1087,6 +1095,7 @@ def moe_short_ok(ex, hidden_states: mx.array, selected_experts: mx.array) -> boo
 
 _MOE_CSORT_SHORT_SRC = r"""
     constexpr uint NSG = 8;
+    const uint PP = uint(inds_shape[0]);
     uint tid = thread_position_in_threadgroup.x;
     uint lane = thread_index_in_simdgroup;
     uint sg = simdgroup_index_in_threadgroup;
@@ -1478,6 +1487,8 @@ _MOE_CSORT_SHORT_TILES_SRC = r"""
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    const uint PP = uint(inds_shape[0]);
+    const uint MAX_TILES = min(PP, PP / uint(BM) + uint(EE));
     uint chunk = (uint(PP) + NSG - 1) / NSG;
     uint s0 = sg * chunk;
     uint s1 = min(s0 + chunk, uint(PP));
@@ -1809,7 +1820,7 @@ def moe_short_forward(
         )
         lhs_idx, inv_order, exp_off, tile_meta = ks(
             inputs=[selected_experts.reshape(-1).astype(mx.uint32)],
-            template=[("PP", P), ("EE", E), ("BM", tmax), ("MAX_TILES", max_tiles)],
+            template=[("EE", E), ("BM", tmax)],
             grid=(256, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(P,), (P,), (E + 1,), (max_tiles,)],
@@ -1851,7 +1862,7 @@ def moe_short_forward(
         )
         lhs_idx, inv_order, exp_off, act_e = ks(
             inputs=[selected_experts.reshape(-1).astype(mx.uint32)],
-            template=[("PP", P), ("EE", E)],
+            template=[("EE", E)],
             grid=(256, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(P,), (P,), (E + 1,), (E + 1,)],
@@ -1923,7 +1934,7 @@ def moe_gmm_forward(
     )
     lhs_idx, inv_order, exp_off, tile_meta = ks(
         inputs=[selected_experts.reshape(-1).astype(mx.uint32)],
-        template=[("PP", P), ("EE", E), ("BM", bm), ("MAX_TILES", max_tiles)],
+        template=[("EE", E), ("BM", bm)],
         grid=(1024, 1, 1),
         threadgroup=(1024, 1, 1),
         output_shapes=[(P,), (P,), (E + 1,), (max_tiles,)],
@@ -1977,6 +1988,7 @@ def moe_gmm_forward(
 # ---------------------------------------------------------------------------------------------------- MoE counting sort + gather
 _MOE_CSORT_SRC = r"""
     constexpr uint NSG = 32;
+    const uint PP = uint(inds_shape[0]);
     uint tid = thread_position_in_threadgroup.x;
     uint lane = thread_index_in_simdgroup;
     uint sg = simdgroup_index_in_threadgroup;
@@ -2063,7 +2075,7 @@ def moe_gather_sort(hidden_states: mx.array, selected_experts: mx.array, num_exp
     ks = _k("pf_moe_csort", ("inds",), ("lhs_idx", "idx_s", "inv_order"), _MOE_CSORT_SRC)
     lhs_idx, idx_s, inv_order = ks(
         inputs=[selected_experts.reshape(-1).astype(mx.uint32)],
-        template=[("PP", P), ("EE", num_experts)],
+        template=[("EE", num_experts)],
         grid=(1024, 1, 1),
         threadgroup=(1024, 1, 1),
         output_shapes=[(P,), (P,), (P,)],
@@ -2087,6 +2099,7 @@ def moe_gather_sort(hidden_states: mx.array, selected_experts: mx.array, num_exp
 # ---------------------------------------------------------------------------------------------------- Fused conv + residual / RMSNorm
 _SC4_RES_SRC = f"""
     GL_NOFMA
+    const uint LL = uint(x_shape[1]);
     uint c4 = thread_position_in_grid.x;
     uint c = c4 * 4;
     if (c >= DD) return;
@@ -2182,7 +2195,7 @@ def short_conv_residual(
     return k(
         inputs=[x, cs_in, weight, residual, cm_in, cl_in],
         template=[
-            ("DD", C), ("LL", L), ("HAS_CS", has_cs), ("TT", tt),
+            ("DD", C), ("HAS_CS", has_cs), ("TT", tt),
             ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
         grid=(((C // 4 + 255) // 256) * 256, B * ntiles, 1),
@@ -2194,6 +2207,7 @@ def short_conv_residual(
 
 _SC_ATTN_POST_SRC = f"""
     GL_NOFMA
+    const uint LL = uint(x_shape[1]);
     uint tok = threadgroup_position_in_grid.x;
     uint lid = thread_position_in_threadgroup.x;
     uint lane = lid & 31;
@@ -2305,7 +2319,7 @@ def short_conv_attn_post(
     return k(
         inputs=[x, cs_in, weight, br_in, cm_in, cl_in],
         template=[
-            ("DD", C), ("LL", L), ("HAS_CS", has_cs), ("ADD_RES", add_res),
+            ("DD", C), ("HAS_CS", has_cs), ("ADD_RES", add_res),
             ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
         grid=(B * L * _TG_RMS, 1, 1),
@@ -2490,6 +2504,7 @@ def qkv_clip_rms(
 # ---------------------------------------------------------------------------------------------------- Fused SlidingAttention (k_sconv+k_clip) + (v_sconv+v_rms) + q_clip
 _SWA_QKV_CONV_CLIP_SRC = f"""
     GL_NOFMA
+    const uint LL = uint(q_shape[1]);
     uint tgx = threadgroup_position_in_grid.x;
     uint tile = threadgroup_position_in_grid.y;
     uint lid = thread_position_in_threadgroup.x;
@@ -2751,7 +2766,7 @@ def swa_qkv_conv_clip(
     qo, ko, vo, nkcs, nvcs, ro = k_fn(
         inputs=[q, k, v, q_scale, k_cw, v_cw, kcs_in, vcs_in, params, r_in, rs_in, cm_in, cl_in],
         template=[
-            ("HQ", num_heads), ("HKV", num_kv_heads), ("LL", L),
+            ("HQ", num_heads), ("HKV", num_kv_heads),
             ("TT", tt), ("HAS_KCS", has_kcs), ("HAS_VCS", has_vcs), ("HAS_REL", has_rel),
             ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
@@ -3043,6 +3058,7 @@ _URMS_DA_F32_SRC = r"""
 
 _SC_ATTN_DA_SRC = f"""
     constexpr int N = K + 1;
+    const uint LL = uint(x_shape[1]);
     uint row = threadgroup_position_in_grid.x;
     uint rows = threadgroups_per_grid.x;
     uint lid = thread_position_in_threadgroup.x;
@@ -3276,7 +3292,7 @@ def short_conv_attn_depth_attn(
     res_out, ncs, out_bf16, out_f32 = k(
         inputs=[x, cs_in, weight, br_in, blocks, query.reshape(-1), sc, nw_in, eps_in, cm_in, cl_in],
         template=[
-            ("K", blocks.shape[0]), ("D", D), ("LL", L),
+            ("K", blocks.shape[0]), ("D", D),
             ("HAS_CS", has_cs), ("ADD_RES", add_res), ("DO_RMS", do_rms),
             ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
@@ -3520,6 +3536,7 @@ def unsort_combine(dn_sorted: mx.array, inv_order: mx.array, routing_weights: mx
 
 # ---------------------------------------------------------------------------------------------------- ShortConvolution
 _SC_SRC = f"""
+    const uint LL = uint(x_shape[1]);
     uint c = thread_position_in_grid.x;
     uint tok = thread_position_in_grid.y;
     uint b = tok / LL;
@@ -3565,6 +3582,7 @@ _SC_SRC = f"""
 """
 
 _SC4_SRC = f"""
+    const uint LL = uint(x_shape[1]);
     uint c4 = thread_position_in_grid.x;
     uint c = c4 * 4;
     if (c >= DD) return;
@@ -3658,7 +3676,7 @@ def short_conv(
         return k(
             inputs=[x, cs_in, weight, cm_in, cl_in],
             template=[
-                ("DD", C), ("LL", L), ("HAS_CS", has_cs), ("TT", tt),
+                ("DD", C), ("HAS_CS", has_cs), ("TT", tt),
                 ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
             ],
             grid=(((C // 4 + 255) // 256) * 256, B * ntiles, 1),
@@ -3670,7 +3688,7 @@ def short_conv(
     return k(
         inputs=[x, cs_in, weight, cm_in, cl_in],
         template=[
-            ("DD", C), ("LL", L), ("HAS_CS", has_cs),
+            ("DD", C), ("HAS_CS", has_cs),
             ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
         grid=(((C + 255) // 256) * 256, B * L, 1),
@@ -3682,6 +3700,7 @@ def short_conv(
 
 # ---------------------------------------------------------------------------------------------------- DynamicShortConv
 _DSC_SRC = f"""
+    const uint LL = uint(x_shape[1]);
     uint c = thread_position_in_grid.x;
     uint tok = thread_position_in_grid.y;
     uint b = tok / LL;
@@ -3727,6 +3746,7 @@ _DSC_SRC = f"""
 """
 
 _DSC4_SRC = f"""
+    const uint LL = uint(x_shape[1]);
     uint c4 = thread_position_in_grid.x;
     uint c = c4 * 4;
     if (c >= CC) return;
@@ -3819,7 +3839,7 @@ def dyn_short_conv(
         return k(
             inputs=[x, dyn_weights, static_weight, cs_in, cm_in, cl_in],
             template=[
-                ("CC", C), ("LL", L), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs), ("TT", tt),
+                ("CC", C), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs), ("TT", tt),
                 ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
             ],
             grid=(((C // 4 + 255) // 256) * 256, B * ntiles, 1),
@@ -3831,7 +3851,7 @@ def dyn_short_conv(
     return k(
         inputs=[x, dyn_weights, static_weight, cs_in, cm_in, cl_in],
         template=[
-            ("CC", C), ("LL", L), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs),
+            ("CC", C), ("HH", num_heads), ("HD", hd), ("HAS_CS", has_cs),
             ("HAS_MASK", has_mask), ("HAS_LENS", has_lens),
         ],
         grid=(((C + 255) // 256) * 256, B * L, 1),
@@ -4205,6 +4225,7 @@ METAL_FUNC void mg_tile_run(
 
 _SPLASH_SINGLE_SRC = r"""
     threadgroup MgShared shared;
+    const uint NN = uint(msg_shape[0]) * uint(msg_shape[1]);
     const uint first = threadgroup_position_in_grid.x * kMgTileRows;
     if (first >= NN) return;
     const uint count = min(kMgTileRows, NN - first);
@@ -4219,6 +4240,7 @@ _SPLASH_SINGLE_SRC = r"""
 
 _SPLASH_QKV_SRC = r"""
     threadgroup MgShared shared;
+    const uint NN = uint(msg_shape[0]) * uint(msg_shape[1]);
     const uint first = threadgroup_position_in_grid.x * kMgTileRows;
     const uint g = threadgroup_position_in_grid.y;
     if (first >= NN || g >= 3) return;
@@ -4272,6 +4294,7 @@ def _gate_logits(gate_mod, x_bf16):
 
 _MGIN_DOWN_QKV_SRC = r"""
     GL_NOFMA
+    const uint NN = uint(msg_shape[0]) * uint(msg_shape[1]);
     const uint g = threadgroup_position_in_grid.y;
     const device bfloat16_t* w = (g == 0 ? w0 : (g == 1 ? w1 : w2));
     device float* out_p = (g == 0 ? o0 : (g == 1 ? o1 : o2));
@@ -4443,6 +4466,7 @@ def _fg_mix_src(is_qkv: bool, w_bf16: bool = False) -> str:
     return (
         "    GL_NOFMA\n"
         "    constexpr int BM = 32, TM = 4;\n"
+        "    const uint NN = uint(msg_shape[0]) * uint(msg_shape[1]);\n"
         "    const uint m0 = (SWAP_GRID ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y) * BM;\n"
         + setup
         + f"""
@@ -4530,7 +4554,7 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
                 h, msg, gate_mod.down_proj.weight, gate_mod.forget_gate_proj.weight,
                 gate_mod.message_gate_proj.weight, ln.weight, mx.array([ln.eps], mx.float32),
             ],
-            template=[("NN", N), ("SLOT", slot)],
+            template=[("SLOT", slot)],
             grid=(nt * 256, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(B, L, D), (N, D)],
@@ -4547,7 +4571,7 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
             k_md = _k_mma("pf_mgin_down_s", ("h", "msg", "w0"), ("o0",), _MGIN_DOWN_S_SRC)
             st = k_md(
                 inputs=[h, msg, gate_mod.down_proj.weight],
-                template=[("DD", D), ("NN", N), ("SPK", spk), ("SLOT", slot)],
+                template=[("DD", D), ("SPK", spk), ("SLOT", slot)],
                 grid=(128 * ((N + 31) // 32), 1, 1),
                 threadgroup=(128, 1, 1),
                 output_shapes=[(B, L, 64)],
@@ -4583,7 +4607,7 @@ def msg_gate_norm_single(gate_mod, h: mx.array, msg: mx.array, slot: int, ln) ->
                 h,
                 msg,
             ],
-            template=[("DD", D), ("NN", N), ("SLOT", slot), ("SWAP_GRID", swap_fg)],
+            template=[("DD", D), ("SLOT", slot), ("SWAP_GRID", swap_fg)],
             grid=(nt_m * 256, D // 64, 1) if swap_fg else ((D // 64) * 256, nt_m, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(B, L, D)],
@@ -4633,7 +4657,7 @@ def msg_gate_norm_qkv(gates, h_or_ai: mx.array, msg: mx.array, lns, *, shared_h:
                 lns[0].weight, lns[1].weight, lns[2].weight,
                 mx.array([lns[0].eps], mx.float32),
             ],
-            template=[("NN", N), ("SHARED_H", int(shared_h)), ("SHARED_LN", int(shared_ln))],
+            template=[("SHARED_H", int(shared_h)), ("SHARED_LN", int(shared_ln))],
             grid=(nt * 256, 3, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(B, L, D), (B, L, D), (B, L, D), (3, N, D)],
@@ -4655,7 +4679,7 @@ def msg_gate_norm_qkv(gates, h_or_ai: mx.array, msg: mx.array, lns, *, shared_h:
             )
             st0, st1, st2 = k_md(
                 inputs=[h_or_ai, msg, gates[0].down_proj.weight, gates[1].down_proj.weight, gates[2].down_proj.weight],
-                template=[("DD", D), ("NN", N), ("SPK", spk), ("SHARED_H", int(shared_h))],
+                template=[("DD", D), ("SPK", spk), ("SHARED_H", int(shared_h))],
                 grid=(128 * ((N + 31) // 32), 3, 1),
                 threadgroup=(128, 1, 1),
                 output_shapes=[(B, L, 64)] * 3,
@@ -4692,7 +4716,7 @@ def msg_gate_norm_qkv(gates, h_or_ai: mx.array, msg: mx.array, lns, *, shared_h:
                 *(wm_b if use_bf16 else [g.message_gate_proj.weight for g in gates]),
                 h_or_ai, msg,
             ],
-            template=[("DD", D), ("NN", N), ("SHARED_H", int(shared_h)), ("SWAP_GRID", swap_fg)],
+            template=[("DD", D), ("SHARED_H", int(shared_h)), ("SWAP_GRID", swap_fg)],
             grid=(nt_m * 256, 3 * (D // 64), 1) if swap_fg else (3 * (D // 64) * 256, nt_m, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(B, L, D)] * 3,

@@ -1512,11 +1512,218 @@ class DFlash2Drafter:
         # Keep pure neural chain unless >= _LOOKUP_BYPASS_MIN, matching draft_hybrid_tree lookup_bypass gating.
         return mx.array(out_rows, mx.int32)
 
+    def draft_batch_chains_coupled(
+        self,
+        states: list[DFlash2StreamState],
+        anchors_c: list[int] | mx.array,
+        W: int,
+        *,
+        temp: float = 0.25,
+    ):
+        """Draft `(C, W)` coupled chains + `(C, W-1, 16)` `(q_ids, q_probs)` for exact Leviathan temp>0 verification."""
+        W = max(2, min(self.block, int(W)))
+        C = len(states)
+        if isinstance(anchors_c, mx.array):
+            anc_list = [int(a) for a in anchors_c.tolist()]
+            anc_nn = anchors_c.reshape(C).astype(mx.int32)
+        else:
+            anc_list = [int(a) for a in anchors_c]
+            anc_nn = mx.array(anc_list, mx.int32)
+
+        anc_embs = self.target.model.language_model.embed(anc_nn.reshape(C, 1))[:, 0, :]
+        m7 = mx.broadcast_to(self._mask_7[None, :, :], (C, self.block - 1, self.H))
+        x = mx.concatenate([anc_embs[:, None, :], m7], axis=1)
+        B_tot = C * self.block
+        scale = self.hd ** -0.5
+
+        ctx_lens = [max(0, states[c].n - max(0, states[c].n - self.window)) for c in range(C)]
+        ctx_starts = [max(0, states[c].n - self.window) for c in range(C)]
+        ctx_max = max(ctx_lens) if ctx_lens else 0
+
+        attn_mask = None
+        if ctx_max > 0 and any(cl != ctx_max for cl in ctx_lens):
+            m_np = np.zeros((C, 1, self.block, ctx_max + self.block), dtype=np.float32)
+            for c, cl in enumerate(ctx_lens):
+                if cl < ctx_max:
+                    m_np[c, :, :, cl:ctx_max] = -1e9
+            attn_mask = mx.array(m_np).astype(mx.bfloat16)
+
+        offs_arr = mx.array([states[c].n for c in range(C)], mx.int32)
+        pre_rope_b, post_attn_b, _ = _get_df_batch_compiled(
+            self.nh, self.nkv, self.hd, self.inter, self.qbits, self.theta
+        )
+        pads = [
+            mx.zeros((1, self.nkv, ctx_max - cl, self.hd), self._kv_dtype) if (ctx_max > 0 and cl < ctx_max) else None
+            for cl in ctx_lens
+        ]
+        for i, lw in enumerate(self.layers):
+            q_cur, k_cur, v_cur, dyn_a = pre_rope_b(
+                x, lw["in_ln"], lw["a_dyn"], lw["a_base"], lw["qkv"], lw["q_norm"], lw["k_norm"], offs_arr
+            )
+            if ctx_max > 0:
+                ks_ctx, vs_ctx = [], []
+                for c in range(C):
+                    s0 = ctx_starts[c]
+                    kc = states[c].ck[i][:, :, s0 : states[c].n, :]
+                    vc = states[c].cv[i][:, :, s0 : states[c].n, :]
+                    pad = pads[c]
+                    if pad is not None:
+                        kc = mx.concatenate([kc, pad], axis=2)
+                        vc = mx.concatenate([vc, pad], axis=2)
+                    ks_ctx.append(kc)
+                    vs_ctx.append(vc)
+                k_all = mx.concatenate([mx.concatenate(ks_ctx, axis=0), k_cur], axis=2)
+                v_all = mx.concatenate([mx.concatenate(vs_ctx, axis=0), v_cur], axis=2)
+            else:
+                k_all, v_all = k_cur, v_cur
+            attn = mx.fast.scaled_dot_product_attention(q_cur, k_all, v_all, scale=scale, mask=attn_mask)
+            attn = attn.transpose(0, 2, 1, 3).reshape(B_tot, self.nh * self.hd)
+            x = post_attn_b(
+                x, attn, lw["o_proj"], dyn_a, lw["a_base"], lw["post_ln"], lw["m_dyn"], lw["m_base"], lw["gu"], lw["down"]
+            )
+
+        n_pos = W - 1
+        hid = _rms(x.reshape(B_tot, self.H), self.final_norm).reshape(C, self.block, self.H)[:, 1 : 1 + n_pos, :]
+        hid_flat = hid.reshape(C * n_pos, self.H)
+        sel_h = self._lin(hid_flat, self.sel_proj).astype(mx.float32).reshape(C, n_pos, self.rank)
+        if self._lm_q4 is not None and 1 <= C * n_pos <= 8:
+            wq4, sc4, bi4 = self._lm_q4
+            top_idx, unary = RQ4.qmv4_bf16_top16_rows(hid_flat, wq4, sc4, bi4)
+        else:
+            if self._lm_q4 is not None:
+                wq4, sc4, bi4 = self._lm_q4
+                raw_logits = mx.quantized_matmul(
+                    hid_flat, wq4, scales=sc4, biases=bi4, transpose=True, group_size=64, bits=4, mode="affine"
+                )
+            elif self._lm_aff8:
+                raw_logits = RQ.qmv_rows(hid_flat, *self._lm_t)[:, : self._unpadded_vocab]
+            else:
+                raw_logits = self.target.lm_head(hid_flat)[:, : self._unpadded_vocab]
+            top_idx = mx.argpartition(-raw_logits, 16, axis=-1)[:, :16]
+            unary = mx.take_along_axis(raw_logits, top_idx, axis=-1).astype(mx.float32)
+
+        top_idx_c = top_idx.reshape(C, n_pos, 16).astype(mx.uint32)
+        unary_c = unary.reshape(C, n_pos, 16)
+        sc0_list, sc16_list = [], []
+        for c in range(C):
+            _, sc0_i, sc16_i = _selector_scores_from_top16(
+                top_idx_c[c], unary_c[c], sel_h[c], self.pred_cb, self.succ_cb, anc_nn[c], self.softcap,
+            )
+            sc0_list.append(sc0_i)
+            sc16_list.append(sc16_i)
+        sc0_all = mx.stack(sc0_list, axis=0)
+        sc16_all = mx.stack(sc16_list, axis=0)
+        u_all = mx.random.uniform(shape=(C, n_pos), dtype=mx.float32)
+        mx.eval(top_idx_c, sc0_all, sc16_all, u_all)
+
+        tl_all = top_idx_c.tolist()
+        s0_all = sc0_all.tolist()
+        s16_all = sc16_all.tolist()
+        u_list = u_all.tolist()
+        inv_t = 1.0 / max(float(temp), 1e-4)
+
+        out_rows = []
+        q_probs_out = np.zeros((C, n_pos, 16), dtype=np.float32)
+        for c in range(C):
+            row = [anc_list[c]]
+            prev_slot = 0
+            for p in range(n_pos):
+                sc_p = s0_all[c] if p == 0 else s16_all[c][p - 1][prev_slot]
+                m_v = max(sc_p)
+                ex = [math.exp((v - m_v) * inv_t) for v in sc_p]
+                z = sum(ex)
+                probs = [v / z for v in ex]
+                q_probs_out[c, p, :] = probs
+                u = u_list[c][p]
+                cum = 0.0
+                chosen = 15
+                for j, pv in enumerate(probs):
+                    cum += pv
+                    if u <= cum:
+                        chosen = j
+                        break
+                prev_slot = chosen
+                row.append(int(tl_all[c][p][chosen]))
+            out_rows.append(row)
+        return mx.array(out_rows, mx.int32), top_idx_c, mx.array(q_probs_out, mx.float32)
+
+
+def _coupled_verify_chains(model, h_out_cw, blk_cw, q_ids_c, q_probs_c, sampler):
+    """Exact Leviathan coupled rejection sampling over `C` verified chains (`h_out_cw: (C*W, 2304)`)."""
+    from mlx_lm.models.inkling2.batchdecode import _std_sampler_params
+    from mlx_lm.models.inkling2.rows import head as RH
+
+    C, W = int(blk_cw.shape[0]), int(blk_cw.shape[1])
+    std_samp = _std_sampler_params(sampler)
+    assert std_samp is not None
+    temp, top_p, min_p = std_samp
+    lm = model.lm_head
+    text = model.args.text
+    sc = text.final_logit_softcapping
+    V = text.unpadded_vocab_size
+    logits = RQ.qmv_rows(h_out_cw.reshape(C * W, -1), lm["weight"], lm["scales"], lm["biases"])  # (C*W, P)
+
+    # Batched coupled head call across all C streams: pad each stream's W-th slot with dummy q (unused).
+    u_acc_all = mx.random.uniform(shape=(C, W - 1), dtype=mx.float32)
+    bl = blk_cw.tolist()
+    qp_l = q_probs_c.tolist()
+    qi_l = q_ids_c.tolist()
+    keeps_raw = []
+    next_ancs = []
+    for c in range(C):
+        lg_c = logits[c * W : (c + 1) * W]
+        child_c = blk_cw[c, 1:].astype(mx.uint32)
+        bonus_c, reject_c, child_pt_c, ovf_c = RH.softcap_coupled_verify_rows(
+            lg_c, sc, V, q_ids_c[c], q_probs_c[c], child_c, temp=temp, top_p=top_p, min_p=min_p
+        )
+        mx.eval(bonus_c, reject_c, child_pt_c, ovf_c, u_acc_all)
+        ovf_l = ovf_c.tolist()
+        bonus_l = bonus_c.tolist()
+        reject_l = reject_c.tolist()
+        cpt_l = child_pt_c.tolist()
+        u_l = u_acc_all[c].tolist()
+        k_raw = 1
+        nxt_tok = None
+        for j in range(W - 1):
+            if ovf_l[j] != 0:
+                # Exact CPU/MLX target distribution fallback on overflow row j.
+                lg_j = lg_c[j : j + 1, :V].astype(mx.float32)
+                if sc and float(sc) > 0.0:
+                    lg_j = mx.tanh(lg_j / float(sc)) * float(sc)
+                lp_j = lg_j - mx.logsumexp(lg_j, axis=-1, keepdims=True)
+                tok_j = int(sampler(lp_j).item())
+                if tok_j == int(bl[c][j + 1]):
+                    k_raw += 1
+                    continue
+                nxt_tok = tok_j
+                break
+            cid = int(bl[c][j + 1])
+            q_val = sum(qp_l[c][j][k] for k in range(16) if int(qi_l[c][j][k]) == cid)
+            p_val = float(cpt_l[j])
+            acc_p = 1.0 if (q_val <= 0.0 or p_val >= q_val) else (p_val / q_val)
+            if u_l[j] <= acc_p:
+                k_raw += 1
+            else:
+                nxt_tok = int(reject_l[j])
+                break
+        if nxt_tok is None:
+            if ovf_l[W - 1] != 0:
+                lg_w = lg_c[W - 1 : W, :V].astype(mx.float32)
+                if sc and float(sc) > 0.0:
+                    lg_w = mx.tanh(lg_w / float(sc)) * float(sc)
+                lp_w = lg_w - mx.logsumexp(lg_w, axis=-1, keepdims=True)
+                nxt_tok = int(sampler(lp_w).item())
+            else:
+                nxt_tok = int(bonus_l[W - 1])
+        keeps_raw.append(k_raw)
+        next_ancs.append(nxt_tok)
+    return keeps_raw, next_ancs
+
 
 _DF2_INST: dict = {}
 
 
-def _get_drafter(model, draft_dir: str = DFLASH2_DIR) -> DFlash2Drafter:
+def _get_drafter(model, draft_dir: str = DFLASH2_DIR, *, reset: bool = True) -> DFlash2Drafter:
     lm_w = model.lm_head["weight"]
     qbits = int(os.environ.get("LOOPLING_DFLASH2_QUANT", "4"))
     fused = qbits == 4 and os.environ.get("LOOPLING_DFLASH2_FUSED", "1") not in ("0", "", "false", "False")
@@ -1525,7 +1732,8 @@ def _get_drafter(model, draft_dir: str = DFLASH2_DIR) -> DFlash2Drafter:
     entry = _DF2_INST.get(key)
     if entry is not None and entry[0] is lm_w:
         dr = entry[1]
-        dr.reset()
+        if reset:
+            dr.reset()
         return dr
     dr = DFlash2Drafter(model, draft_dir=draft_dir, quant_bits=qbits)
     _DF2_INST[key] = (lm_w, dr)
@@ -2306,3 +2514,757 @@ def dflash2_exact_generate_step(
                 n += 1
     finally:
         _sync_exact_cache()
+
+
+class _DFlash2C1Runner:
+    """Step-driven C=1 bit-exact DFlash 2 runner for `GenerationBatch` with seamless C=1 <-> C>=2 handoff."""
+
+    def __init__(
+        self,
+        dec,
+        dr: DFlash2Drafter,
+        state: DFlash2StreamState,
+        anchor: mx.array,
+        anchor_int: int,
+        *,
+        all_tokens: list[int],
+        tap_keys,
+        tap_set,
+        sampler,
+        max_tokens: int,
+        num_tokens: int,
+        track_cache_rb: bool = False,
+    ):
+        from mlx_lm.models.inkling2.batchdecode import _cw_ar_cache, _std_sampler_params
+
+        self.dec = dec
+        self.dr = dr
+        self.state = state
+        self.anchor = anchor.reshape(1).astype(mx.uint32)
+        self.anchor_int = int(anchor_int)
+        self.tap_keys = tap_keys
+        self.tap_set = tap_set
+        self.tap_check = set(tap_set) | {"F"}
+        self.sampler = sampler
+        self.max_tokens = int(max_tokens)
+        self.n = int(num_tokens)
+        self.track_cache_rb = bool(track_cache_rb)
+        self._cw_ar_cache = _cw_ar_cache
+
+        tm = dec.tm
+        passes = tm.args.loop_config["num_passes"]
+        self.W_cfg = int(os.environ.get("LOOPLING_DFLASH2_W", "8"))
+        self.use_budget = os.environ.get("LOOPLING_DFLASH2_BUDGET", "1") not in ("0", "", "false", "False")
+        self.use_lookup = os.environ.get("LOOPLING_DFLASH2_LOOKUP", "1") not in ("0", "", "false", "False")
+        tree_env = os.environ.get("LOOPLING_DFLASH2_TREE", "")
+        self.use_tree = (tree_env not in ("0", "")) if tree_env else self.use_budget
+
+        # Bind drafter KV buffers to this stream's state.
+        if state.ck[0] is None:
+            state.ensure_cap(2048)
+        dr.ck = state.ck
+        dr.cv = state.cv
+        dr.n = int(state.n)
+
+        # Sync lookup automaton with all tokens seen so far (prompt + tok0).
+        self.lookup = state.lookup if self.use_lookup else None
+        if self.lookup is not None:
+            n_lp = len(self.lookup.tokens)
+            if n_lp < len(all_tokens):
+                self.lookup.append(all_tokens[n_lp:])
+                if self.lookup._prompt_end < 0 and len(all_tokens) >= 1:
+                    self.lookup.set_prompt_end(len(all_tokens) - 1)
+        self.lookup_cd = 0
+
+        self.budget = getattr(dr, "_budget", None) if self.use_budget else None
+        if self.use_budget and self.budget is None:
+            self.budget = dr._budget = VerifyBudget()
+        self.costs = getattr(dr, "_costs", None) if self.use_budget else None
+        if self.use_budget and self.costs is None:
+            self.costs = dr._costs = MoEStepCosts(dr.qbits)
+        elif self.costs is not None:
+            self.costs.ar_cooldown = 0
+            self.costs.low_streak = 0
+            self.costs.ar_backoff = 4
+            self.costs.ema_ratio = 1.15
+
+        self.is_greedy = sampler is None or getattr(sampler, "_sampler_key", None) == ("greedy",)
+        std_samp = None if self.is_greedy else _std_sampler_params(sampler)
+
+        self.use_pipe_ahead = (
+            os.environ.get("LOOPLING_DFLASH2_PIPE_AHEAD", "1") not in ("0", "", "false", "False")
+            and dr._fused
+            and self.W_cfg >= 2
+            and os.environ.get("LOOPLING_COMPILE_VERIFY", "1") not in ("0", "")
+            and not (tm.loopcd.enabled_for(passes) and tm.loopcd.mode != "hidden")
+        )
+        self.off_cpu = int(dec.caches[0][0][0].offset)
+        # Context-aware W cap: at ctx >= 128K (or unpacked 1M full KV), QPS=4 (W=4) is the scalar ALU sweet spot.
+        self._is_long_ctx = bool(getattr(dec, "_b1_unpacked_full", False)) or (self.off_cpu >= 131072)
+        if self._is_long_ctx:
+            long_w = int(os.environ.get("LOOPLING_DFLASH2_LONG_W", "4"))
+            self.W_cfg = max(2, min(self.W_cfg, long_w))
+            if self.costs is not None:
+                # Add measured sdpa_long_full_staged_unpacked KV latency scaled by ctx / 1M (W=1: +52.2ms, W=2: +60.5ms, W=8: +132.5ms).
+                frac = self.off_cpu / 1_048_576.0
+                long_costs = MoEStepCosts(dr.qbits)
+                long_costs.t_ar += 52.2 * frac
+                long_costs.t_v2 += 60.5 * frac
+                long_costs.t_v8 += 132.5 * frac
+                self.costs = long_costs
+
+        rem0 = max(1, self.max_tokens - self.n)
+        if self.use_pipe_ahead and rem0 > 1:
+            init_win = min(rem0 + 16, 4096)
+            if not dec.ensure_gpu_cap(init_win):
+                self.use_pipe_ahead = False
+            else:
+                dr._ensure_cap(dr.n + init_win + 16)
+        self.tau_cap = max(4096, ((self.off_cpu + min(rem0, 4096) + 32 + 4095) // 4096) * 4096)
+        self.pa_depth = max(1, min(3, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
+        self.use_coupled = (
+            (self.use_pipe_ahead or bool(getattr(dec, "_b1_unpacked_full", False)))
+            and (std_samp is not None)
+            and os.environ.get("LOOPLING_DFLASH2_COUPLED_SAMPLE", "1") not in ("0", "", "false", "False")
+        )
+        if self.use_coupled:
+            _dt_env = os.environ.get("LOOPLING_DFLASH2_DRAFT_TEMP", "")
+            self.draft_temp = float(_dt_env) if _dt_env else min(std_samp[0], 0.25)
+            self.pa_tree = False
+        else:
+            self.draft_temp = 0.0
+            self.pa_tree = bool(self.use_tree or self.use_budget or not self.is_greedy)
+
+        fscale = (12 + 12 * passes) / 24.0
+        pa_costs_env = os.environ.get("LOOPLING_DFLASH2_PA_COSTS")
+        if pa_costs_env:
+            _pa_c_ov = mx.array([float(x) for x in pa_costs_env.split(",")], mx.float32)
+            self.pa_cost_map = {4: _pa_c_ov, 6: _pa_c_ov, 8: _pa_c_ov}
+        else:
+            s = fscale / 2.0
+            _c4 = mx.array([c * s for c in (0.0, 9.6, 15.0, 16.3, 17.5, 20.5, 21.3, 22.1, 22.8)], mx.float32)
+            _c_def = mx.array([c * s for c in (0.0, 9.6, 17.8, 18.7, 19.6, 20.5, 21.3, 22.1, 22.8)], mx.float32)
+            self.pa_cost_map = {4: _c4, 6: _c_def, 8: _c_def}
+        pa_priors_env = os.environ.get("LOOPLING_DFLASH2_PA_PRIORS")
+        if pa_priors_env:
+            self.pa_prior_cfg = mx.array([float(x) for x in pa_priors_env.split(",")], mx.float32)
+        else:
+            self.pa_prior_cfg = mx.array([VerifyBudget.PRIOR_SLOPE, *VerifyBudget.PRIOR_INTERCEPTS], mx.float32)
+
+        self.pa_adapt = bool(self.use_budget) and os.environ.get("LOOPLING_DFLASH2_PA_ADAPT", "1") not in ("0", "", "false", "False")
+        self.pa_promote = float(os.environ.get("LOOPLING_DFLASH2_PA_PROMOTE", "5.3"))
+        self.pa_demote = self.pa_promote - 0.6
+        self.pa_demote4 = float(os.environ.get("LOOPLING_DFLASH2_PA_DEMOTE4", "2.40"))
+        self.pa_promote4 = self.pa_demote4 + 0.50
+        self.pa_w_run = min(self.W_cfg, 6) if (self.pa_adapt and self.W_cfg > 6) else self.W_cfg
+        self.pa_ema_tpc = 3.0
+        self.pa_packed = None
+        self.pa_packed_w = 0
+        self.pa_queue: deque = deque()
+        self.deferred_feats: list[mx.array] = []
+        self.last_popped_rb = None
+        self.last_popped_tokens: list[int] = []
+
+        self.stats = getattr(dec.model, "dflash2_stats", None)
+        if self.stats is None:
+            self.stats = dec.model.dflash2_stats = {"cycles": 0, "accepted": 0, "tokens": 0, "draft_ms": 0.0, "verify_ms": 0.0}
+
+    def _sync_to_state(self) -> None:
+        self.state.ck = self.dr.ck
+        self.state.cv = self.dr.cv
+        self.state.n = int(self.dr.n)
+
+    def _read_cpu_kv(self):
+        dec = self.dec
+        ring_vs = dec._ring_visits or tuple(v for v in range(dec.nv) if hasattr(dec.caches[0][v][0], "_idx"))
+        full_vs = dec._full_visits or dec._b1_full_unp_visits or tuple(
+            v for v in range(dec.nv) if not hasattr(dec.caches[0][v][0], "_idx")
+        )
+        if ring_vs:
+            kv_r = dec.caches[0][ring_vs[0]][0]
+            off_r, idx_r = int(kv_r.offset), int(kv_r._idx)
+        else:
+            off_r, idx_r = 0, 0
+        off_f = int(dec.caches[0][full_vs[0]][0].offset) if full_vs else 0
+        unp_len = int(dec._b1_full_unp_len) if getattr(dec, "_b1_unpacked_full", False) else -1
+        return off_r, idx_r, off_f, int(self.dr.n), unp_len
+
+    def _snap_rb(self, slot_r_expr, w_slots: int, need_ring: bool = True):
+        dec = self.dec
+        conv_bak = [list(cs) for cs in dec.conv]
+        pos_bak = ring_bak = None
+        if need_ring and dec._kv_stacked and dec._kv_ring is not None and dec._ring_visits:
+            max_size_r = int(dec.caches[0][dec._ring_visits[0]][0].max_size)
+            ar = self._cw_ar_cache.get(w_slots)
+            if ar is None:
+                ar = self._cw_ar_cache[w_slots] = mx.arange(w_slots, dtype=mx.int32)
+            pos_bak = (slot_r_expr + ar) % max_size_r
+            ring_bak = dec._kv_ring[:, :, :, pos_bak, :]
+        elif need_ring and not dec._kv_stacked:
+            ring_vs = [v for v in range(dec.nv) if hasattr(dec.caches[0][v][0], "_idx") and dec.caches[0][v][0]._packed is not None]
+            if ring_vs:
+                max_size_r = int(dec.caches[0][ring_vs[0]][0].max_size)
+                ar = self._cw_ar_cache.get(w_slots)
+                if ar is None:
+                    ar = self._cw_ar_cache[w_slots] = mx.arange(w_slots, dtype=mx.int32)
+                pos_bak = (slot_r_expr + ar) % max_size_r
+                ring_bak = ("per_visit", ring_vs, [dec.caches[0][v][0]._packed[:, :, pos_bak, :] for v in ring_vs])
+        return conv_bak, pos_bak, ring_bak
+
+    def _restore_kv_slices(self, conv_bak, pos_bak, ring_bak) -> None:
+        dec = self.dec
+        if conv_bak is not None:
+            dec.conv = [list(cs) for cs in conv_bak]
+        if pos_bak is not None and ring_bak is not None:
+            if isinstance(ring_bak, tuple) and ring_bak[0] == "per_visit":
+                _, ring_vs, slices = ring_bak
+                for v, sl in zip(ring_vs, slices):
+                    dec.caches[0][v][0]._packed[:, :, pos_bak, :] = sl
+            elif dec._kv_ring is not None:
+                dec._kv_ring[:, :, :, pos_bak, :] = ring_bak
+
+    def _flush_deferred(self) -> None:
+        if self.deferred_feats:
+            f_cat = self.deferred_feats[0] if len(self.deferred_feats) == 1 else mx.concatenate(self.deferred_feats, axis=1)
+            self.dr.append_ctx(f_cat)
+            self.deferred_feats.clear()
+            mx.async_eval(self.dr.ck, self.dr.cv)
+
+    def _pa_cost_for(self, w_val: int) -> mx.array:
+        if w_val <= 4:
+            return self.pa_cost_map[4]
+        if w_val <= 6:
+            return self.pa_cost_map[6]
+        return self.pa_cost_map[8]
+
+    def _draft_pa(self, anc_tok, w_val: int, p_arr):
+        if self.use_coupled:
+            u_d = mx.random.uniform(shape=(w_val - 1,), dtype=mx.float32)
+            return self.dr.draft_and_pack_coupled_gpu(anc_tok, w_val, u_d, self.draft_temp, pos_arr=p_arr)
+        return self.dr.draft_and_pack_gpu(
+            anc_tok, w_val, pos_arr=p_arr, use_tree=self.pa_tree, cost_arr=self._pa_cost_for(w_val), prior_cfg=self.pa_prior_cfg
+        )
+
+    def _can_launch_pa(self, w_launch: int):
+        dec = self.dec
+        dr = self.dr
+        hi_d = sum(item[7] for item in self.pa_queue)
+        lo_d = len(self.pa_queue)
+        if self.n + hi_d + w_launch > self.max_tokens or not dec._kv_stacked or dr.ck[0] is None:
+            return False, None
+        ok_b, binfo = dec._cw_safe_bounds_range(self.off_cpu + lo_d, self.off_cpu + hi_d, w_launch - 1)
+        if not ok_b:
+            return False, None
+        cap_r, cap_f, max_size_r = binfo[4], binfo[5], binfo[6]
+        if (
+            self.off_cpu + hi_d + w_launch > cap_f
+            or (cap_r < max_size_r and self.off_cpu + hi_d + w_launch > cap_r)
+            or dr.n + hi_d + w_launch + dr.block > int(dr.ck[0].shape[2])
+        ):
+            return False, None
+        return True, binfo
+
+    def _snapped_lookup_props(self, rem_now: int, w_base: int, in_pa: bool):
+        if self.lookup is None or _LOOKUP_BYPASS_MIN <= 0:
+            return None
+        l_len_now = self.lookup.match_len
+        if l_len_now < _LOOKUP_BYPASS_MIN:
+            return None
+        if _LOOKUP_W >= 16 and l_len_now >= max(_LOOKUP_BYPASS_MIN, _LOOKUP_W16_MIN) and rem_now >= 16:
+            p16 = self.lookup.proposals(15)
+            if len(p16) >= 15:
+                return p16[:15]
+        if not in_pa and w_base >= 2 and rem_now >= w_base:
+            pw = self.lookup.proposals(w_base - 1)
+            if len(pw) >= w_base - 1:
+                return pw[: w_base - 1]
+        return None
+
+    def _launch_pa_cycle(self, packed, meta_r, meta_f, dr_pos, binfo, ring_may_wrap, launch_next_draft=True, next_w=None):
+        from mlx_lm.models.inkling2.mtp import _feats_from_dict
+
+        dec = self.dec
+        dr = self.dr
+        if self.use_coupled:
+            blk_c, par_c, dep_c, ca_c, tm_c, q_ids, q_probs, q_child = packed
+            wa_c = None
+            w_c = int(blk_c.shape[0])
+            u_acc = mx.random.uniform(shape=(w_c - 1,), dtype=mx.float32)
+            coupled_arg = (q_ids, q_probs, q_child, u_acc)
+        elif self.pa_tree:
+            blk_c, par_c, dep_c, ca_c, tm_c, wa_c = packed
+            w_c = int(blk_c.shape[0])
+            coupled_arg = None
+        else:
+            blk_c, par_c, dep_c, ca_c, tm_c = packed
+            wa_c = None
+            w_c = int(blk_c.shape[0])
+            coupled_arg = None
+        walk_res, kv_news, conv_ws, tap_buf = dec.verify_w_gpu(
+            blk_c,
+            meta_r=meta_r,
+            meta_f=meta_f,
+            depths_arr=dep_c,
+            conv_anc=ca_c,
+            tree_meta=tm_c,
+            max_depth=w_c - 1,
+            binfo=binfo,
+            tau_cap=self.tau_cap,
+            tap_visits=self.tap_check,
+            par_arr=par_c,
+            dr_pos=dr_pos,
+            use_stage=False,
+            w_act=wa_c,
+            sampler=self.sampler,
+            coupled=coupled_arg,
+        )
+        ovf_c = None
+        if self.use_coupled:
+            walk_res, ovf_c = walk_res
+        (
+            path_pad, emitted, keep_arr, last_slot, anc_nxt,
+            slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
+        ) = walk_res
+        # Always snapshot rollback metadata so C=1->C>=2 handoff or early stop is 100% exact.
+        rb = self._snap_rb(slot_r_old, w_c, need_ring=ring_may_wrap)
+        eval_a = [
+            emitted, keep_arr, path_pad, last_slot, anc_nxt,
+            slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
+            *kv_news,
+        ]
+        if ovf_c is not None:
+            eval_a.append(ovf_c)
+        if rb is not None and rb[2] is not None:
+            eval_a.append(rb[2])
+        for cw in conv_ws:
+            eval_a.extend(cw)
+        eval_a.extend(tap_buf.values())
+        mx.async_eval(*eval_a)
+
+        dec.commit_w_gpu(
+            kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, w_c,
+            ring_may_wrap=ring_may_wrap,
+        )
+        f_w = _feats_from_dict(tap_buf, self.tap_keys)
+        f_pad = f_w[:, path_pad]
+        dr.append_ctx_gpu(f_pad, dr_pos_old)
+
+        eval_b = [*dec.kv_eval_targets()]
+        for cs in dec.conv:
+            eval_b.extend(cs)
+        eval_b.extend(dr.ck)
+        eval_b.extend(dr.cv)
+        if launch_next_draft:
+            wn = w_c if next_w is None else int(next_w)
+            packed_nxt = self._draft_pa(anc_nxt, wn, dr_pos_nxt)
+            eval_b.extend(packed_nxt)
+        else:
+            packed_nxt = None
+        mx.async_eval(*eval_b)
+        return (emitted, keep_arr, anc_nxt, meta_r_nxt, meta_f_nxt, dr_pos_nxt, packed_nxt, w_c, rb, ovf_c)
+
+    def _fill_pa_queue(self) -> None:
+        if not self.use_pipe_ahead:
+            return
+        want_lookup_bypass = (self.lookup_cd == 0) and (
+            self._snapped_lookup_props(self.max_tokens - self.n, self.pa_w_run, in_pa=True) is not None
+        )
+        if want_lookup_bypass:
+            return
+        dec = self.dec
+        dr = self.dr
+        if self.deferred_feats:
+            self._flush_deferred()
+            if not dec._kv_stacked:
+                dec.ensure_gpu_cap(min(self.max_tokens - self.n + 16, 4096))
+                self.off_cpu = int(dec.caches[0][0][0].offset)
+            dr._ensure_cap(dr.n + min(self.max_tokens - self.n + 32, 4096))
+        while len(self.pa_queue) < self.pa_depth:
+            qlen = len(self.pa_queue)
+            w_l = self.pa_w_run
+            if not self.pa_queue and dec._kv_stacked and dec._full_visits:
+                need_win = min(self.max_tokens - self.n + 16, 4096)
+                cap_f_now = int(dec._kv_full.shape[3])
+                cap_dr_now = 0 if dr.ck[0] is None else int(dr.ck[0].shape[2])
+                if self.off_cpu + w_l > cap_f_now:
+                    dec.ensure_gpu_cap(need_win)
+                    self.off_cpu = int(dec.caches[0][0][0].offset)
+                if dr.n + w_l + dr.block > cap_dr_now:
+                    dr._ensure_cap(dr.n + need_win + 16)
+                if self.off_cpu + w_l + 32 > self.tau_cap:
+                    self.tau_cap = ((self.off_cpu + need_win + 32 + 4095) // 4096) * 4096
+            ok_pa, binfo_pa = self._can_launch_pa(w_l)
+            if not ok_pa:
+                break
+            if qlen == 0:
+                if self.pa_packed is None or self.pa_packed_w != w_l:
+                    self.pa_packed = self._draft_pa(self.anchor, w_l, FD._wpos(dr.n))
+                    self.pa_packed_w = w_l
+                meta_r0, meta_f0 = dec.get_gpu_meta(staged=False)
+                dr_pos0 = FD._wpos(dr.n)
+                lnxt = (self.pa_depth >= 2) and (self.n + 2 * w_l <= self.max_tokens)
+                self.pa_queue.append(
+                    self._launch_pa_cycle(
+                        self.pa_packed, meta_r0, meta_f0, dr_pos0, binfo_pa,
+                        ring_may_wrap=(self.off_cpu + w_l > binfo_pa[6]),
+                        launch_next_draft=lnxt,
+                        next_w=w_l,
+                    )
+                )
+                self.pa_packed = None
+                self.pa_packed_w = 0
+            else:
+                prev = self.pa_queue[-1]
+                p_nxt = prev[6]
+                if p_nxt is None or int(p_nxt[0].shape[0]) != w_l:
+                    break
+                hi_d = sum(item[7] for item in self.pa_queue)
+                lnxt = (self.n + hi_d + 2 * w_l <= self.max_tokens)
+                self.pa_queue.append(
+                    self._launch_pa_cycle(
+                        p_nxt, prev[3], prev[4], prev[5], binfo_pa,
+                        ring_may_wrap=(self.off_cpu + hi_d + w_l > binfo_pa[6]),
+                        launch_next_draft=lnxt,
+                        next_w=w_l,
+                    )
+                )
+
+    def prefetch(self) -> None:
+        """Optionally enqueue the first pipe-ahead cycle asynchronously right after emitting token 0."""
+        self._fill_pa_queue()
+
+    def _ar_step(self) -> list[int]:
+        from mlx_lm.models.inkling2.mtp import _feats_from_dict
+
+        cpu_pre = self._read_cpu_kv() if self.track_cache_rb else None
+        prev_anc = self.anchor_int
+        y_cur, tp = self.dec.step_with_taps(self.anchor, tap_visits=self.tap_set, sampler=self.sampler)
+        f1 = _feats_from_dict(tp, self.tap_keys)
+        mx.eval(y_cur)
+        mx.async_eval(*self.dec.kv_eval_targets(), self.dec.conv, f1)
+        self.deferred_feats.append(f1)
+        tok = int(y_cur.item())
+        self.anchor = y_cur.reshape(1).astype(mx.uint32)
+        self.anchor_int = tok
+        self.off_cpu = int(self.dec.caches[0][0][0].offset)
+        if self.lookup is not None:
+            self.lookup.append_one(tok)
+        self.n += 1
+        self.stats["cycles"] += 1
+        self.stats["tokens"] += 1
+        self.last_popped_rb = None
+        self.last_popped_tokens = [prev_anc]
+        self._sync_to_state()
+        return [tok]
+
+    def step(self) -> list[int]:
+        """Execute one speculative (or tail AR) cycle and return `1..keep` verified new token IDs."""
+        from mlx_lm.models.inkling2.batchdecode import build_tree_tables
+        from mlx_lm.models.inkling2.mtp import _feats_from_dict
+
+        dec = self.dec
+        dr = self.dr
+        self._fill_pa_queue()
+
+        if self.pa_queue:
+            emitted_c, keep_arr_c, anc_nxt, _, _, _, p_nxt, _, rb_c, ovf_c = self.pa_queue.popleft()
+            if ovf_c is not None:
+                mx.eval(emitted_c, keep_arr_c, ovf_c)
+                if int(mx.max(ovf_c).item()) != 0:
+                    for item in reversed(self.pa_queue):
+                        if item[8] is not None:
+                            self._restore_kv_slices(*item[8])
+                    self.pa_queue.clear()
+                    if rb_c is not None:
+                        self._restore_kv_slices(*rb_c)
+                    self.pa_packed = None
+                    self.pa_packed_w = 0
+                    self.use_coupled = False
+                    self.pa_tree = True
+                    return self._ar_step()
+            else:
+                mx.eval(emitted_c, keep_arr_c)
+            keep = int(keep_arr_c.item())
+            em = emitted_c.tolist()[:keep]
+            if self.track_cache_rb:
+                self.last_popped_rb = (self._read_cpu_kv(), *rb_c)
+                self.last_popped_tokens = [self.anchor_int] + (em[: keep - 1] if keep > 1 else [])
+            dec.sync_kv_offsets(keep, staged=False)
+            dr.n += keep
+            self.off_cpu += keep
+            self.n += keep
+            self.stats["cycles"] += 1
+            self.stats["accepted"] += keep - 1
+            self.stats["tokens"] += keep
+            if self.lookup is not None:
+                for tok_e in em:
+                    self.lookup.append_one(tok_e)
+            if self.lookup_cd > 0:
+                self.lookup_cd -= 1
+            if self.pa_adapt:
+                self.pa_ema_tpc = 0.72 * self.pa_ema_tpc + 0.28 * keep
+                if self.W_cfg >= 8 and self.pa_w_run == 6 and self.pa_ema_tpc >= self.pa_promote:
+                    self.pa_w_run = 8
+                elif self.pa_w_run == 8 and self.pa_ema_tpc < self.pa_demote:
+                    self.pa_w_run = 6
+                elif self.pa_demote4 > 0.0 and self.W_cfg >= 6 and self.pa_w_run == 6 and self.pa_ema_tpc < self.pa_demote4:
+                    self.pa_w_run = 4
+                elif self.pa_w_run == 4 and self.pa_ema_tpc >= self.pa_promote4:
+                    self.pa_w_run = min(self.W_cfg, 6)
+            self.anchor_int = int(em[keep - 1])
+            if not self.pa_queue:
+                self.anchor = anc_nxt
+                self.pa_packed = p_nxt
+                self.pa_packed_w = int(p_nxt[0].shape[0]) if p_nxt is not None else 0
+            # Keep GPU busy while vllm-mlx streams this burst!
+            if self.n < self.max_tokens:
+                self._fill_pa_queue()
+            self._sync_to_state()
+            return em
+
+        # Non-PA path: W=16 LookupIndex bypass or short tail near max_tokens.
+        self.pa_packed = None
+        self.pa_packed_w = 0
+        rem = self.max_tokens - self.n
+        w_cur = max(1, min(self.W_cfg, dr.block, rem))
+        l_len = self.lookup.match_len if self.lookup is not None else 0
+        byp_props = self._snapped_lookup_props(rem, self.pa_w_run if self.use_pipe_ahead else w_cur, in_pa=self.use_pipe_ahead)
+        l_props = (
+            byp_props
+            if byp_props is not None
+            else (self.lookup.proposals(w_cur - 1) if (self.lookup is not None and l_len >= LookupIndex.MIN_MATCH) else [])
+        )
+        if w_cur == 1 or (not self.is_greedy and not self.use_coupled and byp_props is None):
+            return self._ar_step()
+
+        # Non-PA coupled temp>0 speculative path (e.g. C=1 at 128K..1M unpacked full KV).
+        if not self.is_greedy and self.use_coupled and byp_props is None:
+            self._flush_deferred()
+            self._sync_to_state()
+            blk_c, q_ids_c, q_probs_c = dr.draft_batch_chains_coupled(
+                [self.state], [self.anchor_int], w_cur, temp=self.draft_temp
+            )
+            h_out, kv_news, conv_ws, tap_buf = dec.verify_w(
+                blk_c[0], tap_visits=self.tap_check, return_h_out=True
+            )
+            keeps_raw, next_ancs = _coupled_verify_chains(
+                dec.model, h_out, blk_c, q_ids_c, q_probs_c, self.sampler
+            )
+            keep = int(keeps_raw[0])
+            bonus_tok = int(next_ancs[0])
+            bl = blk_c[0].tolist()
+            em = [int(bl[j]) for j in range(1, keep)] + [bonus_tok]
+            if self.track_cache_rb:
+                ring_vs = dec._ring_visits or tuple(v for v in range(dec.nv) if hasattr(dec.caches[0][v][0], "_idx"))
+                if ring_vs:
+                    kv_r0 = dec.caches[0][ring_vs[0]][0]
+                    max_size_r = int(kv_r0.max_size)
+                    slot_r0 = 0 if int(kv_r0._idx) == max_size_r else int(kv_r0._idx)
+                    need_ring = (self.off_cpu + keep) > max_size_r
+                else:
+                    slot_r0, need_ring = 0, False
+                rb_np = self._snap_rb(slot_r0, keep, need_ring=need_ring)
+                self.last_popped_rb = (self._read_cpu_kv(), *rb_np)
+                self.last_popped_tokens = [int(bl[j]) for j in range(keep)]
+            dec.commit_w(kv_news, conv_ws, keep)
+            self.off_cpu = int(dec.caches[0][0][0].offset)
+            f_w = _feats_from_dict(tap_buf, self.tap_keys)
+            dr.append_ctx(f_w[:, :keep])
+            self.anchor = mx.array([bonus_tok], mx.uint32)
+            self.anchor_int = bonus_tok
+            self.n += keep
+            self.stats["cycles"] += 1
+            self.stats["accepted"] += keep - 1
+            self.stats["tokens"] += keep
+            if self.lookup is not None:
+                for tok_e in em:
+                    self.lookup.append_one(tok_e)
+            mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv)
+            self._sync_to_state()
+            return em
+
+        did_lookup_bypass = byp_props is not None
+        if not did_lookup_bypass:
+            self._flush_deferred()
+        if did_lookup_bypass:
+            toks_lp = [self.anchor_int] + byp_props
+            blk = mx.array(toks_lp, mx.int32)
+            parents = tuple(range(-1, len(toks_lp) - 1))
+            depths = tuple(range(len(toks_lp)))
+            raw_probs = [-1.0] * len(toks_lp)
+        else:
+            if self.use_budget or self.use_tree or l_props:
+                blk, parents, depths, raw_probs = dr.draft_hybrid_tree(
+                    self.anchor,
+                    w_max=w_cur,
+                    budget=self.budget,
+                    step_costs=self.costs,
+                    lookup_props=l_props,
+                    lookup_len=l_len,
+                    use_tree=self.use_tree,
+                )
+            else:
+                blk = dr.draft_chain(self.anchor, width=w_cur)
+                parents = tuple(range(-1, w_cur - 1))
+                depths = tuple(range(w_cur))
+                raw_probs = [-1.0] * w_cur
+        if blk is None:
+            return self._ar_step()
+
+        w_act = len(parents)
+        is_tree = parents != tuple(range(-1, w_act - 1))
+        if is_tree:
+            _, ca, tm_tbl = build_tree_tables(parents, depths)
+            t, kv_news, conv_ws, tap_buf = dec.verify_w(
+                blk, tap_visits=self.tap_check, parents=parents, depths=depths, conv_anc=ca, tree_meta=tm_tbl,
+                sampler=self.sampler,
+            )
+        else:
+            t, kv_news, conv_ws, tap_buf = dec.verify_w(blk, tap_visits=self.tap_check, sampler=self.sampler)
+        mx.eval(t)
+        tl = t.tolist()
+        bl = blk.tolist()
+        if self.budget is not None:
+            self.budget.observe(parents, depths, raw_probs, bl, tl)
+
+        children = [[] for _ in range(w_act)]
+        for s in range(1, w_act):
+            children[parents[s]].append((s, bl[s]))
+        path = [0]
+        cur_slot = 0
+        while True:
+            target_tok = tl[cur_slot]
+            matched = None
+            for c_slot, c_tok in children[cur_slot]:
+                if c_tok == target_tok:
+                    matched = c_slot
+                    break
+            if matched is None:
+                bonus_tok = target_tok
+                break
+            path.append(matched)
+            cur_slot = matched
+        keep = len(path)
+        em = [int(bl[path[j]]) for j in range(1, keep)] + [int(bonus_tok)]
+
+        if self.track_cache_rb:
+            ring_vs = dec._ring_visits or tuple(v for v in range(dec.nv) if hasattr(dec.caches[0][v][0], "_idx"))
+            if ring_vs:
+                kv_r0 = dec.caches[0][ring_vs[0]][0]
+                max_size_r = int(kv_r0.max_size)
+                slot_r0 = 0 if int(kv_r0._idx) == max_size_r else int(kv_r0._idx)
+                need_ring = (self.off_cpu + keep) > max_size_r
+            else:
+                slot_r0 = 0
+                need_ring = False
+            rb_np = self._snap_rb(slot_r0, keep, need_ring=need_ring)
+            if rb_np[2] is not None and not (isinstance(rb_np[2], tuple) and rb_np[2][0] == "per_visit"):
+                mx.async_eval(rb_np[2])
+            self.last_popped_rb = (self._read_cpu_kv(), *rb_np)
+            self.last_popped_tokens = [int(bl[path[j]]) for j in range(keep)]
+
+        dec.commit_w(kv_news, conv_ws, keep, path=path)
+        self.off_cpu = int(dec.caches[0][0][0].offset)
+        f_w = _feats_from_dict(tap_buf, self.tap_keys)
+        f_keep = f_w[:, :keep] if path == list(range(keep)) else f_w[:, mx.array(path, mx.int32)]
+        self.anchor = t[cur_slot : cur_slot + 1].reshape(1).astype(mx.uint32)
+        self.anchor_int = int(bonus_tok)
+        self.n += keep
+        self.stats["cycles"] += 1
+        self.stats["accepted"] += keep - 1
+        self.stats["tokens"] += keep
+        if self.lookup is not None:
+            for tok_e in em:
+                self.lookup.append_one(tok_e)
+        if did_lookup_bypass and keep < 6:
+            self.lookup_cd = 8
+        if did_lookup_bypass and self.lookup_cd == 0 and self._snapped_lookup_props(self.max_tokens - self.n, self.pa_w_run, in_pa=True) is not None:
+            self.deferred_feats.append(f_keep)
+            mx.async_eval(*dec.kv_eval_targets(), dec.conv, f_keep)
+        else:
+            if self.deferred_feats:
+                self.deferred_feats.append(f_keep)
+                self._flush_deferred()
+            else:
+                dr.append_ctx(f_keep)
+            mx.async_eval(*dec.kv_eval_targets(), dec.conv, dr.ck, dr.cv)
+        self._sync_to_state()
+        return em
+
+    def rollback_unemitted(self) -> None:
+        """Roll back any in-flight unemitted pipe-ahead cycles so `dec` matches emitted tokens exactly."""
+        for item in reversed(self.pa_queue):
+            rb = item[8]
+            if rb is not None:
+                self._restore_kv_slices(*rb)
+        self.pa_queue.clear()
+        self.pa_packed = None
+        self.pa_packed_w = 0
+        self._sync_to_state()
+
+    def finalize_exact_cache(self, *, emitted_kept: int, total_in_burst: int, em_burst: list[int]) -> None:
+        """Roll back unemitted cycles + any overshot tokens in the final burst, then commit exact yielded tail."""
+        self.rollback_unemitted()
+        dec = self.dec
+        if emitted_kept < total_in_burst and self.last_popped_rb is not None:
+            cpu_pre, conv_bak, pos_bak, ring_bak = self.last_popped_rb
+            off_r, idx_r, off_f, dr_n0, unp_len0 = cpu_pre
+            self._restore_kv_slices(conv_bak, pos_bak, ring_bak)
+            ring_vs = dec._ring_visits or tuple(v for v in range(dec.nv) if hasattr(dec.caches[0][v][0], "_idx"))
+            full_vs = dec._full_visits or dec._b1_full_unp_visits or tuple(
+                v for v in range(dec.nv) if not hasattr(dec.caches[0][v][0], "_idx")
+            )
+            for v in ring_vs:
+                kv = dec.caches[0][v][0]
+                kv.offset = off_r
+                kv._idx = idx_r
+            for v in full_vs:
+                dec.caches[0][v][0].offset = off_f
+            if unp_len0 >= 0 and getattr(dec, "_b1_unpacked_full", False):
+                dec._b1_full_unp_len = unp_len0
+            self.dr.n = dr_n0
+            dec.unstack_kv()
+            # Replay [prev_anchor] + em_burst[:emitted_kept] via BatchDecoder.step() so KV/conv are bit-exact with AR.
+            replay = [self.last_popped_tokens[0]] + em_burst[:emitted_kept]
+            for tid in replay:
+                y = dec.step(mx.array([tid], mx.uint32))
+                mx.eval(y)
+            dec.flush()
+            mx.eval([c.state for c in dec.caches[0]])
+        else:
+            # All tokens in burst were emitted; feed the final anchor token via BatchDecoder.step()!
+            dec.unstack_kv()
+            y = dec.step(mx.array([self.anchor_int], mx.uint32))
+            mx.eval(y)
+            dec.flush()
+            mx.eval([c.state for c in dec.caches[0]])
+        self._sync_to_state()
+
+    def discard(self) -> None:
+        """Fast teardown when caller does not need completion cache (0ms flush)."""
+        self.pa_queue.clear()
+        self.pa_packed = None
+        self.pa_packed_w = 0
+        self.deferred_feats.clear()
+        self._sync_to_state()
+
+    def handoff_to_ar(self, *, need_next_token: bool = True) -> mx.array | None:
+        """Restore exact committed KV/conv state, unstack KV, and produce `next_tokens` matching AR invariant."""
+        self.rollback_unemitted()
+        self._flush_deferred()
+        dec = self.dec
+        dec.unstack_kv()
+        if not need_next_token:
+            self._sync_to_state()
+            return None
+        anc = mx.array([self.anchor_int], dtype=mx.uint32)
+        if self.is_greedy:
+            nxt = dec.step(anc)
+        elif dec.can_fast_sample(self.sampler):
+            nxt = dec.sample_step(anc, self.sampler)
+        else:
+            lp = dec.logprobs(dec._hidden_pair(anc))
+            nxt = self.sampler(lp).astype(mx.uint32)
+        mx.async_eval(nxt)
+        self._sync_to_state()
+        return nxt

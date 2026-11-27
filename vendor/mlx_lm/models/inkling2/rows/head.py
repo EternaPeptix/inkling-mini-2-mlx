@@ -15,6 +15,7 @@ __all__ = [
     "softcap_logprobs_rows",
     "softcap_lse_rows",
     "softcap_sample_rows",
+    "softcap_sample_rows_nosync",
     "softcap_coupled_verify_rows",
 ]
 
@@ -849,7 +850,12 @@ _SAMP_SRAM_P2_SRC = r"""
         float cum = 0.0f;
         for (int i = 0; i < n; i++) {
           cum += metal::fast::exp(lps[i]);
-          if (cum >= TOPP) { k_cut = i + 1; break; }
+          if (cum >= TOPP) {
+            float thr_lp = lps[i];
+            k_cut = i + 1;
+            while (k_cut < n && lps[k_cut] >= thr_lp) k_cut++;
+            break;
+          }
         }
       }
       k_cut_tg = k_cut;
@@ -942,6 +948,250 @@ _SAMP_SRAM_P2_SRC = r"""
 """
 
 
+_SAMP_PURE_P1_SRC = r"""
+    GL_NOFMA
+    const float INVT = s_cfg[2];
+    uint sp = threadgroup_position_in_grid.x;
+    uint b = threadgroup_position_in_grid.y;
+    uint lid = thread_position_in_threadgroup.x;
+    uint lane = lid & 31, sg = lid >> 5;
+    const uint seed0 = seeds[b * 2 + 0];
+    const uint seed1 = seeds[b * 2 + 1];
+    auto hash_u01 = [](uint k0, uint k1, uint idx) -> float {
+      uint x = idx ^ k0;
+      x *= 0x7feb352du;
+      x ^= x >> 15;
+      x += k1;
+      x *= 0x846ca68bu;
+      x ^= x >> 16;
+      return clamp((float(x & 0xFFFFFFu) + 0.5f) * 5.960464477539063e-8f, 1e-7f, 1.0f - 1e-7f);
+    };
+    const device bfloat16_t* row = logits + size_t(b) * PP;
+    const int chunk = (((VV + SP - 1) / SP) + 7) & ~7;
+    const int s0 = int(sp) * chunk;
+    const int s1 = min(VV, s0 + chunk);
+    float bsc = -INFINITY;
+    uint bid = 0xFFFFFFFFu;
+    if constexpr ((PP & 7) == 0) {
+      int i = s0 + int(lid) * 8;
+      for (; i + 8 <= s1; i += TG * 8) {
+        uint4 pk = ((const device uint4*)(row + i))[0];
+        bfloat4 v0 = as_type<bfloat4>(pk.xy), v1 = as_type<bfloat4>(pk.zw);
+        bfloat16_t bs[8] = { v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w };
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+          uint idx = uint(i + k);
+          float u = hash_u01(seed0, seed1, idx);
+          float sc = head_sc<HAS_SC>(bs[k], SC) * INVT - metal::log(-metal::log(u));
+          if (sc > bsc || (sc == bsc && idx < bid)) { bsc = sc; bid = idx; }
+        }
+      }
+      for (; i < s1; i++) {
+        uint idx = uint(i);
+        float u = hash_u01(seed0, seed1, idx);
+        float sc = head_sc<HAS_SC>(row[i], SC) * INVT - metal::log(-metal::log(u));
+        if (sc > bsc || (sc == bsc && idx < bid)) { bsc = sc; bid = idx; }
+      }
+    } else {
+      for (int i = s0 + int(lid); i < s1; i += TG) {
+        uint idx = uint(i);
+        float u = hash_u01(seed0, seed1, idx);
+        float sc = head_sc<HAS_SC>(row[i], SC) * INVT - metal::log(-metal::log(u));
+        if (sc > bsc || (sc == bsc && idx < bid)) { bsc = sc; bid = idx; }
+      }
+    }
+    for (uint d = 16u; d > 0u; d >>= 1) {
+      float osc = simd_shuffle_down(bsc, d);
+      uint oid = simd_shuffle_down(bid, d);
+      if (osc > bsc || (osc == bsc && oid < bid)) { bsc = osc; bid = oid; }
+    }
+    threadgroup float sb[8];
+    threadgroup uint si[8];
+    if (lane == 0u) { sb[sg] = bsc; si[sg] = bid; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+      float fv = -INFINITY;
+      uint fi = 0xFFFFFFFFu;
+      if (lane < TG / 32u) { fv = sb[lane]; fi = si[lane]; }
+      for (uint d = 16u; d > 0u; d >>= 1) {
+        float ov = simd_shuffle_down(fv, d);
+        uint oi = simd_shuffle_down(fi, d);
+        if (ov > fv || (ov == fv && oi < fi)) { fv = ov; fi = oi; }
+      }
+      if (lane == 0u) {
+        size_t o = size_t(b) * SP + sp;
+        pval[o] = fv;
+        pidx[o] = fi;
+      }
+    }
+"""
+
+_SAMP_PURE_P2_SRC = r"""
+    uint b = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    float fv = -INFINITY;
+    uint fi = 0xFFFFFFFFu;
+    for (int i = int(lane); i < SP; i += 32) {
+      size_t o = size_t(b) * SP + uint(i);
+      float ov = pval[o];
+      uint oi = pidx[o];
+      if (ov > fv || (ov == fv && oi < fi)) { fv = ov; fi = oi; }
+    }
+    for (uint d = 16u; d > 0u; d >>= 1) {
+      float ov = simd_shuffle_down(fv, d);
+      uint oi = simd_shuffle_down(fi, d);
+      if (ov > fv || (ov == fv && oi < fi)) { fv = ov; fi = oi; }
+    }
+    if (lane == 0u) out[b] = fi;
+"""
+
+_SAMP_SRAM_P2_FB_SRC = r"""
+    GL_NOFMA
+    const float TOPP = s_cfg[0];
+    const float MINP = s_cfg[1];
+    const float INVT = s_cfg[2];
+    uint b = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+
+    const uint seed0 = seeds[b * 2 + 0];
+    const uint seed1 = seeds[b * 2 + 1];
+    auto hash_u01 = [](uint k0, uint k1, uint idx) -> float {
+      uint x = idx ^ k0;
+      x *= 0x7feb352du;
+      x ^= x >> 15;
+      x += k1;
+      x *= 0x846ca68bu;
+      x ^= x >> 16;
+      return clamp((float(x & 0xFFFFFFu) + 0.5f) * 5.960464477539063e-8f, 1e-7f, 1.0f - 1e-7f);
+    };
+
+    float mass_loc = 0.0f;
+    uint cnt_loc = 0u;
+    uint ovf_loc = 0u;
+    for (int s = int(lane); s < SP; s += 32) {
+      mass_loc += mass_part[size_t(b) * SP + s];
+      uint cs = c_cnt[size_t(b) * SP + s];
+      if (cs > uint(MAX_CSP)) { ovf_loc = 1u; cs = uint(MAX_CSP); }
+      cnt_loc += cs;
+    }
+    float tot_mass = simd_sum(mass_loc);
+    int total_c = int(simd_sum(cnt_loc));
+    bool ovf = (simd_sum(ovf_loc) != 0u);
+    if (ovf || total_c > MAX_TOT || total_c == 0 || (USE_TOPP && tot_mass < TOPP)) {
+      // Exact 0-sync GPU fallback directly over bf16 logits (triggers on <0.1% high-entropy rows).
+      float gmv = gmax[b * 32 + lane];
+      float gm = simd_max(gmv);
+      float nn = gnrm[b * 32 + lane] * metal::fast::exp(gmv - gm);
+      float tot = simd_sum(nn);
+      float sub = metal::isinf(gm) ? gm : (metal::log(tot) + gm);
+      float lp_max = gm - sub;
+      const device bfloat16_t* row = logits + size_t(b) * PP;
+
+      float thr = (MINP > 0.0f) ? (lp_max + metal::log(MINP)) : -1e30f;
+      if constexpr (USE_TOPP) {
+        float lmin = lp_max;
+        for (int i = int(lane); i < VV; i += 32) {
+          float lp = head_sc<HAS_SC>(row[i], SC) - sub;
+          if (lp < lmin) lmin = lp;
+        }
+        lmin = simd_min(lmin);
+        float lo = lmin, hi = lp_max;
+        for (int it = 0; it < 26; it++) {
+          float mid = 0.5f * (lo + hi);
+          float m_loc = 0.0f;
+          for (int i = int(lane); i < VV; i += 32) {
+            float lp = head_sc<HAS_SC>(row[i], SC) - sub;
+            if (lp >= mid) m_loc += metal::fast::exp(lp);
+          }
+          float m_sum = simd_sum(m_loc);
+          if (m_sum >= TOPP) lo = mid;
+          else hi = mid;
+        }
+        if (lo > thr) thr = lo;
+      }
+      if (thr > lp_max) thr = lp_max;
+
+      float best_sc = -INFINITY;
+      uint best_id = 0u;
+      for (int i = int(lane); i < VV; i += 32) {
+        float lp = head_sc<HAS_SC>(row[i], SC) - sub;
+        if (lp >= thr) {
+          float u = hash_u01(seed0, seed1, uint(i));
+          float sc = (lp - lp_max) * INVT - metal::log(-metal::log(u));
+          if (sc > best_sc || (sc == best_sc && uint(i) < best_id)) { best_sc = sc; best_id = uint(i); }
+        }
+      }
+      for (uint d = 16u; d > 0u; d >>= 1) {
+        float osc = simd_shuffle_down(best_sc, d);
+        uint oid = simd_shuffle_down(best_id, d);
+        if (osc > best_sc || (osc == best_sc && oid < best_id)) { best_sc = osc; best_id = oid; }
+      }
+      if (lane == 0u) out_bonus[b] = best_id;
+      return;
+    }
+
+    threadgroup float lps[MAX_TOT];
+    threadgroup uint ids[MAX_TOT];
+    threadgroup int k_cut_tg;
+    if (lane == 0u) {
+      int n = 0;
+      for (int s = 0; s < SP; s++) {
+        uint cnt_s = min(uint(MAX_CSP), c_cnt[size_t(b) * SP + s]);
+        size_t src_base = (size_t(b) * SP + s) * MAX_CSP;
+        for (uint j = 0; j < cnt_s; j++) {
+          lps[n] = cand_lp[src_base + j];
+          ids[n] = cand_id[src_base + j];
+          n++;
+        }
+      }
+      for (int i = 1; i < n; i++) {
+        float kl = lps[i];
+        uint ki = ids[i];
+        int j = i - 1;
+        while (j >= 0 && lps[j] < kl) {
+          lps[j + 1] = lps[j];
+          ids[j + 1] = ids[j];
+          j--;
+        }
+        lps[j + 1] = kl;
+        ids[j + 1] = ki;
+      }
+      int k_cut = n;
+      if (USE_TOPP) {
+        float cum = 0.0f;
+        for (int i = 0; i < n; i++) {
+          cum += metal::fast::exp(lps[i]);
+          if (cum >= TOPP) {
+            float thr_lp = lps[i];
+            k_cut = i + 1;
+            while (k_cut < n && lps[k_cut] >= thr_lp) k_cut++;
+            break;
+          }
+        }
+      }
+      k_cut_tg = k_cut;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int k_cut = k_cut_tg;
+    const float lp_max = lps[0];
+    float best_b_sc = -INFINITY;
+    uint best_b_id = ids[0];
+    for (int i = int(lane); i < k_cut; i += 32) {
+      uint id_i = ids[i];
+      float u = hash_u01(seed0, seed1, id_i);
+      float sc_b = (lps[i] - lp_max) * INVT - metal::log(-metal::log(u));
+      if (sc_b > best_b_sc || (sc_b == best_b_sc && id_i < best_b_id)) { best_b_sc = sc_b; best_b_id = id_i; }
+    }
+    for (uint d = 16u; d > 0u; d >>= 1) {
+      float ob_sc = simd_shuffle_down(best_b_sc, d);
+      uint ob_id = simd_shuffle_down(best_b_id, d);
+      if (ob_sc > best_b_sc || (ob_sc == best_b_sc && ob_id < best_b_id)) { best_b_sc = ob_sc; best_b_id = ob_id; }
+    }
+    if (lane == 0u) out_bonus[b] = best_b_id;
+"""
+
+
 def _get_samp(kind, has_sc=False, sc_lit="1.0f"):
     key = ("samp", kind, has_sc, sc_lit)
     k = _kernels.get(key)
@@ -961,6 +1211,24 @@ def _get_samp(kind, has_sc=False, sc_lit="1.0f"):
             input_names=["cand_lp", "cand_id", "mass_part", "c_cnt", "seeds", "s_cfg", "q_ids", "q_probs", "child_toks"],
             output_names=["out_bonus", "out_reject", "child_pt", "overflow"],
             source=_SAMP_SRAM_P2_SRC, header=_HEAD_HEADER, ensure_row_contiguous=True)
+    elif kind == "sram_p2_fb":
+        k = mx.fast.metal_kernel(
+            name=f"head_samp_sram_p2_fb_{int(has_sc)}_{h}",
+            input_names=["cand_lp", "cand_id", "mass_part", "c_cnt", "seeds", "s_cfg", "logits", "gmax", "gnrm"],
+            output_names=["out_bonus"],
+            source=sc_def + _SAMP_SRAM_P2_FB_SRC, header=_HEAD_HEADER, ensure_row_contiguous=True)
+    elif kind == "pure_p1":
+        k = mx.fast.metal_kernel(
+            name=f"head_samp_pure_p1_{int(has_sc)}_{h}",
+            input_names=["logits", "seeds", "s_cfg"],
+            output_names=["pval", "pidx"],
+            source=sc_def + _SAMP_PURE_P1_SRC, header=_HEAD_HEADER, ensure_row_contiguous=True)
+    elif kind == "pure_p2":
+        k = mx.fast.metal_kernel(
+            name="head_samp_pure_p2",
+            input_names=["pval", "pidx"],
+            output_names=["out"],
+            source=_SAMP_PURE_P2_SRC, header=_HEAD_HEADER, ensure_row_contiguous=True)
     _kernels[key] = k
     return k
 
@@ -970,10 +1238,7 @@ _DUMMY_SAMP_U32 = mx.zeros((256,), mx.uint32)
 _DUMMY_SAMP_F32 = mx.zeros((256,), mx.float32)
 
 
-def _run_sample_core(logits, softcap, unpadded_vocab, *, temp, top_p=1.0, min_p=0.0, seeds=None, coupled=False, q_ids=None, q_probs=None, child_toks=None):
-    logits, B, P, V = _norm_logits(logits, unpadded_vocab)
-    has_sc = softcap is not None and float(softcap) > 0.0
-    sc_lit = flit(float(softcap)) if has_sc else "1.0f"
+def _get_samp_cfg(top_p, min_p, temp):
     inv_t = 1.0 / max(float(temp), 1e-6)
     use_topp = 0.0 < float(top_p) < 1.0
     tp_val = float(top_p) if use_topp else 1.0
@@ -984,6 +1249,14 @@ def _run_sample_core(logits, softcap, unpadded_vocab, *, temp, top_p=1.0, min_p=
         if len(_SAMP_CFG_CACHE) >= 64:
             _SAMP_CFG_CACHE.clear()
         s_cfg = _SAMP_CFG_CACHE[ckey] = mx.array([tp_val, mp_val, inv_t], mx.float32)
+    return s_cfg, use_topp, mp_val
+
+
+def _run_sample_core(logits, softcap, unpadded_vocab, *, temp, top_p=1.0, min_p=0.0, seeds=None, coupled=False, q_ids=None, q_probs=None, child_toks=None):
+    logits, B, P, V = _norm_logits(logits, unpadded_vocab)
+    has_sc = softcap is not None and float(softcap) > 0.0
+    sc_lit = flit(float(softcap)) if has_sc else "1.0f"
+    s_cfg, use_topp, _ = _get_samp_cfg(top_p, min_p, temp)
     if seeds is None:
         seeds = mx.random.randint(0, 0x7FFFFFFF, (B, 2), dtype=mx.int32).astype(mx.uint32)
 
@@ -1032,6 +1305,70 @@ def _run_sample_core(logits, softcap, unpadded_vocab, *, temp, top_p=1.0, min_p=
 def softcap_sample_rows(logits, softcap, unpadded_vocab=None, *, temp=1.0, top_p=1.0, min_p=0.0, seeds=None):
     """Fused GPU softcap + lse + sparse-nucleus top-p + Gumbel-max returning `(toks (B,) u32, overflow (B,) u32)`."""
     return _run_sample_core(logits, softcap, unpadded_vocab, temp=temp, top_p=top_p, min_p=min_p, seeds=seeds, coupled=False)
+
+
+def softcap_sample_rows_nosync(logits, softcap, unpadded_vocab=None, *, temp=1.0, top_p=1.0, min_p=0.0, seeds=None):
+    """Zero-sync fused GPU exact-distribution sampler returning `(B,) uint32` (never requires CPU overflow check)."""
+    logits, B, P, V = _norm_logits(logits, unpadded_vocab)
+    has_sc = softcap is not None and float(softcap) > 0.0
+    sc_lit = flit(float(softcap)) if has_sc else "1.0f"
+    s_cfg, use_topp, mp_val = _get_samp_cfg(top_p, min_p, temp)
+    if seeds is None:
+        seeds = mx.random.randint(0, 0x7FFFFFFF, (B, 2), dtype=mx.int32).astype(mx.uint32)
+    sp = 80 if B == 1 else max(16, 80 // B)
+    tg = 128
+
+    if not use_topp and mp_val <= 0.0:
+        kp1 = _get_samp("pure_p1", has_sc, sc_lit)
+        pv, pi = kp1(
+            inputs=[logits, seeds, s_cfg],
+            template=[("HAS_SC", has_sc), ("PP", P), ("VV", V), ("SP", sp), ("TG", tg)],
+            grid=(sp * tg, B, 1),
+            threadgroup=(tg, 1, 1),
+            output_shapes=[(B, sp), (B, sp)],
+            output_dtypes=[mx.float32, mx.uint32],
+        )
+        kp2 = _get_samp("pure_p2")
+        (out,) = kp2(
+            inputs=[pv, pi],
+            template=[("SP", sp)],
+            grid=(B * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(B,)],
+            output_dtypes=[mx.uint32],
+        )
+        return out
+
+    kl = _get("lse32", has_sc, sc_lit)
+    gmax, gnrm = kl(
+        inputs=[logits],
+        template=[("HAS_SC", has_sc), ("PP", P), ("VV", V)],
+        grid=(32 * 32, B, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, 32), (B, 32)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    max_csp = 128
+    max_tot = 1536
+    ks1 = _get_samp("sparse_p1", has_sc, sc_lit)
+    cand_lp, cand_id, mass_part, c_cnt, _ = ks1(
+        inputs=[logits, gmax, gnrm, s_cfg],
+        template=[("HAS_SC", has_sc), ("PP", P), ("VV", V), ("SP", sp), ("TG", tg), ("MAX_CSP", max_csp)],
+        grid=(sp * tg, B, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(B, sp, max_csp), (B, sp, max_csp), (B, sp), (B, sp), (B,)],
+        output_dtypes=[mx.float32, mx.uint32, mx.float32, mx.uint32, mx.float32],
+    )
+    ks2 = _get_samp("sram_p2_fb", has_sc, sc_lit)
+    (out,) = ks2(
+        inputs=[cand_lp, cand_id, mass_part, c_cnt, seeds, s_cfg, logits, gmax, gnrm],
+        template=[("HAS_SC", has_sc), ("PP", P), ("VV", V), ("SP", sp), ("MAX_CSP", max_csp), ("MAX_TOT", max_tot), ("USE_TOPP", use_topp)],
+        grid=(B * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B,)],
+        output_dtypes=[mx.uint32],
+    )
+    return out
 
 
 def softcap_coupled_verify_rows(

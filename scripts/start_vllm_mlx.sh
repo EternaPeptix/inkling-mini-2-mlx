@@ -8,7 +8,9 @@ MODEL_PATH="${LOOPLING_MODEL_PATH:-$HOME/loopling/models/loopling-p3}"
 HOST="${LOOPLING_HOST:-0.0.0.0}"
 PORT="${LOOPLING_PORT:-8080}"
 SSD_CACHE_DIR="${LOOPLING_SSD_CACHE_DIR:-$ROOT/vllm_ssd_cache}"
-SSD_CACHE_GB="${LOOPLING_SSD_CACHE_GB:-120}"
+SSD_CACHE_GB="${LOOPLING_SSD_CACHE_GB:-1500}"
+CACHE_MEM_PCT="${LOOPLING_CACHE_MEM_PCT:-0.70}"
+REQUEST_TIMEOUT="${LOOPLING_TIMEOUT:-7200}"
 LOG_FILE="${LOOPLING_LOG_FILE:-$ROOT/vllm_mlx_p3_${PORT}.log}"
 PID_FILE="${LOOPLING_PID_FILE:-$ROOT/vllm_mlx_p3_${PORT}.pid}"
 
@@ -17,6 +19,7 @@ export PYTHONPATH="$SRC/vendor:$SRC"
 export HF_HUB_OFFLINE=1
 export LOOPLING_SERVER_BATCHDECODE=1
 export LOOPLING_LOOPCD="${LOOPLING_LOOPCD:-off}"
+export LOOPLING_MTP="${LOOPLING_MTP:-dflash2}"
 
 mkdir -p "$SSD_CACHE_DIR"
 
@@ -33,11 +36,12 @@ nohup "$VENV_PY" -m vllm_mlx_inkling2.serve serve "$MODEL_PATH" \
     --port "$PORT" \
     --continuous-batching \
     --max-tokens 32768 \
-    --max-request-tokens 32768 \
+    --max-request-tokens 1048576 \
+    --timeout "$REQUEST_TIMEOUT" \
     --default-temperature 0.7 \
     --default-top-p 0.95 \
     --prefill-step-size 4096 \
-    --cache-memory-percent 0.35 \
+    --cache-memory-percent "$CACHE_MEM_PCT" \
     --ssd-cache-dir "$SSD_CACHE_DIR" \
     --ssd-cache-max-gb "$SSD_CACHE_GB" \
     --reasoning-parser inkling2 \

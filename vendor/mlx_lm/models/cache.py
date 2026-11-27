@@ -458,21 +458,34 @@ class KVCache(_BaseCache):
             self.unpack_b1()
         prev = self.offset
         if self._keys is None or (prev + keys.shape[2]) > self._keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
+            B, n_kv_heads, S, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
             if self._keys is not None:
                 if prev % self.step != 0:
                     self._keys = self._keys[..., :prev, :]
                     self._values = self._values[..., :prev, :]
+                cur = self._keys.shape[2]
+                need = prev + S
+                if cur >= 4096:
+                    target = max(
+                        ((need + self.step - 1) // self.step) * self.step,
+                        ((cur * 2 + self.step - 1) // self.step) * self.step,
+                    )
+                    if need <= 1048576 < target:
+                        target = 1048576
+                    add = target - cur
+                else:
+                    add = ((self.step + S - 1) // self.step) * self.step
+                new_k = mx.zeros((B, n_kv_heads, add, k_head_dim), keys.dtype)
+                new_v = mx.zeros((B, n_kv_heads, add, v_head_dim), values.dtype)
                 self._keys = mx.concatenate([self._keys, new_k], axis=2)
                 self._values = mx.concatenate([self._values, new_v], axis=2)
             else:
-                self._keys, self._values = new_k, new_v
+                n_steps = (self.step + S - 1) // self.step
+                k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+                v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+                self._keys = mx.zeros(k_shape, keys.dtype)
+                self._values = mx.zeros(v_shape, values.dtype)
 
         self.offset += keys.shape[2]
         self._keys[..., prev : self.offset, :] = keys
@@ -1173,21 +1186,34 @@ class BatchKVCache(_BaseCache):
     def update_and_fetch(self, keys, values):
         prev = self._idx
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
+            B, n_kv_heads, S, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
             if self.keys is not None:
                 if prev % self.step != 0:
                     self.keys = self.keys[..., :prev, :]
                     self.values = self.values[..., :prev, :]
+                cur = self.keys.shape[2]
+                need = prev + S
+                if cur >= 4096:
+                    target = max(
+                        ((need + self.step - 1) // self.step) * self.step,
+                        ((cur * 2 + self.step - 1) // self.step) * self.step,
+                    )
+                    if need <= 1048576 < target:
+                        target = 1048576
+                    add = target - cur
+                else:
+                    add = ((self.step + S - 1) // self.step) * self.step
+                new_k = mx.zeros((B, n_kv_heads, add, k_head_dim), keys.dtype)
+                new_v = mx.zeros((B, n_kv_heads, add, v_head_dim), values.dtype)
                 self.keys = mx.concatenate([self.keys, new_k], axis=2)
                 self.values = mx.concatenate([self.values, new_v], axis=2)
             else:
-                self.keys, self.values = new_k, new_v
+                n_steps = (self.step + S - 1) // self.step
+                k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+                v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+                self.keys = mx.zeros(k_shape, keys.dtype)
+                self.values = mx.zeros(v_shape, values.dtype)
 
         self.offset = self.offset + keys.shape[2]
         self._idx += keys.shape[2]
@@ -1324,6 +1350,15 @@ class BatchKVCache(_BaseCache):
         # No cache has content so make an empty one
         if max_length == 0:
             return BatchKVCache([0] * len(caches))
+
+        if len(caches) == 1:
+            c = caches[0]
+            cache = cls([0])
+            cache.keys = c.keys[..., : c.offset, :]
+            cache.values = c.values[..., : c.offset, :]
+            cache.offset += cache.keys.shape[2]
+            cache._idx = cache.keys.shape[2]
+            return cache
 
         padding = [max_length - l for l in lengths]
         B = len(caches)
@@ -1689,6 +1724,21 @@ class BatchRotatingKVCache(_BaseCache):
         # No cache has content so make an empty one
         if max_length == 0:
             return cls(caches[0].max_size, [0] * len(caches))
+
+        if len(caches) == 1:
+            c = caches[0]
+            l = lengths[0]
+            keys = c._temporal_order(c.keys)[..., -l:, :]
+            values = c._temporal_order(c.values)[..., -l:, :]
+            cache = cls(caches[0].max_size, [0])
+            cache.keys = keys
+            cache.values = values
+            cache.offset = mx.array(offsets)
+            cache._idx = keys.shape[2]
+            cache._offset = keys.shape[2]
+            if cache._fd_delta is not None:
+                cache._fd_delta = int(offsets[0]) - keys.shape[2]
+            return cache
 
         padding = [max_length - l for l in lengths]
         B = len(caches)

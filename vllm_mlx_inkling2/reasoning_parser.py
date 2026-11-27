@@ -32,21 +32,29 @@ _ALL_MARKERS = (
 _MAX_MARKER_LEN = max(len(m) for m in _ALL_MARKERS)
 
 
-def _partial_suffix_len(text: str, markers: tuple[str, ...] = _ALL_MARKERS) -> int:
+def _partial_suffix_len(
+    text: str,
+    markers: tuple[str, ...] = _ALL_MARKERS,
+    *,
+    allow_lone_lt: bool = True,
+) -> int:
     """Return length of longest trailing substring that prefixes any structural marker."""
     idx = text.rfind("<|")
-    if idx < 0:
-        return 0
-    tail = text[idx:]
-    if len(tail) >= _MAX_MARKER_LEN:
-        return 0
-    if any(m.startswith(tail) and m != tail for m in markers):
-        return len(tail)
+    if idx >= 0:
+        tail = text[idx:]
+        if len(tail) < _MAX_MARKER_LEN and any(
+            m.startswith(tail) and m != tail for m in markers
+        ):
+            return len(tail)
+    if allow_lone_lt and text.endswith("<"):
+        return 1
     return 0
 
 
 class _Inkling2StreamState:
     """Incremental state machine matching vendor/mlx_lm/chat_templates/inkling2.py."""
+
+    __slots__ = ("state", "buf", "saw_marker")
 
     def __init__(self, implicit_mode: bool = False) -> None:
         self.state: str = _REASONING if implicit_mode else _HEADER
@@ -54,10 +62,13 @@ class _Inkling2StreamState:
         self.saw_marker: bool = implicit_mode
 
     def _find_next_marker(self) -> tuple[int, str | None]:
+        buf = self.buf
+        if "<|" not in buf:
+            return -1, None
         best_idx = -1
         best_tag: str | None = None
         for tag in _ALL_MARKERS:
-            pos = self.buf.find(tag)
+            pos = buf.find(tag)
             if pos >= 0 and (best_idx < 0 or pos < best_idx):
                 best_idx = pos
                 best_tag = tag
@@ -65,6 +76,13 @@ class _Inkling2StreamState:
 
     def feed(self, delta_text: str) -> tuple[str, str]:
         """Consume `delta_text` and return `(reasoning_delta, content_delta)`."""
+        if not self.buf and "<" not in delta_text:
+            state = self.state
+            if state == _REASONING:
+                return delta_text, ""
+            if state == _NORMAL or state == _TOOL:
+                return "", delta_text
+
         self.buf += delta_text
         r_parts: list[str] = []
         c_parts: list[str] = []
@@ -114,7 +132,9 @@ class _Inkling2StreamState:
             elif tag in (_TAG_MODEL, _TAG_EOS):
                 self.state = _HEADER
 
-        return "".join(r_parts), "".join(c_parts)
+        r_out = r_parts[0] if len(r_parts) == 1 else ("".join(r_parts) if r_parts else "")
+        c_out = c_parts[0] if len(c_parts) == 1 else ("".join(c_parts) if c_parts else "")
+        return r_out, c_out
 
     def finalize(self) -> tuple[str, str]:
         """Flush any buffered text on end-of-stream without leaking structural tags."""
@@ -122,7 +142,7 @@ class _Inkling2StreamState:
         self.buf = ""
         if not rem:
             return "", ""
-        hold = _partial_suffix_len(rem)
+        hold = _partial_suffix_len(rem, allow_lone_lt=False)
         if hold:
             rem = rem[:-hold]
         if not rem:

@@ -833,7 +833,7 @@ def stream_generate(
         _ss = selfspec.parse_env()
         if _ss is not None and not selfspec.applicable(model, *_ss):
             _ss = None
-    if draft_model is None and os.environ.get("LOOPLING_MTP") in ("1", "dflash2"):
+    if draft_model is None and os.environ.get("LOOPLING_MTP") in ("1", "dflash2") and not kwargs.get("logits_processors"):
         # official MTP or Splash DFlash2 drafter; default OFF
         if _ss is not None:
             raise ValueError("LOOPLING_MTP and LOOPLING_SELFSPEC cannot be combined")

@@ -1750,11 +1750,12 @@ def dflash2_exact_generate_step(
         )
         off_cpu = int(dec.caches[0][0][0].offset)
         if use_pipe_ahead and max_tokens > 1:
-            if not dec.ensure_gpu_cap(max_tokens + 16):
+            init_win = min(max_tokens + 16, 4096)
+            if not dec.ensure_gpu_cap(init_win):
                 use_pipe_ahead = False
             else:
-                dr._ensure_cap(dr.n + max_tokens + 32)
-        tau_cap = off_cpu + max_tokens + 32
+                dr._ensure_cap(dr.n + init_win + 16)
+        tau_cap = max(4096, ((off_cpu + min(max_tokens, 4096) + 32 + 4095) // 4096) * 4096)
 
         pa_depth = max(1, min(3, int(os.environ.get("LOOPLING_DFLASH2_PA", "2"))))
         std_samp = None if is_greedy else _std_sampler_params(sampler)
@@ -1938,12 +1939,23 @@ def dflash2_exact_generate_step(
                     if deferred_feats:
                         flush_deferred()
                         if not dec._kv_stacked:
-                            dec.ensure_gpu_cap(max_tokens - n + 16)
+                            dec.ensure_gpu_cap(min(max_tokens - n + 16, 4096))
                             off_cpu = int(dec.caches[0][0][0].offset)
-                        dr._ensure_cap(dr.n + max_tokens - n + 32)
+                        dr._ensure_cap(dr.n + min(max_tokens - n + 32, 4096))
                     while len(pa_queue) < pa_depth:
                         qlen = len(pa_queue)
                         w_l = pa_w_run
+                        if not pa_queue and dec._kv_stacked and dec._full_visits:
+                            need_win = min(max_tokens - n + 16, 4096)
+                            cap_f_now = int(dec._kv_full.shape[3])
+                            cap_dr_now = 0 if dr.ck[0] is None else int(dr.ck[0].shape[2])
+                            if off_cpu + w_l > cap_f_now:
+                                dec.ensure_gpu_cap(need_win)
+                                off_cpu = int(dec.caches[0][0][0].offset)
+                            if dr.n + w_l + dr.block > cap_dr_now:
+                                dr._ensure_cap(dr.n + need_win + 16)
+                            if off_cpu + w_l + 32 > tau_cap:
+                                tau_cap = ((off_cpu + need_win + 32 + 4095) // 4096) * 4096
                         ok_pa, binfo_pa = _can_launch_pa(w_l)
                         if not ok_pa:
                             break
@@ -2084,9 +2096,9 @@ def dflash2_exact_generate_step(
                     if pa_ar_burst == 0:
                         flush_deferred()
                         if not dec._kv_stacked:
-                            dec.ensure_gpu_cap(max_tokens - n + 16)
+                            dec.ensure_gpu_cap(min(max_tokens - n + 16, 4096))
                             off_cpu = int(dec.caches[0][0][0].offset)
-                        dr._ensure_cap(dr.n + max_tokens - n + 32)
+                        dr._ensure_cap(dr.n + min(max_tokens - n + 32, 4096))
                         pa_ema_tpc = 2.6
                         pa_w_run = min(6, W_cfg)
                     stats["cycles"] += 1

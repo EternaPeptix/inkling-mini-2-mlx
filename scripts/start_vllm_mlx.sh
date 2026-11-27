@@ -9,6 +9,7 @@ SERVED_MODEL_NAME="${LOOPLING_SERVED_MODEL_NAME:-$HOME/loopling/models/loopling-
 MODEL_TAG="$(basename "$MODEL_PATH")"
 HOST="${LOOPLING_HOST:-0.0.0.0}"
 PORT="${LOOPLING_PORT:-8080}"
+MAX_TOKENS="${LOOPLING_MAX_TOKENS:-65536}"
 SSD_CACHE_DIR="${LOOPLING_SSD_CACHE_DIR:-$ROOT/vllm_ssd_cache/$MODEL_TAG}"
 SSD_CACHE_GB="${LOOPLING_SSD_CACHE_GB:-1500}"
 CACHE_MEM_PCT="${LOOPLING_CACHE_MEM_PCT:-0.70}"
@@ -24,6 +25,7 @@ export LOOPLING_LOOPCD="${LOOPLING_LOOPCD:-off}"
 export LOOPLING_MTP="${LOOPLING_MTP:-dflash2}"
 
 mkdir -p "$SSD_CACHE_DIR"
+touch "$ROOT/vllm_ssd_cache/.metadata_never_index" "$SSD_CACHE_DIR/.metadata_never_index" 2>/dev/null || true
 
 if [ -f "$PID_FILE" ]; then
     OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -38,7 +40,7 @@ nohup "$VENV_PY" -m vllm_mlx_inkling2.serve serve "$MODEL_PATH" \
     --host "$HOST" \
     --port "$PORT" \
     --continuous-batching \
-    --max-tokens 32768 \
+    --max-tokens "$MAX_TOKENS" \
     --max-request-tokens 1048576 \
     --timeout "$REQUEST_TIMEOUT" \
     --default-temperature 0.7 \

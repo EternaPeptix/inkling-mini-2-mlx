@@ -2056,7 +2056,7 @@ class BatchDecoder:
         kv0 = self.caches[0][self._b1_full_unp_visits[0]][0]
         Hkv = int(kv0._keys.shape[1])
         if self._b1_full_unp_st is None:
-            scap = max(256, ((int(extra_w) + 255) // 256) * 256)
+            scap = 4096 if int(extra_w) <= 4096 else ((int(extra_w) + 255) // 256) * 256
             self._b1_full_unp_st = mx.zeros((nf, 2, Hkv, scap, 128), kv0._keys.dtype)
             self._b1_full_unp_len = 0
             self._b1_full_unp_slot0 = int(kv0.offset)
@@ -3828,6 +3828,21 @@ class BatchDecoder:
             return None
         return (True, blk_max)
 
+    @staticmethod
+    def _unp_ns_bucket(s_max_f: int) -> int:
+        """Coarse power-of-2 split-K bucket for unpacked long SDPA (5 buckets across 32K..1M)."""
+        if s_max_f <= 65536:
+            return 256
+        if s_max_f <= 131072:
+            return 512
+        if s_max_f <= 262144:
+            return 1024
+        if s_max_f <= 524288:
+            return 2048
+        if s_max_f <= 1048576:
+            return 4096
+        return ((int(s_max_f) + 131071) // 131072) * 512
+
     def _cw_safe_bounds_range(self, end_lo: int, end_hi: int, max_depth: int):
         if self._b1_unpacked_full:
             if not self._ring_stacked or not self._ring_visits or not self._b1_full_unp_visits or self._b1_full_unp_st is None:
@@ -3845,7 +3860,7 @@ class BatchDecoder:
                 return False, None
             if (int(end_hi) - int(self._b1_full_unp_slot0) + int(max_depth) + 1) > scap_f:
                 return False, None
-            ns_bucket = max(1, (s_max_f + 8191) // 8192) * 32
+            ns_bucket = self._unp_ns_bucket(s_max_f)
             f_key = ("unp_long", ns_bucket)
             return True, (r_key, f_key, (s_min_r, s_max_r), (s_min_f, s_max_f), cap_r, scap_f, max_size_r)
         if not self._kv_stacked or not self._ring_visits or not self._full_visits:
@@ -3885,7 +3900,7 @@ class BatchDecoder:
             if (end0_f - int(self._b1_full_unp_slot0) + int(max_depth) + 1) > scap_f:
                 self._flush_b1_full_unpacked()
                 scap_f = int(self._b1_full_unp_st.shape[3])
-            ns_bucket = max(1, (s_max_f + 8191) // 8192) * 32
+            ns_bucket = self._unp_ns_bucket(s_max_f)
             f_key = ("unp_long", ns_bucket)
             meta_r, meta_f = self.get_gpu_meta(staged=False)
             return True, (r_key, f_key, meta_r, meta_f, (s_min_r, s_max_r), (s_min_f, s_max_f), end0_f, cap_r, scap_f)
@@ -4206,7 +4221,7 @@ class BatchDecoder:
                     walk_t = coupled_walk_commit_meta_gpu(
                         tokens, bonus, reject, child_pt, q_child, u_acc, meta_r, meta_f, dr_pos, W,
                     )
-                    ret = (walk_t, ovf)
+                    ret = (walk_t, None)
                 else:
                     nt = self._sample_verify_tokens(ret, sampler)
                     if use_walk:

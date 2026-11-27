@@ -2263,8 +2263,8 @@ class GenerationBatch:
             if st is None or not st._full_visits:
                 return None
             fv0 = st._full_visits[0]
-            min_ctx = min(int(self._bd.caches[c][fv0][0].offset) + int(st.st_lens[c]) for c in range(C))
-            if min_ctx < _df2_batch_min_ctx():
+            max_ctx = max(int(self._bd.caches[c][fv0][0].offset) + int(st.st_lens[c]) for c in range(C))
+            if max_ctx < _df2_batch_min_ctx():
                 return None
         samplers = [
             self.fallback_sampler if s is None else s

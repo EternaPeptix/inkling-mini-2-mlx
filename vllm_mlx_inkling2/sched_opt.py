@@ -345,6 +345,7 @@ def install() -> None:
                         (8, None, "0"),
                         (4, samp_07, None),
                         (6, samp_07, None),
+                        (8, samp_07, "0"),
                     ]
                     # 2a. Single-pass packed (< _TWO_PASS_N)
                     _run_df2_warmup_suite(c2, 64)
@@ -354,10 +355,13 @@ def install() -> None:
                     _run_df2_warmup_suite(c_2p, 1200)
                     del c_2p
 
-                    # 2c. Unpacked-full long SDPA (> _KV_STACK_MAX_CAP)
+                    # 2c. Unpacked-full long SDPA coarse buckets (<=64K and <=128K; zero 8K recompiles)
                     c_unp = _pad_cache_for_warmup(c2, 32769)
                     _run_df2_warmup_suite(c_unp, 32769)
-                    del c_unp, c2
+                    del c_unp
+                    c_unp128 = _pad_cache_for_warmup(c2, 65537)
+                    _run_df2_warmup_suite(c_unp128, 65537)
+                    del c_unp128, c2
                 finally:
                     if orig_w_env is None:
                         os.environ.pop("LOOPLING_DFLASH2_W", None)

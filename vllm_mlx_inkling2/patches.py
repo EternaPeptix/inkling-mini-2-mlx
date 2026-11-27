@@ -372,6 +372,14 @@ def _patch_ssd_cache_list() -> None:
         memory_bytes: int,
     ) -> bool:
         """Fast path for all-CacheList stacks: single batched mx.eval across all layers + uint16 bf16 view."""
+        if not getattr(self, "_spotlight_excluded", False):
+            self._spotlight_excluded = True
+            for d in (getattr(self, "_cache_dir", None), getattr(self, "_data_dir", None)):
+                if d:
+                    try:
+                        open(os.path.join(d, ".metadata_never_index"), "a").close()
+                    except OSError:
+                        pass
         if not cache or not all(isinstance(getattr(layer, "caches", None), (list, tuple)) for layer in cache):
             return orig_enqueue_spill(self, tokens, cache, memory_bytes)
         with self._lifecycle_lock:

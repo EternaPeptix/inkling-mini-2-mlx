@@ -4,10 +4,12 @@ set -euo pipefail
 ROOT="${LOOPLING_OPT_ROOT:-$HOME/loopling-opt}"
 SRC="${LOOPLING_SRC_DIR:-$ROOT/src-main}"
 VENV_PY="${LOOPLING_VENV_PY:-$ROOT/.venv/bin/python}"
-MODEL_PATH="${LOOPLING_MODEL_PATH:-$HOME/loopling/models/loopling-p3}"
+MODEL_PATH="${LOOPLING_MODEL_PATH:-$HOME/loopling/models/loopling-p3-inkblot}"
+SERVED_MODEL_NAME="${LOOPLING_SERVED_MODEL_NAME:-$HOME/loopling/models/loopling-p3}"
+MODEL_TAG="$(basename "$MODEL_PATH")"
 HOST="${LOOPLING_HOST:-0.0.0.0}"
 PORT="${LOOPLING_PORT:-8080}"
-SSD_CACHE_DIR="${LOOPLING_SSD_CACHE_DIR:-$ROOT/vllm_ssd_cache}"
+SSD_CACHE_DIR="${LOOPLING_SSD_CACHE_DIR:-$ROOT/vllm_ssd_cache/$MODEL_TAG}"
 SSD_CACHE_GB="${LOOPLING_SSD_CACHE_GB:-1500}"
 CACHE_MEM_PCT="${LOOPLING_CACHE_MEM_PCT:-0.70}"
 REQUEST_TIMEOUT="${LOOPLING_TIMEOUT:-7200}"
@@ -32,6 +34,7 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 nohup "$VENV_PY" -m vllm_mlx_inkling2.serve serve "$MODEL_PATH" \
+    --served-model-name "$SERVED_MODEL_NAME" \
     --host "$HOST" \
     --port "$PORT" \
     --continuous-batching \

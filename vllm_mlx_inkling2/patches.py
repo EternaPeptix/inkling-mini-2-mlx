@@ -584,16 +584,20 @@ def _patch_cache_list_trim_and_config() -> None:
     vmc.MemoryAwarePrefixCache.__init__ = _patched_mc_init
 
 
-def _clone_cache_wrappers(cache: list[Any]) -> list[Any]:
+def _clone_cache_wrappers(cache: list[Any], *, strip_transient: bool = False) -> list[Any]:
     """Zero-copy shallow clone of cache wrappers (and `ArraysCache.cache` lists).
 
     MLX arrays are immutable (writes rebind attributes/list entries), so cloning
     the Python wrapper objects guarantees BatchDecoder's 1-token direct-admit
     path (`pack_b1`/`update_packed_b1`) can never mutate a stored prefix-cache
-    entry in place, at <0.05ms and 0 GPU bytes copied.
+    entry in place, at <0.05ms and 0 GPU bytes copied. When `strip_transient=True`,
+    also strips `_cascade_ref` and `_packed` on the cloned wrappers without mutating
+    the live request caches.
     """
 
     def _clone_layer(layer: Any) -> Any:
+        if layer is None:
+            return None
         children = getattr(layer, "caches", None)
         if isinstance(children, (list, tuple)):
             c = copy.copy(layer)
@@ -603,9 +607,24 @@ def _clone_cache_wrappers(cache: list[Any]) -> list[Any]:
         c = copy.copy(layer)
         if hasattr(c, "cache") and isinstance(c.cache, list):
             c.cache = list(c.cache)
+        if strip_transient:
+            if hasattr(c, "_cascade_ref"):
+                try:
+                    delattr(c, "_cascade_ref")
+                except Exception:
+                    c._cascade_ref = None
+            if hasattr(c, "_packed") and c._packed is not None:
+                c._packed = None
         return c
 
     return [_clone_layer(layer) for layer in cache]
+
+
+def _strip_transient_cache_attrs(cache: list[Any]) -> list[Any]:
+    """Shallow-clone cache wrappers and strip transient MLX-array attrs (`_cascade_ref`, `_packed`)
+    before storage detachment so `MemoryAwarePrefixCache._detach_cache_for_storage` never sees
+    stale live-array aliases and stored entries never retain old cascade prefix tensors."""
+    return _clone_cache_wrappers(cache, strip_transient=True)
 
 
 class _SuppressPromptCacheSaveWarning(logging.Filter):
@@ -670,10 +689,10 @@ def _patch_prompt_cache_and_batch_hooks() -> None:
                             refresh_thresh = int(env_refresh)
                         elif len(key) < 4096:
                             refresh_thresh = 64
-                        elif len(key) < 32768:
-                            refresh_thresh = 512
+                        elif len(key) < 131072:
+                            refresh_thresh = 256
                         else:
-                            refresh_thresh = 4096
+                            refresh_thresh = 512
                         if covered > 0 and (len(key) - covered) <= refresh_thresh:
                             req._prompt_cache_saved = True
                             continue
@@ -691,7 +710,7 @@ def _patch_prompt_cache_and_batch_hooks() -> None:
                                 len(key),
                             )
                             continue
-                        stored = mc.store(key, extracted, evict_prefixes=True)
+                        stored = mc.store(key, _strip_transient_cache_attrs(extracted), evict_prefixes=True)
                         req._prompt_cache_saved = True
                         logger.info(
                             "[cache_store_prompt_n1] request=%s key_tokens=%d prompt_tokens=%d stored=%s entries=%d",
@@ -851,7 +870,16 @@ def _patch_cascade_prefix_pinning() -> None:
     BatchKVCache.filter = _patched_bkv_filter
     BatchKVCache.extract = _patched_bkv_extract
 
-    # 2. Protect pinned MemoryAwarePrefixCache entries from LRU eviction & prefix eviction.
+    # 2. Strip transient attrs before storage detach & protect pinned entries from eviction.
+    orig_detach_for_storage = vmc._detach_cache_for_storage
+
+    def _patched_detach_for_storage(cache: list[Any], *args, **kwargs):
+        if kwargs.get("_eval_targets") is None:
+            cache = _strip_transient_cache_attrs(cache)
+        return orig_detach_for_storage(cache, *args, **kwargs)
+
+    vmc._detach_cache_for_storage = _patched_detach_for_storage
+
     class _AllEntriesPinned(Exception):
         pass
 

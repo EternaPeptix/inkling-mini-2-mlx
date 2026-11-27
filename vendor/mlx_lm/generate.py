@@ -64,6 +64,10 @@ _SERVER_BATCHDECODE = os.environ.get("LOOPLING_SERVER_BATCHDECODE", "1") not in 
     "false",
     "False",
 )
+_PREFILL_CLEAR_INTERVAL = max(1, int(os.environ.get("LOOPLING_PREFILL_CLEAR_INTERVAL", "8")))
+_DECODE_BURST_STEPS = max(1, int(os.environ.get("LOOPLING_DECODE_BURST_STEPS", "16")))
+_DECODE_BURST_S = max(0.0, float(os.environ.get("LOOPLING_DECODE_BURST_MS", "250")) / 1000.0)
+_SHORT_PREFILL_THRESH = max(1, int(os.environ.get("LOOPLING_SHORT_PREFILL_THRESH", "2048")))
 
 
 def _is_inkling2_model(model: nn.Module) -> bool:
@@ -1516,6 +1520,7 @@ class PromptProcessingBatch:
 
         # Actual prompt processing loop
         chunk_off = 0
+        clear_counter = 0
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             if df2_ctx is not None:
@@ -1562,9 +1567,11 @@ class PromptProcessingBatch:
             else:
                 self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
                 mx.eval([c.state for c in self.prompt_cache])
-            mx.clear_cache()
+            clear_counter += 1
             chunk_off += n_to_process
             tokens = tokens[:, n_to_process:]
+            if tokens.shape[1] == 0 or clear_counter % _PREFILL_CLEAR_INTERVAL == 0:
+                mx.clear_cache()
 
         # Finalize the cache if there was any padding
         if max_padding > 0:
@@ -2600,6 +2607,8 @@ class BatchGenerator:
         self._unprocessed_sequences = deque()
         self._currently_processing = []
         self._prefill_turn = False
+        self._decode_burst_steps = 0
+        self._decode_burst_start = 0.0
 
         self._counters = BatchCounters()
 
@@ -2812,7 +2821,7 @@ class BatchGenerator:
         total += self._generation_batch.cache_nbytes
         return total
 
-    def _make_batch(self, n: int):
+    def _make_batch_from(self, sequences):
         uids = []
         caches = []
         tokens = []
@@ -2822,8 +2831,7 @@ class BatchGenerator:
         stop_sequences = []
         need_logprobs = []
         need_final_cache = []
-        for _ in range(n):
-            sequence = self._unprocessed_sequences.popleft()
+        for sequence in sequences:
             uids.append(sequence[0])
             caches.append(sequence[3])
             tokens.append(sequence[4])
@@ -2852,21 +2860,73 @@ class BatchGenerator:
             need_final_cache=need_final_cache,
         )
 
+    def _make_batch(self, n: int):
+        sequences = [self._unprocessed_sequences.popleft() for _ in range(n)]
+        return self._make_batch_from(sequences)
+
+    @staticmethod
+    def _seq_rem_tokens(sequence) -> int:
+        return sum(len(s) for s in sequence[1])
+
+    def _prereserve_solo_kv(self, total_new_tokens: int) -> None:
+        """Pre-extend BatchKVCache once for solo long prefills to avoid 2x doubling concats."""
+        if total_new_tokens <= 4096 or len(self._prompt_batch) != 1:
+            return
+        for layer in self._prompt_batch.prompt_cache:
+            subs = getattr(layer, "caches", None)
+            targets = subs if isinstance(subs, (list, tuple)) else (layer,)
+            for sub in targets:
+                if (
+                    hasattr(sub, "keys")
+                    and hasattr(sub, "values")
+                    and hasattr(sub, "_idx")
+                    and hasattr(sub, "step")
+                    and not hasattr(sub, "max_size")
+                    and sub.keys is not None
+                ):
+                    prev = int(sub._idx)
+                    need = prev + total_new_tokens
+                    step = int(sub.step)
+                    target = ((need + step - 1) // step) * step
+                    cur = int(sub.keys.shape[2])
+                    if target > cur:
+                        if prev % step != 0:
+                            sub.keys = sub.keys[..., :prev, :]
+                            sub.values = sub.values[..., :prev, :]
+                            cur = prev
+                        add = target - cur
+                        if add > 0:
+                            sub.keys = mx.concatenate(
+                                [sub.keys, mx.zeros((1, sub.keys.shape[1], add, sub.keys.shape[3]), sub.keys.dtype)],
+                                axis=2,
+                            )
+                            sub.values = mx.concatenate(
+                                [sub.values, mx.zeros((1, sub.values.shape[1], add, sub.values.shape[3]), sub.values.dtype)],
+                                axis=2,
+                            )
+
     def _next(self):
         generation_responses = []
         prompt_responses = []
 
-        # Generate tokens first unless this tick is explicitly flushing a deferred prefill
+        # Generate tokens unless this tick is explicitly flushing a deferred prefill chunk
         prefill_turn = self._prefill_turn
         self._prefill_turn = False
         if len(self._generation_batch) > 0 and not prefill_turn:
+            if self._decode_burst_steps == 0:
+                self._decode_burst_start = time.perf_counter()
             tic = time.perf_counter()
             generation_responses = self._generation_batch.next()
             self._counters.decode_time += time.perf_counter() - tic
             self._counters.generation_tokens += len(generation_responses)
             self._counters.generation_steps += 1
+            self._decode_burst_steps += 1
             if self._counters.generation_steps % 512 == 0:
                 mx.clear_cache()
+
+        if len(self._generation_batch) == 0:
+            self._decode_burst_steps = 0
+            self._decode_burst_start = 0.0
 
         # Exit early because we already have our hands full with decoding
         if len(self._generation_batch) >= self.completion_batch_size:
@@ -2901,22 +2961,25 @@ class BatchGenerator:
 
         _split_ready()
 
-        # Direct-admit already-prefilled 1-token sequences (e.g. prefix-cache hits) without
-        # round-tripping through PromptProcessingBatch merge/extract or prefill_batch_size chunking.
-        if (
-            len(self._prompt_batch) == 0
-            and self._unprocessed_sequences
-            and len(self._generation_batch) < self.completion_batch_size
-        ):
+        # Direct-admit already-prefilled 1-token sequences (e.g. prefix-cache hits) anywhere
+        # in the queue, even while a long prefill is active in _prompt_batch.
+        def _direct_admit_ready():
+            if not self._unprocessed_sequences or len(self._generation_batch) >= self.completion_batch_size:
+                return
             cap_ready = self.completion_batch_size - len(self._generation_batch)
             ready_seqs = []
-            while (
-                len(ready_seqs) < cap_ready
-                and self._unprocessed_sequences
-                and len(self._unprocessed_sequences[0][1]) == 1
-                and len(self._unprocessed_sequences[0][1][0]) == 1
-            ):
-                ready_seqs.append(self._unprocessed_sequences.popleft())
+            kept_unproc = deque()
+            while self._unprocessed_sequences:
+                seq = self._unprocessed_sequences.popleft()
+                if (
+                    len(ready_seqs) < cap_ready
+                    and len(seq[1]) == 1
+                    and len(seq[1][0]) == 1
+                ):
+                    ready_seqs.append(seq)
+                else:
+                    kept_unproc.append(seq)
+            self._unprocessed_sequences = kept_unproc
             if ready_seqs:
                 r_uids = [s[0] for s in ready_seqs]
                 r_last = mx.array([s[1][0][0] for s in ready_seqs])
@@ -2949,23 +3012,156 @@ class BatchGenerator:
                     )
                 self._generation_batch.extend(gen_batch)
 
-        # Admit pending sequences into newly freed prompt slots
-        n = min(
+        _direct_admit_ready()
+
+        # If we are in a decode burst and still have burst budget left, keep streaming decode
+        # tokens smoothly before taking a prefill turn (unless _generation_batch just drained).
+        if generation_responses and (self._currently_processing or self._unprocessed_sequences):
+            burst_elapsed = time.perf_counter() - self._decode_burst_start
+            burst_done = (
+                self._decode_burst_steps >= _DECODE_BURST_STEPS
+                or burst_elapsed >= _DECODE_BURST_S
+            )
+            if not burst_done:
+                return prompt_responses, generation_responses
+            self._prefill_turn = True
+            self._decode_burst_steps = 0
+            self._decode_burst_start = 0.0
+            return prompt_responses, generation_responses
+
+        # Fast-lane short uncached prompts (<= _SHORT_PREFILL_THRESH) when a long prompt is
+        # already mid-prefill in _prompt_batch, avoiding left/right padding contamination and HoL blocking.
+        if (
+            len(self._prompt_batch) > 0
+            and self._unprocessed_sequences
+            and len(self._generation_batch) < self.completion_batch_size
+        ):
+            pb_max_rem = max(s[2] - s[1] for s in self._currently_processing)
+            pb_max_cached = max(len(t) for t in self._prompt_batch.tokens)
+            has_long_pb = pb_max_rem > _SHORT_PREFILL_THRESH or pb_max_cached >= 1024
+            if has_long_pb and any(
+                self._seq_rem_tokens(s) <= _SHORT_PREFILL_THRESH for s in self._unprocessed_sequences
+            ):
+                cap_short = min(
+                    self.prefill_batch_size,
+                    self.completion_batch_size - len(self._generation_batch),
+                )
+                short_seqs = []
+                rem_unproc = deque()
+                ref_rem = None
+                ref_cached = None
+                while self._unprocessed_sequences:
+                    s = self._unprocessed_sequences.popleft()
+                    s_rem = self._seq_rem_tokens(s)
+                    s_cached = len(s[4])
+                    if (
+                        len(short_seqs) < cap_short
+                        and s_rem <= _SHORT_PREFILL_THRESH
+                        and (
+                            ref_rem is None
+                            or (abs(s_rem - ref_rem) <= 256 and abs(s_cached - ref_cached) <= 256)
+                        )
+                    ):
+                        if ref_rem is None:
+                            ref_rem = s_rem
+                            ref_cached = s_cached
+                        short_seqs.append(s)
+                    else:
+                        rem_unproc.append(s)
+                self._unprocessed_sequences = rem_unproc
+                if short_seqs:
+                    saved_pb = self._prompt_batch
+                    saved_cp = self._currently_processing
+                    self._currently_processing = []
+                    try:
+                        self._prompt_batch = self._make_batch_from(short_seqs)
+                        while True:
+                            _split_ready()
+                            if not self._currently_processing:
+                                break
+                            s_prompts = []
+                            for i, seq in enumerate(self._currently_processing):
+                                resp = PromptProcessingBatch.Response(
+                                    self._prompt_batch.uids[i], 0, False, False
+                                )
+                                segments = seq[0]
+                                take = len(segments[0]) if len(segments) > 1 else max(1, len(segments[0]) - 1)
+                                take = min(take, self.prefill_step_size)
+                                s_prompts.append(segments[0][:take])
+                                segments[0] = segments[0][take:]
+                                if len(segments[0]) == 0:
+                                    segments.pop(0)
+                                    resp.end_of_segment = True
+                                seq[1] += len(s_prompts[-1])
+                                resp.progress = (seq[1], seq[2])
+                                prompt_responses.append(resp)
+                            if s_prompts:
+                                self._counters.prompt_tokens += sum(len(p) for p in s_prompts)
+                                tic = time.perf_counter()
+                                self._prompt_batch.prompt(s_prompts)
+                                self._counters.prompt_time += time.perf_counter() - tic
+                    finally:
+                        self._prompt_batch = saved_pb
+                        self._currently_processing = saved_cp
+                    return prompt_responses, generation_responses
+
+        # Admit pending sequences into newly freed prompt slots (without mixing incompatible offsets/lengths).
+        cap_add = min(
             self.prefill_batch_size - len(self._prompt_batch),
             self.completion_batch_size - len(self._generation_batch),
             len(self._unprocessed_sequences),
         )
-        if n > 0:
-            self._prompt_batch.extend(self._make_batch(n))
-            _split_ready()
+        if cap_add > 0:
+            admitted = []
+            if len(self._prompt_batch) == 0:
+                ref_seq = self._unprocessed_sequences[0]
+                ref_rem = self._seq_rem_tokens(ref_seq)
+                ref_cached = len(ref_seq[4])
+                if ref_rem > _SHORT_PREFILL_THRESH:
+                    admitted.append(self._unprocessed_sequences.popleft())
+                else:
+                    kept = deque()
+                    while self._unprocessed_sequences:
+                        s = self._unprocessed_sequences.popleft()
+                        s_rem = self._seq_rem_tokens(s)
+                        s_cached = len(s[4])
+                        if (
+                            len(admitted) < cap_add
+                            and s_rem <= _SHORT_PREFILL_THRESH
+                            and abs(s_rem - ref_rem) <= 256
+                            and abs(s_cached - ref_cached) <= 256
+                        ):
+                            admitted.append(s)
+                        else:
+                            kept.append(s)
+                    self._unprocessed_sequences = kept
+            else:
+                pb_rem0 = self._currently_processing[0][2] - self._currently_processing[0][1]
+                pb_cached0 = len(self._prompt_batch.tokens[0])
+                kept = deque()
+                while self._unprocessed_sequences:
+                    s = self._unprocessed_sequences.popleft()
+                    s_rem = self._seq_rem_tokens(s)
+                    s_cached = len(s[4])
+                    if (
+                        len(admitted) < cap_add
+                        and abs(s_rem - pb_rem0) <= 2048
+                        and abs(s_cached - pb_cached0) < 1024
+                    ):
+                        admitted.append(s)
+                    else:
+                        kept.append(s)
+                self._unprocessed_sequences = kept
+            if admitted:
+                self._prompt_batch.extend(self._make_batch_from(admitted))
+                _split_ready()
 
-        # If we already have ready decode tokens to deliver and prompts remain to prefill,
-        # stream the decode tokens immediately and run prefill on the next tick.
-        if generation_responses and self._currently_processing and not prefill_turn:
-            self._prefill_turn = True
-            return prompt_responses, generation_responses
+        # Pre-reserve BatchKVCache once for solo long prefills to skip 2x doubling copies.
+        if len(self._prompt_batch) == 1 and self._currently_processing:
+            total_rem = max(0, self._currently_processing[0][2] - self._currently_processing[0][1] - 1)
+            self._prereserve_solo_kv(total_rem)
 
-        # Extract the next prompts input
+        # Extract the next prompts input (preserve fixed self.prefill_step_size for BF16 bit-exactness)
         prompts = []
         for i, seq in enumerate(self._currently_processing):
             response = PromptProcessingBatch.Response(

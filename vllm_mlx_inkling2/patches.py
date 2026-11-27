@@ -910,6 +910,67 @@ def _patch_cascade_prefix_pinning() -> None:
 
     vmc.MemoryAwarePrefixCache._evict_lru = _patched_evict_lru
 
+    orig_mc_fetch = vmc.MemoryAwarePrefixCache.fetch
+
+    def _patched_mc_fetch(self, tokens: list[int]):
+        cache_out, remaining = orig_mc_fetch(self, tokens)
+        if cache_out is not None:
+            mkey = getattr(self, "_last_matched_key", None)
+            if mkey is not None:
+                with self._memory_lock:
+                    entry = self._entries.get(mkey)
+                    if entry is not None:
+                        entry._hit_count = getattr(entry, "_hit_count", 0) + 1
+        return cache_out, remaining
+
+    vmc.MemoryAwarePrefixCache.fetch = _patched_mc_fetch
+
+    _prefix_retain_min_gap = max(128, int(os.environ.get("LOOPLING_PREFIX_RETAIN_MIN_GAP", "512")))
+    _prefix_retain_max_gap = max(1024, int(os.environ.get("LOOPLING_PREFIX_RETAIN_MAX_GAP", "16384")))
+    _prefix_max_ancestors = max(1, int(os.environ.get("LOOPLING_PREFIX_MAX_ANCESTORS", "6")))
+    _prefix_ssd_min_tokens = max(256, int(os.environ.get("LOOPLING_PREFIX_SSD_MIN_TOKENS", "4096")))
+
+    def _select_prefix_evictions(entries_map, prefix_items: list[tuple[int, tuple[int, ...], Any]]) -> list[tuple[int, tuple[int, ...], Any]]:
+        """Retain pinned, multi-branch, and geometrically-spaced milestone prefixes in RAM."""
+        if not prefix_items:
+            return []
+        prefix_items.sort(key=lambda it: it[0])  # shortest -> longest
+        keep_keys: set[tuple[int, ...]] = set()
+        unpinned_kept: list[tuple[int, tuple[int, ...], Any]] = []
+        last_kept_len = 0
+        for klen, key, old_e in prefix_items:
+            if getattr(old_e, "_pin_count", 0) > 0:
+                keep_keys.add(key)
+                last_kept_len = klen
+                continue
+            hits = getattr(old_e, "_hit_count", 0)
+            req_gap = min(_prefix_retain_max_gap, max(_prefix_retain_min_gap, last_kept_len // 2))
+            is_root = last_kept_len == 0
+            is_milestone = (klen - last_kept_len) >= req_gap
+            is_multi_branch = hits >= 2
+            if is_root or is_milestone or is_multi_branch:
+                keep_keys.add(key)
+                unpinned_kept.append((klen, key, old_e))
+                last_kept_len = klen
+        # Cap unpinned retained ancestors per lineage so long sessions stay bounded.
+        if len(unpinned_kept) > _prefix_max_ancestors:
+            # Drop middle single-hit/zero-hit entries first while keeping root [0] and newest.
+            excess = len(unpinned_kept) - _prefix_max_ancestors
+            for klen, key, old_e in unpinned_kept[1:-1]:
+                if excess <= 0:
+                    break
+                if getattr(old_e, "_hit_count", 0) < 2:
+                    keep_keys.discard(key)
+                    excess -= 1
+            if excess > 0:
+                for klen, key, old_e in unpinned_kept[1:-1]:
+                    if excess <= 0:
+                        break
+                    if key in keep_keys:
+                        keep_keys.discard(key)
+                        excess -= 1
+        return [(klen, key, old_e) for klen, key, old_e in prefix_items if key not in keep_keys]
+
     orig_commit_prepared = vmc.MemoryAwarePrefixCache.commit_prepared
 
     def _patched_commit_prepared(self, entry, evict_prefixes: bool = True, **kwargs) -> bool:
@@ -919,14 +980,9 @@ def _patch_cascade_prefix_pinning() -> None:
         commit_lock = kwargs.get("commit_lock", None)
         commit_guard = kwargs.get("commit_guard", None)
 
-        # Fast-path when no entries in cache are pinned: delegate untouched to upstream.
-        with self._memory_lock:
-            any_pinned = any(getattr(e, "_pin_count", 0) > 0 for e in self._entries.values())
-        if not any_pinned:
-            return orig_commit_prepared(self, entry, evict_prefixes=evict_prefixes, **kwargs)
-
         tokens_key = entry.tokens
         commit_context = commit_lock if commit_lock is not None else nullcontext()
+        spilled_entries: list[tuple[tuple[int, ...], Any]] = []
         try:
             with self._memory_lock, commit_context:
                 if commit_guard is not None and not commit_guard():
@@ -939,7 +995,7 @@ def _patch_cascade_prefix_pinning() -> None:
                     return True
 
                 if evict_prefixes and self._sorted_keys:
-                    to_remove = []
+                    prefix_items: list[tuple[int, tuple[int, ...], Any]] = []
                     idx = bisect.bisect_left(self._sorted_keys, tokens_key)
                     for i in range(idx - 1, -1, -1):
                         key = self._sorted_keys[i]
@@ -948,15 +1004,18 @@ def _patch_cascade_prefix_pinning() -> None:
                             continue
                         if tokens_key[:klen] == key:
                             old_e = self._entries.get(key)
-                            if old_e is not None and getattr(old_e, "_pin_count", 0) <= 0:
-                                to_remove.append(key)
+                            if old_e is not None:
+                                prefix_items.append((klen, key, old_e))
                         elif key[0] != tokens_key[0]:
                             break
-                    for key in to_remove:
+                    to_remove = _select_prefix_evictions(self._entries, prefix_items)
+                    for klen, key, old_e in to_remove:
                         old = self._entries.pop(key)
                         self._current_memory -= old.memory_bytes
                         self._stats.evictions += 1
                         self._remove_from_sorted(key)
+                        if klen >= _prefix_ssd_min_tokens and self._ssd_tier is not None:
+                            spilled_entries.append((key, old))
 
                 while (
                     self._current_memory + entry.memory_bytes > self._max_memory
@@ -969,7 +1028,6 @@ def _patch_cascade_prefix_pinning() -> None:
                 bisect.insort(self._sorted_keys, tokens_key)
                 self._stats.entry_count = len(self._entries)
                 self._stats.current_memory_bytes = self._current_memory
-            return True
         except _AllEntriesPinned:
             self._stats.store_rejections += 1
             logger.debug(
@@ -977,6 +1035,14 @@ def _patch_cascade_prefix_pinning() -> None:
                 len(tokens_key),
             )
             return False
+
+        if spilled_entries and self._ssd_tier is not None:
+            for skey, sentry in spilled_entries:
+                try:
+                    self._ssd_tier.enqueue_spill(skey, sentry.cache, sentry.memory_bytes)
+                except Exception:
+                    logger.debug("[prefix_spill] failed to spill %d tokens to SSD", len(skey), exc_info=True)
+        return True
 
     vmc.MemoryAwarePrefixCache.commit_prepared = _patched_commit_prepared
 
@@ -1089,7 +1155,24 @@ def _patch_cascade_prefix_pinning() -> None:
 
     orig_schedule_waiting = vsched.Scheduler._schedule_waiting
 
+    _short_sched_thresh = max(1, int(os.environ.get("LOOPLING_SHORT_PREFILL_THRESH", "2048")))
+
     def _patched_schedule_waiting(self):
+        if len(self.waiting) > 1:
+            from collections import deque
+
+            def _priority_tier(req: Any) -> int:
+                rem = getattr(req, "remaining_tokens", None)
+                if rem is None:
+                    rem = getattr(req, "prompt_token_ids", None) or ()
+                n_rem = len(rem)
+                if n_rem <= 1:
+                    return 0
+                if n_rem <= _short_sched_thresh:
+                    return 1
+                return 2
+
+            self.waiting = deque(sorted(self.waiting, key=_priority_tier))
         scheduled = orig_schedule_waiting(self)
         for req in scheduled:
             if (getattr(req, "cached_tokens", 0) or 0) <= 0:

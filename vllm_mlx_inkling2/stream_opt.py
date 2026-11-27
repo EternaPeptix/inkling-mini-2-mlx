@@ -257,8 +257,35 @@ def _patch_fast_bytelevel_detokenizer() -> None:
     if getattr(vsched.Scheduler, "_inkling2_fast_detok", False):
         return
 
+    orig_init = vsched.Scheduler.__init__
     orig_get_detok = vsched.Scheduler._get_detokenizer
     _table_cache: dict[int, tuple[bytes, ...] | None] = {}
+
+    def _get_or_build_table(raw: Any) -> tuple[bytes, ...] | None:
+        if raw is None:
+            return None
+        tok_key = id(raw)
+        if tok_key in _table_cache:
+            return _table_cache[tok_key]
+        actual_tok = _unwrap_hf_tokenizer(raw)
+        actual_key = id(actual_tok)
+        if actual_key in _table_cache:
+            table = _table_cache[actual_key]
+        else:
+            table = build_verified_byte_table(actual_tok)
+            _table_cache[actual_key] = table
+            if table is not None:
+                logger.info(
+                    "[stream_opt] FastByteLevelDetokenizer verified for %d tokens",
+                    len(table),
+                )
+        _table_cache[tok_key] = table
+        return table
+
+    def _init_warm_detok(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        raw = getattr(self, "_actual_tokenizer", None) or getattr(self, "tokenizer", None)
+        _get_or_build_table(raw)
 
     def _fast_get_detokenizer(self, request_id: str | None = None) -> Any:
         pool = getattr(self, "_detokenizer_pool", None)
@@ -273,22 +300,7 @@ def _patch_fast_bytelevel_detokenizer() -> None:
         if raw is None:
             return orig_get_detok(self, request_id) if request_id is not None else None
 
-        tok_key = id(raw)
-        if tok_key not in _table_cache:
-            actual_tok = _unwrap_hf_tokenizer(raw)
-            actual_key = id(actual_tok)
-            if actual_key in _table_cache:
-                table = _table_cache[actual_key]
-            else:
-                table = build_verified_byte_table(actual_tok)
-                _table_cache[actual_key] = table
-                if table is not None:
-                    logger.info(
-                        "[stream_opt] FastByteLevelDetokenizer verified for %d tokens",
-                        len(table),
-                    )
-            _table_cache[tok_key] = table
-        table = _table_cache[tok_key]
+        table = _get_or_build_table(raw)
         if table is None:
             if request_id is None:
                 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
@@ -301,6 +313,7 @@ def _patch_fast_bytelevel_detokenizer() -> None:
             pool[request_id] = detok
         return detok
 
+    vsched.Scheduler.__init__ = _init_warm_detok
     vsched.Scheduler._get_detokenizer = _fast_get_detokenizer
     vsched.Scheduler._inkling2_fast_detok = True
 
@@ -335,6 +348,65 @@ def _token_lcp(a: list[int], b: list[int]) -> int:
     return limit
 
 
+def _find_added_split_char(tokenizer: Any, real_prompt: str, dummy_prompt: str) -> int:
+    """Find an added `<|...|>` token end offset at or before string LCP for safe split tokenization."""
+    char_lcp = _str_lcp_len(real_prompt, dummy_prompt)
+    if char_lcp == 0:
+        return 0
+    get_added = getattr(tokenizer, "get_added_vocab", None)
+    if not callable(get_added):
+        inner = getattr(tokenizer, "_tokenizer", None)
+        get_added = getattr(inner, "get_added_vocab", None) if inner is not None else None
+    if not callable(get_added):
+        return 0
+    try:
+        added_vocab = get_added()
+        search_start = max(0, char_lcp - 512)
+        end_pos = real_prompt.rfind("|>", search_start, char_lcp)
+        while end_pos >= 0:
+            start_pos = real_prompt.rfind("<|", max(0, end_pos - 64), end_pos)
+            if start_pos >= 0:
+                candidate = real_prompt[start_pos : end_pos + 2]
+                if candidate in added_vocab:
+                    return end_pos + 2
+            end_pos = real_prompt.rfind("|>", search_start, end_pos)
+    except Exception:
+        pass
+    return 0
+
+
+_SPLIT_ENCODE_PARITY_CACHE: dict[int, bool] = {}
+
+
+def _supports_added_split_encode(tokenizer: Any) -> bool:
+    """Verify once per tokenizer that `encode(a + b) == encode(a) + encode(b, add_special_tokens=False)`."""
+    tid = id(tokenizer)
+    cached = _SPLIT_ENCODE_PARITY_CACHE.get(tid)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        get_added = getattr(tokenizer, "get_added_vocab", None)
+        if not callable(get_added):
+            inner = getattr(tokenizer, "_tokenizer", None)
+            get_added = getattr(inner, "get_added_vocab", None) if inner is not None else None
+        if callable(get_added):
+            added = get_added()
+            probe = "<|end_message|>" if "<|end_message|>" in added else None
+            if probe is not None:
+                a = f"{probe}alpha{probe}"
+                b = "beta gamma"
+                ok = tokenizer.encode(a + b) == (
+                    tokenizer.encode(a) + tokenizer.encode(b, add_special_tokens=False)
+                )
+    except Exception:
+        ok = False
+    if len(_SPLIT_ENCODE_PARITY_CACHE) >= 32:
+        _SPLIT_ENCODE_PARITY_CACHE.clear()
+    _SPLIT_ENCODE_PARITY_CACHE[tid] = ok
+    return ok
+
+
 def _fast_prefix_boundary_from_prompts(
     tokenizer: Any,
     real_prompt: str,
@@ -342,54 +414,43 @@ def _fast_prefix_boundary_from_prompts(
     dummy_prompt: str,
 ) -> int:
     """Compute exact token LCP between real_prompt and dummy_prompt with O(tail) work."""
-    char_lcp = _str_lcp_len(real_prompt, dummy_prompt)
-    if char_lcp == 0:
-        return 0
-
-    # Find an added/special token ending at or before char_lcp: HuggingFace tokenizers
-    # split strictly at added tokens before BPE, guaranteeing zero cross-boundary merges
-    # for both real_prompt and dummy_prompt.
-    get_added = getattr(tokenizer, "get_added_vocab", None)
-    if not callable(get_added):
-        inner = getattr(tokenizer, "_tokenizer", None)
-        get_added = getattr(inner, "get_added_vocab", None) if inner is not None else None
-    if callable(get_added):
+    split_char = _find_added_split_char(tokenizer, real_prompt, dummy_prompt)
+    if split_char > 0:
         try:
-            added_vocab = get_added()
-            search_start = max(0, char_lcp - 512)
-            end_pos = real_prompt.rfind("|>", search_start, char_lcp)
-            while end_pos >= 0:
-                start_pos = real_prompt.rfind("<|", max(0, end_pos - 64), end_pos)
-                if start_pos >= 0:
-                    candidate = real_prompt[start_pos : end_pos + 2]
-                    if candidate in added_vocab:
-                        split_char = end_pos + 2
-                        real_tail = real_prompt[split_char:]
-                        dummy_tail = dummy_prompt[split_char:]
-                        real_tail_ids = tokenizer.encode(
-                            real_tail, add_special_tokens=False
-                        )
-                        tail_len = len(real_tail_ids)
-                        if (
-                            tail_len <= len(real_tokens)
-                            and real_tokens[len(real_tokens) - tail_len :]
-                            == real_tail_ids
-                        ):
-                            split_tok_idx = len(real_tokens) - tail_len
-                            dummy_tail_ids = tokenizer.encode(
-                                dummy_tail, add_special_tokens=False
-                            )
-                            return split_tok_idx + _token_lcp(
-                                real_tail_ids, dummy_tail_ids
-                            )
-                        break
-                end_pos = real_prompt.rfind("|>", search_start, end_pos)
+            real_tail = real_prompt[split_char:]
+            dummy_tail = dummy_prompt[split_char:]
+            real_tail_ids = tokenizer.encode(real_tail, add_special_tokens=False)
+            tail_len = len(real_tail_ids)
+            if (
+                tail_len <= len(real_tokens)
+                and real_tokens[len(real_tokens) - tail_len :] == real_tail_ids
+            ):
+                split_tok_idx = len(real_tokens) - tail_len
+                dummy_tail_ids = tokenizer.encode(dummy_tail, add_special_tokens=False)
+                return split_tok_idx + _token_lcp(real_tail_ids, dummy_tail_ids)
         except Exception:
             pass
 
     # Fallback: exact full encode of dummy_prompt.
     dummy_tokens = tokenizer.encode(dummy_prompt)
     return _token_lcp(real_tokens, dummy_tokens)
+
+
+def _should_offload_chat_prep(messages: list[dict[str, Any]], tools: list[dict] | None) -> bool:
+    if tools or len(messages) >= 8:
+        return True
+    est = 0
+    for msg in messages:
+        c = msg.get("content")
+        if isinstance(c, str):
+            est += len(c)
+        elif isinstance(c, list):
+            est += 512 * len(c)
+        if msg.get("tool_calls"):
+            est += 512
+        if est >= 16384:
+            return True
+    return False
 
 
 def _patch_stream_chat_tokenization() -> None:
@@ -435,55 +496,51 @@ def _patch_stream_chat_tokenization() -> None:
                 yield output
             return
 
-        _, extracted_images, extracted_videos, extracted_audios = (
-            extract_multimodal_content(messages)
-        )
-        if extracted_images or extracted_videos or extracted_audios:
-            async for output in orig_stream_chat(
-                self,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=tools,
-                images=images,
-                videos=videos,
-                **kwargs,
-            ):
-                yield output
-            return
+        if any(isinstance(m.get("content"), list) for m in messages):
+            _, extracted_images, extracted_videos, extracted_audios = (
+                extract_multimodal_content(messages)
+            )
+            if extracted_images or extracted_videos or extracted_audios:
+                async for output in orig_stream_chat(
+                    self,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    tools=tools,
+                    images=images,
+                    videos=videos,
+                    **kwargs,
+                ):
+                    yield output
+                return
 
-        template_tools = convert_tools_for_template(tools) if tools else None
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         enable_thinking = kwargs.pop("enable_thinking", None)
 
-        # Render the real prompt ONCE.
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            num_images=0,
-            num_audios=0,
-            chat_template_kwargs=chat_template_kwargs,
-            enable_thinking=enable_thinking,
-        )
-
-        # Encode ONCE (offloading large prompts so concurrent SSE streams never stall).
         tok = self.tokenizer
         if hasattr(tok, "tokenizer") and not hasattr(tok, "encode"):
             tok = tok.tokenizer
         enc_tok = self.tokenizer if hasattr(self.tokenizer, "encode") else tok
 
-        # Determine if multi-turn prefix_boundary is needed.
         last_user_idx = None
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 last_user_idx = i
                 break
 
-        def _tokenize_and_boundary() -> tuple[list[int], int]:
-            real_tokens = enc_tok.encode(prompt)
+        def _render_tokenize_and_boundary() -> tuple[list[int], int]:
+            template_tools = convert_tools_for_template(tools) if tools else None
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                num_images=0,
+                num_audios=0,
+                chat_template_kwargs=chat_template_kwargs,
+                enable_thinking=enable_thinking,
+            )
             if last_user_idx is None or last_user_idx == 0:
-                return real_tokens, 0
+                return enc_tok.encode(prompt), 0
             try:
                 dummy_messages = list(messages)
                 dummy_messages[last_user_idx] = {
@@ -498,17 +555,35 @@ def _patch_stream_chat_tokenization() -> None:
                     chat_template_kwargs=chat_template_kwargs,
                     enable_thinking=enable_thinking,
                 )
+                split_char = _find_added_split_char(enc_tok, prompt, dummy_prompt)
+                if (
+                    split_char > 0
+                    and (len(prompt) - split_char) > 4096
+                    and _supports_added_split_encode(enc_tok)
+                ):
+                    prefix_ids = enc_tok.encode(prompt[:split_char])
+                    real_tail_ids = enc_tok.encode(prompt[split_char:], add_special_tokens=False)
+                    dummy_tail_ids = enc_tok.encode(
+                        dummy_prompt[split_char:], add_special_tokens=False
+                    )
+                    return (
+                        prefix_ids + real_tail_ids,
+                        len(prefix_ids) + _token_lcp(real_tail_ids, dummy_tail_ids),
+                    )
+                real_tokens = enc_tok.encode(prompt)
                 lcp = _fast_prefix_boundary_from_prompts(
                     enc_tok, prompt, real_tokens, dummy_prompt
                 )
                 return real_tokens, lcp
             except Exception:
-                return real_tokens, 0
+                return enc_tok.encode(prompt), 0
 
-        if len(prompt) >= _ASYNC_TOKENIZE_CHAR_THRESHOLD:
-            prompt_tokens, prefix_boundary = await asyncio.to_thread(_tokenize_and_boundary)
+        if _should_offload_chat_prep(messages, tools):
+            prompt_tokens, prefix_boundary = await asyncio.to_thread(
+                _render_tokenize_and_boundary
+            )
         else:
-            prompt_tokens, prefix_boundary = _tokenize_and_boundary()
+            prompt_tokens, prefix_boundary = _render_tokenize_and_boundary()
 
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
@@ -648,7 +723,153 @@ def _patch_metrics_middleware_passthrough() -> None:
 
 # ---------------------------------------------------------------------------
 # P6b: Lightweight _disconnect_guard (zero per-chunk Task/Timer during fast streaming)
+#      + zero-leak asyncio Task cleanup on StreamingResponse / disconnect / abort
 # ---------------------------------------------------------------------------
+
+_BG_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _track_bg_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    """Keep a strong reference to fire-and-forget tasks until completion (Python 3.14)."""
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+def _patch_streaming_response_aclose() -> None:
+    """Ensure Starlette StreamingResponse closes `body_iterator` even on send()/CancelScope exit."""
+    from starlette.responses import StreamingResponse
+
+    if getattr(StreamingResponse.__call__, "_inkling2_close_on_exit", False):
+        return
+
+    orig_call = StreamingResponse.__call__
+
+    async def _close_body_iter(aclose_fn) -> None:
+        try:
+            await aclose_fn()
+        except BaseException:
+            pass
+
+    async def _call_close_body_iterator(self, scope, receive, send) -> None:
+        try:
+            await orig_call(self, scope, receive, send)
+        finally:
+            body_iter = getattr(self, "body_iterator", None)
+            aclose = getattr(body_iter, "aclose", None)
+            if callable(aclose) and getattr(body_iter, "ag_frame", True) is not None:
+                # Schedule on a tracked top-level task so outer anyio CancelScope
+                # cancellations cannot abort generator cleanup mid-await.
+                t = _track_bg_task(asyncio.create_task(_close_body_iter(aclose)))
+                try:
+                    await asyncio.shield(t)
+                except BaseException:
+                    pass
+
+    _call_close_body_iterator._inkling2_close_on_exit = True  # type: ignore[attr-defined]
+    StreamingResponse.__call__ = _call_close_body_iterator  # type: ignore[method-assign]
+
+
+def _patch_wait_with_disconnect_cleanup(vserver: Any) -> None:
+    """Ensure `_wait_with_disconnect` awaits cancelled tasks in `finally:`."""
+    orig_wait = getattr(vserver, "_wait_with_disconnect", None)
+    if orig_wait is None or getattr(orig_wait, "_inkling2_clean_cancel", False):
+        return
+
+    async def _clean_wait_with_disconnect(
+        coro,
+        raw_request,
+        timeout: float,
+        poll_interval: float = 0.5,
+        timeout_detail_seconds: float | None = None,
+        cleanup_result=None,
+    ):
+        from fastapi import HTTPException
+
+        t0 = time.monotonic()
+        task = asyncio.ensure_future(coro)
+
+        async def _wait_disconnect() -> None:
+            poll_count = 0
+            while True:
+                await asyncio.sleep(poll_interval)
+                poll_count += 1
+                is_disc = vserver._is_client_disconnected(raw_request)
+                if poll_count % 10 == 0 or is_disc:
+                    logger.info(
+                        "[disconnect_guard] poll #%d disconnected=%s elapsed=%.1fs",
+                        poll_count,
+                        is_disc,
+                        time.monotonic() - t0,
+                    )
+                if is_disc:
+                    return
+
+        disconnect_task = asyncio.create_task(_wait_disconnect())
+        try:
+            done, _ = await asyncio.wait(
+                [task, disconnect_task],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        "Request timed out after "
+                        f"{(timeout_detail_seconds or timeout):.1f} seconds"
+                    ),
+                )
+            if disconnect_task in done:
+                logger.info(
+                    "[disconnect_guard] CLIENT DISCONNECTED (non-stream) elapsed=%.1fs",
+                    time.monotonic() - t0,
+                )
+                if task in done:
+                    try:
+                        result = task.result()
+                    except BaseException:
+                        pass
+                    else:
+                        if cleanup_result is not None:
+                            cleanup = cleanup_result(result)
+                            if asyncio.iscoroutine(cleanup):
+                                await cleanup
+                else:
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                return None
+            return task.result()
+        finally:
+            pending = []
+            for t in (disconnect_task, task):
+                if not t.done():
+                    t.cancel()
+                    pending.append(t)
+            if pending:
+                async def _drain_pending() -> None:
+                    for t in pending:
+                        try:
+                            await t
+                        except BaseException:
+                            pass
+
+                drain = _track_bg_task(asyncio.create_task(_drain_pending()))
+                try:
+                    await asyncio.shield(drain)
+                except BaseException:
+                    pass
+
+    _clean_wait_with_disconnect._inkling2_clean_cancel = True  # type: ignore[attr-defined]
+    vserver._wait_with_disconnect = _clean_wait_with_disconnect
 
 
 def _patch_lightweight_disconnect_guard() -> None:
@@ -661,6 +882,9 @@ def _patch_lightweight_disconnect_guard() -> None:
     - `cleanup` callback execution
     """
     from vllm_mlx import server as vserver
+
+    _patch_streaming_response_aclose()
+    _patch_wait_with_disconnect_cleanup(vserver)
 
     if getattr(vserver, "_inkling2_fast_disconnect_guard", False):
         return
@@ -822,18 +1046,25 @@ def _patch_lightweight_disconnect_guard() -> None:
         finally:
             if poll_handle is not None:
                 poll_handle.cancel()
+            _pump_to_await = None
             if not pump_task.done():
                 pump_task.cancel()
+                _pump_to_await = pump_task
             _gen_to_close = aiter
 
             async def _deferred_generator_close() -> None:
+                if _pump_to_await is not None and not _pump_to_await.done():
+                    try:
+                        await _pump_to_await
+                    except BaseException:
+                        pass
                 await asyncio.sleep(0.5)
                 try:
                     await _gen_to_close.aclose()
                 except Exception:
                     pass
 
-            asyncio.create_task(_deferred_generator_close())
+            _track_bg_task(asyncio.create_task(_deferred_generator_close()))
             if cleanup is not None:
                 res = cleanup()
                 if asyncio.iscoroutine(res):

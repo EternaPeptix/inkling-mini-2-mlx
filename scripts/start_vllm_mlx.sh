@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="${LOOPLING_OPT_ROOT:-$HOME/loopling-opt}"
 SRC="${LOOPLING_SRC_DIR:-$ROOT/src-main}"
 VENV_PY="${LOOPLING_VENV_PY:-$ROOT/.venv/bin/python}"
-MODEL_PATH="${LOOPLING_MODEL_PATH:-$HOME/loopling/models/loopling-p3-inkblot}"
+MODEL_PATH="${LOOPLING_MODEL_PATH:-$HOME/loopling/models/loopling-p3-tess}"
 SERVED_MODEL_NAME="${LOOPLING_SERVED_MODEL_NAME:-$HOME/loopling/models/loopling-p3}"
 MODEL_TAG="$(basename "$MODEL_PATH")"
 HOST="${LOOPLING_HOST:-0.0.0.0}"
@@ -43,7 +43,7 @@ nohup "$VENV_PY" -m vllm_mlx_inkling2.serve serve "$MODEL_PATH" \
     --timeout "$REQUEST_TIMEOUT" \
     --default-temperature 0.7 \
     --default-top-p 0.95 \
-    --prefill-step-size 4096 \
+    --prefill-step-size "${LOOPLING_PREFILL_STEP_SIZE:-2048}" \
     --cache-memory-percent "$CACHE_MEM_PCT" \
     --ssd-cache-dir "$SSD_CACHE_DIR" \
     --ssd-cache-max-gb "$SSD_CACHE_GB" \

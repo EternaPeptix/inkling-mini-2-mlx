@@ -7,20 +7,25 @@ Gates:
   t2  In-process vllm-mlx Scheduler + CacheList + SSDCacheTier bit-exactness on 512S2 (--gpu):
       greedy & seeded sampling parity, RAM prefix-cache HIT & 1-tok immutability,
       SSD spill/reload bitwise CacheList (K/V uint16, 4x conv uint32, rotating _idx/offset)
-      + continuation parity, need_logprobs=[False] parity, and C=1 vs C=4 (L>=64) parity.
+      + continuation parity, need_logprobs=[False] parity, C=1 vs C=4 (L>=64) parity,
+      T2.6 concurrent prefill-vs-decode fairness, T2.7 multi-branch prefix retention,
+      and T2.8 128K-132K DFlash2 boundary crossing (_KV_STACK_MAX_CAP=131072).
   t3  Core loopling-opt regressions on 512S2 (--gpu): a2_tests (live-weight mutability),
       prefill_exact_test (--step 4096), server_batch_test (--C 1,2,4,8), optional spec_exact_test.
   t4  Live HTTP /v1/chat/completions golden & perf gate: streaming vs non-streaming exact parity,
       zero leaked <|...|> control tokens, multi-turn >1024-tok rotating-window prefix HIT,
-      C=4 (short + L>=64) vs C=1 parity, SHA-256 verification against golden baseline, and
-      TTFT / dec_tps / p50 / p95 / max_gap_ms / C=4 agg tok/s delta report.
+      C=4 (short + L>=64) vs C=1 parity, SHA-256 verification against golden baseline,
+      TTFT / dec_tps / p50 / p95 / max_gap_ms / C=4 agg tok/s delta report, plus optional
+      --cold-start (Req #1 warm-tier + zero Task-destroyed leak check), --fairness,
+      --multibranch, and --disconnect-check.
 
 Usage:
   RHOST=512S2 LANE=verif scripts/r 'python3 bench/vllm_mlx_gate.py t1'
   RHOST=512S2 LANE=verif scripts/r --gpu 'python3 bench/vllm_mlx_gate.py t2'
   RHOST=512S2 LANE=verif scripts/r --gpu 'python3 bench/vllm_mlx_gate.py t3'
   python3 bench/vllm_mlx_gate.py t4 --url http://512s2.tail91699.ts.net:8080 --capture golden.json
-  python3 bench/vllm_mlx_gate.py t4 --url http://512s2.tail91699.ts.net:8080 --verify golden.json
+  python3 bench/vllm_mlx_gate.py t4 --url http://512s2.tail91699.ts.net:8080 --verify golden.json --fairness --multibranch
+  RHOST=512S2 LANE=verif scripts/r --gpu 'python3 bench/vllm_mlx_gate.py t4 --cold-start --verify scratch/golden_baseline.json'
 """
 
 from __future__ import annotations
@@ -34,11 +39,13 @@ import os
 import random
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -436,7 +443,7 @@ def _encode_chat(tok: Any, messages: list[dict[str, str]]) -> list[int]:
     return tok.encode(s, add_special_tokens=False)
 
 
-def run_t2(model_path: str) -> int:
+def run_t2(model_path: str, skip_131k: bool = False) -> int:
     print("=== GATE T2: In-Process vllm-mlx Scheduler / Prefix-Cache / SSD / Seeded / C=4 ===", flush=True)
     os.environ["LOOPLING_SERVER_BATCHDECODE"] = "1"
     import mlx_lm  # noqa: F401  # MUST precede mlx.core!
@@ -729,6 +736,215 @@ def run_t2(model_path: str) -> int:
     assert got_a == c1_refs[0][:32], f"T2.5 handoff_a mismatch:\n  got={got_a}\n  ref={c1_refs[0][:32]}"
     assert got_b == c1_refs[1][:16], f"T2.5 handoff_b mismatch:\n  got={got_b}\n  ref={c1_refs[1][:16]}"
     print(f"PASS T2.5 Dynamic C=1->C=2->C=1 handoff parity (MTP={os.environ.get('LOOPLING_MTP', 'off')}, 0 mm)", flush=True)
+
+    # --- T2.6: Concurrent Prefill-vs-Decode Fairness + Bit-Exactness ---
+    # Ensures a large (~16K) uncached prefill does not starve an interactive short request (max_tokens=64).
+    p_16k_body = "\n".join(
+        f"Log line {i:04d}: checksum={(i * 2654435761) & 0xFFFF:04x} status=OK latency_ms={(i % 17) + 1}."
+        for i in range(1, 700)
+    )
+    p_16k = _encode_chat(
+        tok,
+        [{"role": "user", "content": "Count the OK entries and summarize briefly:\n" + p_16k_body}],
+    )
+    if len(p_16k) < 16384:
+        pad_block = tok.encode("Verify invariant alpha-beta-gamma-delta 0123456789.\n", add_special_tokens=False)
+        need = 16384 - len(p_16k)
+        reps = (need + len(pad_block) - 1) // len(pad_block)
+        p_16k = (pad_block * reps)[:need] + p_16k
+    p_16k = p_16k[:16384]
+    ref_16k = ref_generate(p_16k, max_tokens=16)
+    ref_fast = ref_generate(p_short, max_tokens=64)
+
+    r_prefill = Request("fair_16k", p_16k, SamplingParams(max_tokens=16, temperature=0.0), prompt_token_ids=list(p_16k))
+    r_fast = Request("fair_short", p_short, SamplingParams(max_tokens=64, temperature=0.0), prompt_token_ids=list(p_short))
+    sched_nocache.add_request(r_prefill)
+    got_16k: list[int] = []
+    got_fast: list[int] = []
+    fast_times: list[float] = []
+    fast_submit_t = 0.0
+    added_fast = False
+    done_f: set[str] = set()
+    step_i = 0
+    while len(done_f) < 2:
+        so = sched_nocache.step()
+        now = time.perf_counter()
+        step_i += 1
+        for ro in so.outputs:
+            if ro.request_id == "fair_16k" and ro.new_token_ids:
+                got_16k.extend(int(t) for t in ro.new_token_ids)
+            elif ro.request_id == "fair_short" and ro.new_token_ids:
+                got_fast.extend(int(t) for t in ro.new_token_ids)
+                fast_times.append(now)
+            if ro.finished:
+                done_f.add(ro.request_id)
+        if not added_fast and step_i >= 1:
+            added_fast = True
+            fast_submit_t = time.perf_counter()
+            sched_nocache.add_request(r_fast)
+
+    assert got_16k == ref_16k, f"T2.6 fair_16k mismatch:\n  got={got_16k}\n  ref={ref_16k}"
+    assert got_fast == ref_fast, f"T2.6 fair_short mismatch:\n  got={got_fast}\n  ref={ref_fast}"
+    assert fast_times, "T2.6 fair_short produced no timestamps"
+    fast_ttft_ms = (fast_times[0] - fast_submit_t) * 1000.0
+    fast_gaps = [(fast_times[i] - fast_times[i - 1]) * 1000.0 for i in range(1, len(fast_times))]
+    fast_max_gap_ms = max(fast_gaps) if fast_gaps else 0.0
+    assert fast_ttft_ms <= 4000.0 and fast_max_gap_ms <= 2500.0, (
+        f"T2.6 prefill starved interactive decode: ttft={fast_ttft_ms:.1f}ms max_gap={fast_max_gap_ms:.1f}ms"
+    )
+    print(
+        f"PASS T2.6 Concurrent prefill-vs-decode fairness (L_prefill={len(p_16k)}, "
+        f"fast_ttft={fast_ttft_ms:.1f}ms fast_max_gap={fast_max_gap_ms:.1f}ms, 0 mm)",
+        flush=True,
+    )
+
+    # --- T2.7: Multi-branch Prefix Cache Retention ---
+    # Branching Session A (L~800 -> L~1200) must NOT evict Session B's shared ancestor (L~800).
+    mb_base_txt = "\n".join(
+        f"BranchBase {i:03d}: deterministic cache retention check invariant ({i * 19 % 101})."
+        for i in range(1, 55)
+    )
+    p_mb_base = _encode_chat(tok, [{"role": "system", "content": mb_base_txt}, {"role": "user", "content": "State Base ID."}])
+    assert len(p_mb_base) >= 750, f"expected >=750 tokens for T2.7 base, got {len(p_mb_base)}"
+    suf_a = tok.encode(" ".join(f"BranchA_token_{i}" for i in range(120)), add_special_tokens=False)
+    suf_b = tok.encode(" ".join(f"BranchB_token_{i}" for i in range(60)), add_special_tokens=False)
+    p_mb_a = p_mb_base + suf_a
+    p_mb_b = p_mb_base + suf_b
+    assert len(p_mb_a) >= 1150, f"expected >=1150 tokens for T2.7 branch A, got {len(p_mb_a)}"
+
+    ref_mb_base = ref_generate(p_mb_base, max_tokens=16)
+    ref_mb_a = ref_generate(p_mb_a, max_tokens=16)
+    ref_mb_b = ref_generate(p_mb_b, max_tokens=16)
+
+    r_mb_base = Request("mb_base", p_mb_base, SamplingParams(max_tokens=16, temperature=0.0), prompt_token_ids=list(p_mb_base))
+    got_mb_base = _run_scheduler_reqs(sched_cache, [r_mb_base])["mb_base"]
+    assert got_mb_base == ref_mb_base, f"T2.7 mb_base mismatch: {got_mb_base} vs {ref_mb_base}"
+
+    r_mb_a = Request("mb_a", p_mb_a, SamplingParams(max_tokens=16, temperature=0.0), prompt_token_ids=list(p_mb_a))
+    got_mb_a = _run_scheduler_reqs(sched_cache, [r_mb_a])["mb_a"]
+    assert got_mb_a == ref_mb_a, f"T2.7 mb_a mismatch: {got_mb_a} vs {ref_mb_a}"
+    assert r_mb_a.cached_tokens >= len(p_mb_base) - 1, (
+        f"T2.7 mb_a expected ancestor hit >= {len(p_mb_base) - 1}, got {r_mb_a.cached_tokens}"
+    )
+
+    r_mb_b = Request("mb_b", p_mb_b, SamplingParams(max_tokens=16, temperature=0.0), prompt_token_ids=list(p_mb_b))
+    got_mb_b = _run_scheduler_reqs(sched_cache, [r_mb_b])["mb_b"]
+    assert got_mb_b == ref_mb_b, f"T2.7 mb_b mismatch: {got_mb_b} vs {ref_mb_b}"
+    assert r_mb_b.cached_tokens >= len(p_mb_base) - 1, (
+        f"T2.7 mb_b shared ancestor destroyed! cached_tokens={r_mb_b.cached_tokens} < {len(p_mb_base) - 1}"
+    )
+    mb_stats = sched_cache.memory_aware_cache.get_stats() if sched_cache.memory_aware_cache else {}
+    assert mb_stats.get("store_rejections", 0) == 0, f"T2.7 unexpected store_rejections={mb_stats}"
+    assert tuple(p_mb_base[:-1]) in sched_cache.memory_aware_cache._entries, "T2.7 base key missing from RAM cache"
+    print(
+        f"PASS T2.7 Multi-branch prefix retention (base={len(p_mb_base)} -> A={len(p_mb_a)}, "
+        f"B_cached={r_mb_b.cached_tokens}, store_rejections=0, 0 mm)",
+        flush=True,
+    )
+
+    # --- T2.8: 128K-132K DFlash2 Boundary Check (_KV_STACK_MAX_CAP = 131,072) ---
+    if not skip_131k:
+        seed_blk = tok.encode(
+            "Verify deterministic KV state transition across the 131072 token stack boundary without drift.\n",
+            add_special_tokens=False,
+        )
+        tail_chat = _encode_chat(
+            tok,
+            [
+                {
+                    "role": "user",
+                    "content": "Write the integers from 1000 to 1300 separated by newlines, with no extra commentary.",
+                }
+            ],
+        )
+        n_over = 131_200
+        n_cross = 130_800  # 130,799 rounds to 130,816 (< 131,072 cap) and crosses 131,072 during 320-tok decode
+        p_131k = (seed_blk * ((n_cross + len(seed_blk) - 1) // len(seed_blk)))[: n_cross - len(tail_chat)] + tail_chat
+        assert len(p_131k) == n_cross
+        p_131k_over = p_131k + (seed_blk * ((n_over - n_cross + len(seed_blk) - 1) // len(seed_blk)))[: n_over - n_cross]
+        assert len(p_131k_over) == n_over
+
+        t_pf0 = time.perf_counter()
+        c_130k = make_prompt_cache(model)
+        idx_arr = mx.array(p_131k[: n_cross - 1])
+        pos = 0
+        while pos < idx_arr.size:
+            step_n = min(4096, int(idx_arr.size) - pos)
+            model(idx_arr[pos : pos + step_n][None], cache=c_130k)
+            mx.eval([x.state for x in c_130k])
+            mx.clear_cache()
+            pos += step_n
+        prefill_130k_s = time.perf_counter() - t_pf0
+
+        c_130k_ref = copy.deepcopy(c_130k)
+        mx.eval([x.state for x in c_130k_ref])
+        sched_cache.memory_aware_cache.store(p_131k[: n_cross - 1], copy.deepcopy(c_130k), evict_prefixes=False)
+
+        ref_130k_cross = [
+            int(tid)
+            for tid, _ in generate_step(
+                mx.array([p_131k[n_cross - 1]]),
+                model,
+                max_tokens=320,
+                sampler=greedy_sampler,
+                prompt_cache=c_130k_ref,
+            )
+        ]
+        r_cross = Request(
+            "df2_130k_cross",
+            p_131k[:n_cross],
+            SamplingParams(max_tokens=320, temperature=0.0),
+            prompt_token_ids=list(p_131k[:n_cross]),
+        )
+        got_130k_cross = _run_scheduler_reqs(sched_cache, [r_cross])["df2_130k_cross"]
+        assert r_cross.cached_tokens == n_cross - 1, (
+            f"T2.8 expected full cache hit {n_cross - 1}, got {r_cross.cached_tokens}"
+        )
+        assert len(got_130k_cross) >= 280, (
+            f"T2.8 stopped before crossing 131072! len={len(got_130k_cross)} (<280)"
+        )
+        assert got_130k_cross == ref_130k_cross[: len(got_130k_cross)], (
+            f"T2.8 crossing 131072 mismatch (cached={r_cross.cached_tokens}, len={len(got_130k_cross)})"
+        )
+
+        # Case B: start >= 131,072 (_b1_unpacked_full=True)
+        model(mx.array(p_131k_over[n_cross - 1 : n_over - 1])[None], cache=c_130k)
+        mx.eval([x.state for x in c_130k])
+        mx.clear_cache()
+        c_over_ref = copy.deepcopy(c_130k)
+        mx.eval([x.state for x in c_over_ref])
+        sched_cache.memory_aware_cache.store(p_131k_over[: n_over - 1], c_130k, evict_prefixes=False)
+
+        ref_over = [
+            int(tid)
+            for tid, _ in generate_step(
+                mx.array([p_131k_over[n_over - 1]]),
+                model,
+                max_tokens=32,
+                sampler=greedy_sampler,
+                prompt_cache=c_over_ref,
+            )
+        ]
+        r_over = Request(
+            "df2_131k_over",
+            p_131k_over[:n_over],
+            SamplingParams(max_tokens=32, temperature=0.0),
+            prompt_token_ids=list(p_131k_over[:n_over]),
+        )
+        got_over = _run_scheduler_reqs(sched_cache, [r_over])["df2_131k_over"]
+        assert r_over.cached_tokens == n_over - 1, (
+            f"T2.8 expected full cache hit {n_over - 1}, got {r_over.cached_tokens}"
+        )
+        assert got_over == ref_over[: len(got_over)], f"T2.8 >=131072 mismatch:\n  got={got_over}\n  ref={ref_over}"
+        b_stats = sched_cache.memory_aware_cache.get_stats()
+        assert b_stats.get("store_rejections", 0) == 0, f"T2.8 store_rejections={b_stats}"
+        del c_130k_ref, c_over_ref, c_130k
+        mx.clear_cache()
+        print(
+            f"PASS T2.8 128K-132K DFlash2 boundary (prefill_130k={prefill_130k_s:.1f}s, "
+            f"cross {n_cross}->+320=0 mm, over {n_over}->+32=0 mm, store_rejections=0)",
+            flush=True,
+        )
 
     print("ALL GATE T2 CHECKS PASSED", flush=True)
     return 0
@@ -1144,8 +1360,392 @@ def _capture_t4(base_url: str) -> dict[str, Any]:
     return res
 
 
-def run_t4(base_url: str, capture_path: str, verify_path: str) -> int:
+def _raw_http_abort(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    stop_after_chunks: int | None = None,
+    abort_after_s: float | None = None,
+) -> None:
+    """Open a raw TCP HTTP stream and close it abruptly mid-prefill or mid-stream."""
+    parsed = urllib.parse.urlparse(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    body = dict(payload)
+    body["stream"] = True
+    raw_body = json.dumps(body).encode("utf-8")
+    req_bytes = (
+        f"POST /v1/chat/completions HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(raw_body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("utf-8") + raw_body
+
+    sock = socket.create_connection((host, port), timeout=15.0)
+    try:
+        sock.sendall(req_bytes)
+        if abort_after_s is not None:
+            time.sleep(abort_after_s)
+            return
+        buf = b""
+        seen = 0
+        target = stop_after_chunks or 4
+        while seen < target:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            seen = buf.count(b"data:")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _run_t4_fairness(base_url: str, model: str, failures: list[str]) -> None:
+    nonce = f"FAIR-{int(time.time() * 1000)}"
+    short_pl = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": f"[{nonce}] Explain in 2 sentences why 0.1 + 0.2 != 0.3 in IEEE-754."}],
+    }
+    long_lines = "\n".join(
+        f"Record {i:04d} [{nonce}]: val={(i * 2654435761) & 0xFFFF:04x} status=OK."
+        for i in range(1, 950)
+    )
+    long_pl = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": f"Summarize status for {nonce}:\n{long_lines}"}],
+    }
+
+    short_ref = _http_chat_stream(base_url, short_pl)
+    short_ref["sha256"] = _http_fp(short_ref)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        fut_long = ex.submit(_http_chat_stream, base_url, long_pl, 300.0)
+        time.sleep(0.25)
+        short_conc = _http_chat_stream(base_url, short_pl)
+        long_conc = fut_long.result()
+
+    short_conc["sha256"], short_conc["leaks"] = _http_fp(short_conc), _http_leaks(short_conc)
+    long_conc["sha256"], long_conc["leaks"] = _http_fp(long_conc), _http_leaks(long_conc)
+    long_ref = _http_chat_stream(base_url, long_pl)
+    long_ref["sha256"] = _http_fp(long_ref)
+
+    eq_short = short_conc["sha256"] == short_ref["sha256"]
+    eq_long = long_conc["sha256"] == long_ref["sha256"]
+    print(
+        f"[fairness        ] short ttft={short_conc['ttft_ms']:6.1f}ms dec={short_conc['dec_tps']:5.1f}t/s "
+        f"max_gap={short_conc['max_gap_ms']:6.1f}ms eq={eq_short} | long eq={eq_long} leaks={len(short_conc['leaks'])+len(long_conc['leaks'])}",
+        flush=True,
+    )
+    if not eq_short:
+        failures.append(f"fairness short SHA mismatch ({short_conc['sha256'][:12]} != {short_ref['sha256'][:12]})")
+    if not eq_long:
+        failures.append(f"fairness long SHA mismatch ({long_conc['sha256'][:12]} != {long_ref['sha256'][:12]})")
+    if short_conc["leaks"] or long_conc["leaks"]:
+        failures.append(f"fairness leaked control tokens: {short_conc['leaks'] + long_conc['leaks']}")
+    if short_conc["ttft_ms"] > 4000.0 or short_conc["max_gap_ms"] > 2500.0:
+        failures.append(
+            f"fairness interactive decode starved: ttft={short_conc['ttft_ms']:.1f}ms max_gap={short_conc['max_gap_ms']:.1f}ms"
+        )
+
+
+def _run_t4_multibranch(base_url: str, model: str, failures: list[str]) -> None:
+    nonce = f"MB-{int(time.time() * 1000)}"
+    rules = "\n".join(
+        f"Rule {i:02d} [{nonce}]: Preserve deterministic prefix trees and zero-copy KV retention ({i * 11 % 97})."
+        for i in range(1, 55)
+    )
+    sys_msg = {"role": "system", "content": rules}
+    pl_base = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "messages": [sys_msg, {"role": "user", "content": "Acknowledge the rules in one short line."}],
+    }
+    r_base = _http_chat_stream(base_url, pl_base)
+    c_after_base = _http_get_json(f"{base_url.rstrip('/')}/v1/cache/stats").get("engine_cache", {})
+    asst_base: dict[str, Any] = {"role": "assistant", "content": r_base["content"]}
+    if r_base.get("reasoning_content"):
+        asst_base["reasoning_content"] = r_base["reasoning_content"]
+
+    pl_a = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "messages": pl_base["messages"]
+        + [asst_base, {"role": "user", "content": "Branch A: " + ("alpha " * 260) + "Summarize Rule 01."}],
+    }
+    pl_b = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "messages": pl_base["messages"]
+        + [asst_base, {"role": "user", "content": "Branch B: State Rule 02 concisely."}],
+    }
+
+    r_a = _http_chat_stream(base_url, pl_a)
+    c_after_a = _http_get_json(f"{base_url.rstrip('/')}/v1/cache/stats").get("engine_cache", {})
+    r_b = _http_chat_stream(base_url, pl_b)
+    c_after_b = _http_get_json(f"{base_url.rstrip('/')}/v1/cache/stats").get("engine_cache", {})
+    r_b_rep = _http_chat_stream(base_url, pl_b)
+
+    sha_b, sha_b_rep = _http_fp(r_b), _http_fp(r_b_rep)
+    a_hits_delta = int(c_after_a.get("hits", 0)) - int(c_after_base.get("hits", 0))
+    saved_delta = int(c_after_b.get("tokens_saved", 0)) - int(c_after_a.get("tokens_saved", 0))
+    hits_delta = int(c_after_b.get("hits", 0)) - int(c_after_a.get("hits", 0))
+    rej = int(c_after_b.get("store_rejections", 0))
+    print(
+        f"[multibranch     ] base_ptok={r_base['usage'].get('prompt_tokens')} A_ptok={r_a['usage'].get('prompt_tokens')} "
+        f"A_hits_delta={a_hits_delta} B_hits_delta={hits_delta} B_saved_delta={saved_delta} B_eq={sha_b==sha_b_rep} store_rej={rej}",
+        flush=True,
+    )
+    if a_hits_delta < 1 or hits_delta < 1 or saved_delta < 700:
+        failures.append(
+            f"multibranch shared ancestor lost! A_hits={a_hits_delta}, B_hits={hits_delta}, B_saved_delta={saved_delta}"
+        )
+    if sha_b != sha_b_rep:
+        failures.append(f"multibranch Branch B parity mismatch ({sha_b[:12]} != {sha_b_rep[:12]})")
+    if rej != 0:
+        failures.append(f"multibranch store_rejections={rej} != 0")
+
+
+def _run_t4_disconnect_check(
+    base_url: str,
+    model: str,
+    failures: list[str],
+    *,
+    log_path: str = "",
+    log_offset: int = 0,
+    golden: dict[str, Any] | None = None,
+) -> None:
+    suite = _build_t4_suite(model)
+    mid_stream_pl = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "Write a detailed 20-step explanation of MergeSort with Python code."}],
+    }
+    nonce = f"ABORT-{int(time.time() * 1000)}"
+    mid_prefill_pl = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": f"[{nonce}] " + ("token_pad_0123456789 " * 1400)}],
+    }
+
+    _raw_http_abort(base_url, mid_stream_pl, stop_after_chunks=4)
+    _raw_http_abort(base_url, mid_prefill_pl, abort_after_s=0.15)
+
+    st = _http_chat_stream(base_url, suite["short_greedy"])
+    ns = _http_chat_nonstream(base_url, suite["short_greedy"])
+    st["sha256"], ns["sha256"] = _http_fp(st), _http_fp(ns)
+    if st["sha256"] != ns["sha256"]:
+        failures.append(f"disconnect follow-up stream != nonstream ({st['sha256'][:12]} != {ns['sha256'][:12]})")
+    if golden is not None:
+        g_sha = golden["cases"]["short_greedy"]["stream"]["sha256"]
+        if st["sha256"] != g_sha:
+            failures.append(f"disconnect follow-up SHA mismatch vs golden ({st['sha256'][:12]} != {g_sha[:12]})")
+
+    time.sleep(1.5)
+    status = _http_get_json(f"{base_url.rstrip('/')}/v1/status")
+    if status.get("num_running", -1) != 0 or status.get("num_waiting", -1) != 0:
+        failures.append(f"disconnect leaked active requests in /v1/status: {status}")
+
+    bad_lines: list[str] = []
+    if log_path and os.path.isfile(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(log_offset)
+            tail = f.read()
+        for pat in ("Task was destroyed but it is pending", "ERROR:asyncio", "Traceback (most recent call last)"):
+            if pat in tail:
+                bad_lines.append(pat)
+        if bad_lines:
+            failures.append(f"disconnect server log errors: {bad_lines}")
+    print(
+        f"[disconnect_check] follow_up_eq={st['sha256']==ns['sha256']} running={status.get('num_running')} "
+        f"waiting={status.get('num_waiting')} log_errors={bad_lines}",
+        flush=True,
+    )
+
+
+def _run_t4_cold_start(cold_model: str, cold_port: int, verify_path: str) -> int:
+    print(f"=== GATE T4 COLD-START + DISCONNECT CHECK (port={cold_port}, model={cold_model}) ===", flush=True)
+    expanded_model = os.path.expanduser(cold_model)
+    served_name = os.path.expanduser("~/loopling/models/loopling-p3")
+    base_url = f"http://127.0.0.1:{cold_port}"
+    golden = json.load(open(verify_path)) if verify_path else None
+    failures: list[str] = []
+
+    with tempfile.NamedTemporaryFile(prefix="vllm_gate_cold_", suffix=".log", delete=False) as tf:
+        log_path = tf.name
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{REPO_ROOT / 'vendor'}:{REPO_ROOT}"
+    env["HF_HUB_OFFLINE"] = "1"
+    env.setdefault("LOOPLING_SERVER_BATCHDECODE", "1")
+    env.setdefault("LOOPLING_MTP", "dflash2")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "vllm_mlx_inkling2.serve",
+        "serve",
+        expanded_model,
+        "--served-model-name",
+        served_name,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(cold_port),
+        "--continuous-batching",
+        "--max-tokens",
+        "32768",
+        "--max-request-tokens",
+        "1048576",
+        "--timeout",
+        "7200",
+        "--default-temperature",
+        "0.7",
+        "--default-top-p",
+        "0.95",
+        "--prefill-step-size",
+        "4096",
+        "--cache-memory-percent",
+        "0.70",
+        "--reasoning-parser",
+        "inkling2",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "inkling2",
+    ]
+    log_f = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=log_f, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.perf_counter() + 180.0
+        health: dict[str, Any] | None = None
+        while time.perf_counter() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"Cold server exited early (code={proc.returncode}), log={log_path}")
+            try:
+                health = _http_get_json(f"{base_url}/health", timeout=2.0)
+                if health.get("status") == "healthy" or health.get("model_name"):
+                    break
+            except Exception:
+                time.sleep(0.5)
+        if health is None:
+            raise TimeoutError(f"Cold server did not become healthy on port {cold_port}, log={log_path}")
+
+        model_id = health.get("model_name") or served_name
+        suite = _build_t4_suite(model_id)
+        mt_t1_pl = {
+            "model": model_id,
+            "temperature": 0.0,
+            "max_tokens": 128,
+            "messages": [
+                {"role": "system", "content": suite["multiturn_sys"]},
+                {"role": "user", "content": "Summarize Rule 01 and Rule 51 in one sentence each."},
+            ],
+        }
+
+        # Cold Request #1 immediately after boot!
+        req1 = _http_chat_stream(base_url, suite["short_greedy"])
+        req1["sha256"], req1["leaks"] = _http_fp(req1), _http_leaks(req1)
+        req2 = _http_chat_stream(base_url, mt_t1_pl)
+        req2["sha256"], req2["leaks"] = _http_fp(req2), _http_leaks(req2)
+        req1_warm = _http_chat_stream(base_url, suite["short_greedy"])
+        req1_warm["sha256"] = _http_fp(req1_warm)
+        req2_warm = _http_chat_stream(base_url, mt_t1_pl)
+        req2_warm["sha256"] = _http_fp(req2_warm)
+
+        status = _http_get_json(f"{base_url}/v1/status")
+        if env.get("LOOPLING_MTP") == "dflash2" and not (status.get("mtp") or {}).get("enabled"):
+            failures.append(f"cold-start /v1/status mtp.enabled is False under LOOPLING_MTP=dflash2: {status.get('mtp')}")
+
+        if req1["leaks"] or req2["leaks"]:
+            failures.append(f"cold-start leaked tags: {req1['leaks'] + req2['leaks']}")
+        if req1["sha256"] != req1_warm["sha256"]:
+            failures.append("cold Req #1 != warm Req #1 repeat")
+        if req2["sha256"] != req2_warm["sha256"]:
+            failures.append("cold Req #2 != warm Req #2 repeat")
+        if golden is not None:
+            if req1["sha256"] != golden["cases"]["short_greedy"]["stream"]["sha256"]:
+                failures.append("cold Req #1 SHA mismatch vs golden")
+            if req2["sha256"] != golden["cases"]["multiturn_t1"]["sha256"]:
+                failures.append("cold Req #2 SHA mismatch vs golden")
+
+        if req1["ttft_ms"] > 450.0 or req1["max_gap_ms"] > 120.0 or req1["dec_tps"] < req1_warm["dec_tps"] * 0.85:
+            failures.append(
+                f"cold Req #1 warmup tax detected: ttft={req1['ttft_ms']:.1f}ms max_gap={req1['max_gap_ms']:.1f}ms "
+                f"dec={req1['dec_tps']:.1f}t/s (warm={req1_warm['dec_tps']:.1f}t/s)"
+            )
+
+        log_f.flush()
+        with open(log_path, "r", encoding="utf-8", errors="replace") as lf:
+            boot_log = lf.read()
+        pos_start = boot_log.find("Starting server at")
+        pos_detok = boot_log.find("FastByteLevelDetokenizer verified")
+        if pos_detok != -1 and pos_start != -1 and pos_detok > pos_start:
+            failures.append("FastByteLevelDetokenizer verified lazily AFTER server started!")
+        if "warmup skipped:" in boot_log:
+            failures.append("Startup warmup skipped (check server log for warmup warning)!")
+
+        print(
+            f"[cold_req1       ] ttft={req1['ttft_ms']:6.1f}ms dec={req1['dec_tps']:5.1f}t/s (warm={req1_warm['dec_tps']:5.1f}) "
+            f"max_gap={req1['max_gap_ms']:5.1f}ms sha={req1['sha256'][:12]} mtp={(status.get('mtp') or {}).get('enabled')}",
+            flush=True,
+        )
+        print(
+            f"[cold_req2_l1897 ] ttft={req2['ttft_ms']:6.1f}ms dec={req2['dec_tps']:5.1f}t/s (warm={req2_warm['dec_tps']:5.1f}) "
+            f"max_gap={req2['max_gap_ms']:5.1f}ms sha={req2['sha256'][:12]}",
+            flush=True,
+        )
+
+        _run_t4_disconnect_check(base_url, model_id, failures, log_path=log_path, log_offset=0, golden=golden)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+        log_f.close()
+        if not failures:
+            try:
+                os.remove(log_path)
+            except OSError:
+                pass
+        else:
+            print(f"Preserved failing cold-start server log at {log_path}", flush=True)
+
+    if failures:
+        print("\n=== GATE T4 COLD-START FAILED ===", flush=True)
+        for f in failures:
+            print("  FAIL:", f, flush=True)
+        return 1
+    print("\nALL GATE T4 COLD-START & DISCONNECT CHECKS PASSED", flush=True)
+    return 0
+
+
+def run_t4(
+    base_url: str,
+    capture_path: str,
+    verify_path: str,
+    *,
+    fairness: bool = False,
+    multibranch: bool = False,
+    disconnect_check: bool = False,
+    server_log: str = "",
+) -> int:
     print(f"=== GATE T4: Live HTTP Golden & Perf Gate ({base_url}) ===", flush=True)
+    log_offset = os.path.getsize(server_log) if (disconnect_check and server_log and os.path.isfile(server_log)) else 0
     cur = _capture_t4(base_url)
     if capture_path:
         with open(capture_path, "w") as f:
@@ -1164,10 +1764,13 @@ def run_t4(base_url: str, capture_path: str, verify_path: str) -> int:
         failures.append("multiturn_t1_repeat != multiturn_t1")
     if not cur["parity_checks"]["c4_ge64_vs_c1_exact"]:
         failures.append("c4_ge64 concurrent != c1 refs (L>=64 regime must be 0-mm bit-exact!)")
+    t2_rej = (cur["cases"].get("multiturn_cache_stats") or {}).get("after_t2", {}).get("store_rejections", 0)
+    if t2_rej != 0:
+        failures.append(f"multiturn_t2 store_rejections={t2_rej} != 0")
 
+    golden = json.load(open(verify_path)) if verify_path else None
     # Golden comparison if --verify provided
-    if verify_path:
-        golden = json.load(open(verify_path))
+    if golden is not None:
         print("\n--- Golden Comparison (baseline -> current) ---", flush=True)
         for name in ("short_greedy", "medium_greedy", "tool_call_greedy"):
             g_st = golden["cases"][name]["stream"]
@@ -1211,6 +1814,21 @@ def run_t4(base_url: str, capture_path: str, verify_path: str) -> int:
                 if c1["sha256"] != g["sha256"] or c4["sha256"] != g["sha256"]:
                     failures.append(f"c4_ge64[{i}]: SHA mismatch vs golden")
 
+    model = cur["meta"]["model"]
+    if fairness:
+        _run_t4_fairness(base_url, model, failures)
+    if multibranch:
+        _run_t4_multibranch(base_url, model, failures)
+    if disconnect_check:
+        _run_t4_disconnect_check(
+            base_url,
+            model,
+            failures,
+            log_path=server_log,
+            log_offset=log_offset,
+            golden=golden,
+        )
+
     if failures:
         print("\n=== GATE T4 FAILED ===", flush=True)
         for f in failures:
@@ -1223,21 +1841,41 @@ def run_t4(base_url: str, capture_path: str, verify_path: str) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Bit-exactness verification gate for vllm-mlx + loopling-opt")
     ap.add_argument("gate", choices=("t1", "t2", "t3", "t4"))
-    ap.add_argument("--model", default="~/loopling/models/loopling-p3")
+    ap.add_argument("--model", default=os.environ.get("INKLING2_MODEL", "~/loopling/models/loopling-p3-tess"))
     ap.add_argument("--url", default="http://512s2.tail91699.ts.net:8080")
     ap.add_argument("--capture", default="")
     ap.add_argument("--verify", default="")
     ap.add_argument("--with-spec", action="store_true")
+    ap.add_argument("--skip-131k", action="store_true")
+    ap.add_argument("--fairness", action="store_true")
+    ap.add_argument("--multibranch", action="store_true")
+    ap.add_argument("--disconnect-check", action="store_true")
+    ap.add_argument("--server-log", default="")
+    ap.add_argument("--cold-start", action="store_true")
+    ap.add_argument("--cold-port", type=int, default=18080)
+    ap.add_argument("--cold-model", default="~/loopling/models/loopling-p3-tess")
     args = ap.parse_args()
 
     if args.gate == "t1":
         sys.exit(run_t1(args.model))
     elif args.gate == "t2":
-        sys.exit(run_t2(args.model))
+        sys.exit(run_t2(args.model, skip_131k=args.skip_131k))
     elif args.gate == "t3":
         sys.exit(run_t3(with_spec=args.with_spec))
     elif args.gate == "t4":
-        sys.exit(run_t4(args.url, args.capture, args.verify))
+        if args.cold_start:
+            sys.exit(_run_t4_cold_start(args.cold_model, args.cold_port, args.verify))
+        sys.exit(
+            run_t4(
+                args.url,
+                args.capture,
+                args.verify,
+                fairness=args.fairness,
+                multibranch=args.multibranch,
+                disconnect_check=args.disconnect_check,
+                server_log=args.server_log,
+            )
+        )
 
 
 if __name__ == "__main__":

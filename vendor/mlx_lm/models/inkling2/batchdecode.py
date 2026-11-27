@@ -267,7 +267,7 @@ def build_multi_chain_conv_anc(C: int, W: int):
     return arr
 KV_STAGE_CAP = 32
 _BATCH_KV_STAGE_CAP = int(os.environ.get("LOOPLING_KV_STAGE_CAP", "128"))
-_KV_STACK_MAX_CAP = int(os.environ.get("LOOPLING_KV_STACK_MAX_CAP", "131072"))
+_KV_STACK_MAX_CAP = int(os.environ.get("LOOPLING_KV_STACK_MAX_CAP", "32768"))
 
 
 def _kv_stack_max_cap() -> int:
@@ -1262,7 +1262,7 @@ def _layer_causal_w_body(
     layer, v, h, bs, msg, W, tau_cache=None, depths=None, conv_anc=None, tree_meta=None,
     depths_arr=None, tau_lut=None, tau_table=None, meta_arr=None, s_bounds=None,
     prev_moe=None, skip_combine=False, emit_h=False, use_stage=False, w_act=None, kv=None,
-    b1_unp_full=None,
+    b1_unp_full=None, unp_full_args=None,
 ):
     a, sliding, op_m, rel_proj, scale, window, rot, max_size = cw_meta[v]
     cs = conv_list[v]
@@ -1309,7 +1309,20 @@ def _layer_causal_w_body(
                 if tau_cache is not None:
                     tau_cache[tkey] = tau_w
     rel_w_bf = FD._rel_w_bf(rel_proj)
-    if not sliding and b1_unp_full is not None and kv is not None and kv._packed is None:
+    if not sliding and unp_full_args is not None:
+        q, kv_new, pb, w0, w1 = RM.mid_causal_w_flat(
+            layer, qkv_flat, qkv_lay, cs[0], cs[1], W, tau=tau_w, rel_w=rel_w_bf, conv_anc=conv_anc, w_act=w_act,
+        )
+        k_m_v, v_m_v, unp_st, u_meta_v, unp_nsplits = unp_full_args
+        mta_unp = mx.concatenate([meta_arr[0:1], u_meta_v[0:3], meta_arr[6:8], u_meta_v[3:5]])
+        attn_out = RS.sdpa_long_full_staged_unpacked(
+            q, k_m_v, v_m_v, kv_new, pb, qkv_flat, gate_off, sink_off,
+            0, int(unp_nsplits) * 256, 0, 0, int(W),
+            scale=scale, kv_layer_idx=-1, tree_meta=tree_meta,
+            meta_arr=mta_unp, kv_stage=unp_st, w_act=w_act,
+            gate_stride=gate_stride, sink_stride=sink_stride,
+        )
+    elif not sliding and b1_unp_full is not None and kv is not None and kv._packed is None:
         q, kv_new, pb, w0, w1 = RM.mid_causal_w_flat(
             layer, qkv_flat, qkv_lay, cs[0], cs[1], W, tau=tau_w, rel_w=rel_w_bf, conv_anc=conv_anc, w_act=w_act,
         )
@@ -1499,11 +1512,13 @@ class BatchDecoder:
         self._cw_meta = None
         self._static_kv_vmap = None
         self._b1_unpacked_full = False
+        self._ring_stacked = False
         self._b1_full_unp_visits = ()
         self._b1_full_unp_map = {}
         self._b1_full_unp_st = None
         self._b1_full_unp_len = 0
         self._b1_full_unp_slot0 = 0
+        self._unp_meta_cache = {}
         if self._b1_fast:
             self.conv = [[caches[0][v][1].cache[j] for j in range(4)] for v in range(self.nv)]
             rot_sig = tuple(
@@ -1704,6 +1719,12 @@ class BatchDecoder:
         """Restore per-visit 4D `_packed` buffers onto caches if currently stacked."""
         self._flush_b1_pending()
         if not self._kv_stacked:
+            if self._ring_stacked and self._kv_ring is not None:
+                buf = self._kv_ring
+                self._kv_ring = None
+                for i, v in enumerate(self._ring_visits):
+                    self.caches[0][v][0]._packed = mx.contiguous(buf[i])
+                self._ring_stacked = False
             return
         self.flush_kv_stage()
         if self._kv_ring is not None:
@@ -1861,8 +1882,50 @@ class BatchDecoder:
         self._b1_st_prev_r = None
         self._b1_st_prev_f = None
 
+    def _ensure_unpacked_full_gpu_ready(self) -> bool:
+        """Stack only sliding-window ring KV (<=160 MiB) + ensure 4K-slot full-KV stage for unpacked PA."""
+        if not self._b1_unpacked_full:
+            return False
+        self._flush_b1_pending()
+        ring_v = tuple(v for v in range(self.nv) if hasattr(self.caches[0][v][0], "_idx"))
+        if not ring_v or not self._b1_full_unp_visits:
+            return False
+        if not self._ring_stacked:
+            kvs_r = [self.caches[0][v][0] for v in ring_v]
+            if any(kv._packed is None for kv in kvs_r):
+                return False
+            self._kv_ring = mx.contiguous(mx.stack([kv._packed for kv in kvs_r], axis=0))
+            for kv in kvs_r:
+                kv._packed = None
+            self._ring_visits = ring_v
+            self._ring_stacked = True
+            mx.eval(self._kv_ring)
+        if self._b1_full_unp_st is None:
+            self._ensure_b1_full_unp_stage(4096)
+        elif int(self._b1_full_unp_st.shape[3]) < 4096:
+            self._ensure_b1_full_unp_stage(4096 - int(self._b1_full_unp_len))
+        return True
+
     def ensure_gpu_cap(self, extra: int) -> bool:
         """Pre-grow stacked ring/full KV buffers for `extra` upcoming tokens so GPU commits can donate in place."""
+        if self._b1_unpacked_full:
+            if not self._ensure_unpacked_full_gpu_ready():
+                return False
+            ex = int(extra)
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            end0_r = int(kv_r.offset)
+            cap_r = int(self._kv_ring.shape[3])
+            max_size_r = int(kv_r.max_size)
+            if cap_r < max_size_r and end0_r + ex > cap_r:
+                buf = self._kv_ring
+                self._kv_ring = None
+                target_cap = min(max_size_r, ((end0_r + ex + kv_r.step - 1) // kv_r.step) * kv_r.step)
+                ext = mx.zeros((len(self._ring_visits), 2, buf.shape[2], target_cap - cap_r, buf.shape[4]), buf.dtype)
+                self._kv_ring = mx.concatenate([buf, ext], axis=3)
+                mx.eval(self._kv_ring)
+            if self._b1_full_unp_len + ex > int(self._b1_full_unp_st.shape[3]):
+                self._flush_b1_full_unpacked()
+            return True
         if not self._ensure_stacked_kv() or not self._ring_visits or not self._full_visits:
             return False
         self.flush_kv_stage()
@@ -1901,7 +1964,22 @@ class BatchDecoder:
         return True
 
     def get_gpu_meta(self, staged: bool = False):
-        """Return `(meta_r, meta_f)` 6-int32 (or 8-int32 when staged=True) GPU arrays matching current KV state."""
+        """Return `(meta_r, meta_f)` 6-int32 (or 8-int32 when staged=True or unpacked-full) GPU arrays."""
+        if self._b1_unpacked_full:
+            assert self._ring_stacked and self._ring_visits and self._b1_full_unp_visits and self._b1_full_unp_st is not None
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            kv_f = self.caches[0][self._b1_full_unp_visits[0]][0]
+            end0_r = int(kv_r.offset)
+            max_size_r = int(kv_r.max_size)
+            cap_r = int(self._kv_ring.shape[3])
+            slot0_r = 0 if kv_r._idx == max_size_r else int(kv_r._idx)
+            s0_r = min(end0_r, max_size_r)
+            end0_f = int(kv_f.offset)
+            st_len = int(self._b1_full_unp_len)
+            slot_f = int(self._b1_full_unp_slot0)
+            return _get_cw_meta_arr(
+                (s0_r, end0_r, slot0_r, cap_r, max_size_r, 0, slot_f, st_len)
+            ), _get_cw_meta_arr((end0_f, end0_f, 0, 0, 0, 0, slot_f, st_len))
         assert self._kv_stacked and self._ring_visits and self._full_visits
         kv_r = self.caches[0][self._ring_visits[0]][0]
         kv_f = self.caches[0][self._full_visits[0]][0]
@@ -1924,7 +2002,7 @@ class BatchDecoder:
     def sync_kv_offsets(self, delta_keep: int, *, staged: bool = False):
         """Advance CPU KV `offset` and `_idx` counters by `delta_keep` after GPU commit."""
         d = int(delta_keep)
-        assert d >= 1 and self._kv_stacked
+        assert d >= 1 and (self._kv_stacked or self._ring_stacked)
         if staged:
             self._kv_st_len += d
         if self._ring_visits:
@@ -1937,7 +2015,12 @@ class BatchDecoder:
                 kv = self.caches[0][v][0]
                 kv.offset = new_off
                 kv._idx = new_idx
-        if self._full_visits:
+        if self._b1_unpacked_full:
+            self._b1_full_unp_len += d
+            new_off = int(self._b1_full_unp_slot0) + int(self._b1_full_unp_len)
+            for v in self._b1_full_unp_visits:
+                self.caches[0][v][0].offset = new_off
+        elif self._full_visits:
             new_off = int(self.caches[0][self._full_visits[0]][0].offset) + d
             for v in self._full_visits:
                 self.caches[0][v][0].offset = new_off
@@ -1958,7 +2041,10 @@ class BatchDecoder:
                 out.append(self._kv_full)
             return out
         if self._b1_unpacked_full:
-            out = [c[0]._packed for c in self.caches[0] if c[0]._packed is not None]
+            if self._ring_stacked and self._kv_ring is not None:
+                out = [self._kv_ring]
+            else:
+                out = [c[0]._packed for c in self.caches[0] if c[0]._packed is not None]
             if self._b1_full_unp_st is not None:
                 out.append(self._b1_full_unp_st)
             return out
@@ -2096,8 +2182,8 @@ class BatchDecoder:
                             self._b1_full_unp_st[fi, 1, :, :k, :][None],
                         )
                 else:
-                    if self._kv_stacked:
-                        is_ring, lidx = self._kv_vmap[v]
+                    if self._kv_stacked or (self._ring_stacked and not (self._b1_unpacked_full and v in self._b1_full_unp_map)):
+                        is_ring, lidx = self._static_kv_vmap[v] if self._b1_unpacked_full else self._kv_vmap[v]
                         pk = (self._kv_ring if is_ring else self._kv_full)[lidx]
                     else:
                         pk = kv._packed
@@ -2399,7 +2485,11 @@ class BatchDecoder:
         depths_arr=None, tau_lut=None, tau_table=None, meta_arr=None, s_bounds=None,
         prev_moe=None, skip_combine=False, emit_h=False, use_stage=False, w_act=None,
     ):
-        kv_vmap = self._kv_vmap if self._kv_stacked else None
+        kv_vmap = (
+            self._static_kv_vmap
+            if (self._b1_unpacked_full and self._ring_stacked)
+            else (self._kv_vmap if self._kv_stacked else None)
+        )
         kv = self.caches[0][v][0]
         b1_unp = None
         if self._b1_unpacked_full and v in self._b1_full_unp_map:
@@ -3739,6 +3829,25 @@ class BatchDecoder:
         return (True, blk_max)
 
     def _cw_safe_bounds_range(self, end_lo: int, end_hi: int, max_depth: int):
+        if self._b1_unpacked_full:
+            if not self._ring_stacked or not self._ring_visits or not self._b1_full_unp_visits or self._b1_full_unp_st is None:
+                return False, None
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            max_size_r = int(kv_r.max_size)
+            cap_r = int(self._kv_ring.shape[3])
+            scap_f = int(self._b1_full_unp_st.shape[3])
+            s_min_r = min(int(end_lo) + 1, max_size_r)
+            s_max_r = min(int(end_hi) + int(max_depth) + 1, max_size_r)
+            s_min_f = int(end_lo) + 1
+            s_max_f = int(end_hi) + int(max_depth) + 1
+            r_key = self._regime_key(s_min_r, s_max_r)
+            if r_key is None or s_min_f < RS._LONG_SDPA_MIN_S:
+                return False, None
+            if (int(end_hi) - int(self._b1_full_unp_slot0) + int(max_depth) + 1) > scap_f:
+                return False, None
+            ns_bucket = max(1, (s_max_f + 8191) // 8192) * 32
+            f_key = ("unp_long", ns_bucket)
+            return True, (r_key, f_key, (s_min_r, s_max_r), (s_min_f, s_max_f), cap_r, scap_f, max_size_r)
         if not self._kv_stacked or not self._ring_visits or not self._full_visits:
             return False, None
         kv_r = self.caches[0][self._ring_visits[0]][0]
@@ -3756,6 +3865,30 @@ class BatchDecoder:
         return True, (r_key, f_key, (s_min_r, s_max_r), (s_min_f, s_max_f), cap_r, cap_f, max_size_r)
 
     def _cw_safe_bounds(self, max_depth):
+        if self._b1_unpacked_full:
+            if not self._ensure_unpacked_full_gpu_ready():
+                return False, None
+            kv_r = self.caches[0][self._ring_visits[0]][0]
+            kv_f = self.caches[0][self._b1_full_unp_visits[0]][0]
+            end0_r = int(kv_r.offset)
+            max_size_r = int(kv_r.max_size)
+            cap_r = int(self._kv_ring.shape[3])
+            s_min_r = min(end0_r + 1, max_size_r)
+            s_max_r = min(end0_r + max_depth + 1, max_size_r)
+            end0_f = int(kv_f.offset)
+            s_min_f = end0_f + 1
+            s_max_f = end0_f + max_depth + 1
+            r_key = self._regime_key(s_min_r, s_max_r)
+            if r_key is None or s_min_f < RS._LONG_SDPA_MIN_S:
+                return False, None
+            scap_f = int(self._b1_full_unp_st.shape[3])
+            if (end0_f - int(self._b1_full_unp_slot0) + int(max_depth) + 1) > scap_f:
+                self._flush_b1_full_unpacked()
+                scap_f = int(self._b1_full_unp_st.shape[3])
+            ns_bucket = max(1, (s_max_f + 8191) // 8192) * 32
+            f_key = ("unp_long", ns_bucket)
+            meta_r, meta_f = self.get_gpu_meta(staged=False)
+            return True, (r_key, f_key, meta_r, meta_f, (s_min_r, s_max_r), (s_min_f, s_max_f), end0_f, cap_r, scap_f)
         if not self._kv_stacked or not self._ring_visits or not self._full_visits:
             return False, None
         kv_r = self.caches[0][self._ring_visits[0]][0]
@@ -3782,10 +3915,28 @@ class BatchDecoder:
         meta_f = _get_cw_meta_arr((end0_f, end0_f, 0, cap_f, 0, 0))
         return True, (r_key, f_key, meta_r, meta_f, (s_min_r, s_max_r), (s_min_f, s_max_f), end0_f, cap_r, cap_f)
 
+    def _unp_chunk_inputs(self, fvs, scap: int, nsplits: int):
+        fmap = self._b1_full_unp_map
+        ks, vs, ms = [], [], []
+        for v in fvs:
+            fi = fmap[v]
+            kv = self.caches[0][v][0]
+            kcap, vcap = int(kv._keys.shape[2]), int(kv._values.shape[2])
+            ks.append(kv._keys)
+            vs.append(kv._values)
+            mk = (kcap, vcap, fi, scap, nsplits)
+            marr = self._unp_meta_cache.get(mk)
+            if marr is None:
+                if len(self._unp_meta_cache) >= 256:
+                    self._unp_meta_cache.clear()
+                marr = self._unp_meta_cache[mk] = mx.array(mk, mx.int32)
+            ms.append(marr)
+        return ks + vs + ms
+
     def _get_cw_compiled(
         self, W, max_depth, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, tap_tuple,
         use_tau_table=False, tau_size=0, use_walk=False, fuse_k1=None, use_stage=False, use_dyn=False,
-        return_h_out=False,
+        return_h_out=False, unp_full=False, unp_scap=0, unp_nsplits=0,
     ):
         if fuse_k1 is None:
             fuse_k1 = (not use_dyn) and (os.environ.get("LOOPLING_FUSE_COMB_K1", "0") not in ("0", ""))
@@ -3794,6 +3945,7 @@ class BatchDecoder:
         key = (
             W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple,
             use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, return_h_out, sdpa_mid_cw,
+            unp_full, unp_scap, unp_nsplits,
             _env_compile_sig(),
         )
         ent = self._cw_compiled.get(key)
@@ -3808,16 +3960,18 @@ class BatchDecoder:
         kv_vmap = self._static_kv_vmap
         has_o = "o" in tap_set
         has_F = tap_tuple is not None
+        is_meta8 = bool(use_stage or unp_full)
 
         def make_chunk(v0, v1, is_first=False, is_last=False):
             n_v = v1 - v0
             t_in_chunk = frozenset(v for v in range(v0, v1) if v in tap_set)
             f_vs = [v for v in range(v0, v1) if not cw_meta[v][1]]
             f_pos = {v: i for i, v in enumerate(f_vs)}
+            n_f_chunk = len(f_vs)
             n_bs_pre = sum(1 for v in range(0, v1) if layers_seq[v].is_block_boundary)
 
             @mx.compile
-            def fn(h_or_toks, bs_in, kv_r, kv_f, kv_st_r, kv_st_f, ca_in, tm_in, dep_in, m_r, m_f, tau_luts, w_act_in, walk_in, *convs):
+            def fn(h_or_toks, bs_in, kv_r, kv_f, kv_st_r, kv_st_f, ca_in, tm_in, dep_in, m_r, m_f, tau_luts, w_act_in, walk_in, unp_in, *convs):
                 conv_local = [None] * nv
                 for j, v in enumerate(range(v0, v1)):
                     conv_local[v] = [convs[4 * j], convs[4 * j + 1], convs[4 * j + 2], convs[4 * j + 3]]
@@ -3836,6 +3990,10 @@ class BatchDecoder:
                         or (is_last and v == v1 - 1)
                     )
                     use_prev = prev_moe is not None
+                    unp_args = None
+                    if unp_full and not is_ring:
+                        fi_c = f_pos[v]
+                        unp_args = (unp_in[fi_c], unp_in[n_f_chunk + fi_c], kv_st_f, unp_in[2 * n_f_chunk + fi_c], unp_nsplits)
                     out_v, bs, kvn, cw, prev_w3, h_before_v = _layer_causal_w_body(
                         cw_meta, kv_vmap, kv_r, kv_f, kst_r_arg, kst_f_arg, conv_local,
                         layers_seq[v], v, h, bs, None, W,
@@ -3846,7 +4004,7 @@ class BatchDecoder:
                         s_bounds=(s_bounds_r if is_ring else s_bounds_f),
                         conv_anc=ca_in, tree_meta=tm_in,
                         prev_moe=prev_moe, skip_combine=skip_v, emit_h=use_prev,
-                        use_stage=use_stage, w_act=wa,
+                        use_stage=use_stage, w_act=wa, unp_full_args=unp_args,
                     )
                     if v in t_in_chunk:
                         taps_out.append(h_before_v)
@@ -3919,7 +4077,7 @@ class BatchDecoder:
         c2 = make_chunk(14, 24, is_last=True)
         if len(self._cw_compiled) >= 64:
             self._cw_compiled.clear()
-        ent = self._cw_compiled[key] = (c0, c1, c2, use_walk, use_stage)
+        ent = self._cw_compiled[key] = (c0, c1, c2, use_walk, is_meta8)
         return ent
 
     @staticmethod
@@ -3987,7 +4145,8 @@ class BatchDecoder:
         tap_visits=None, par_arr=None, dr_pos=None, use_stage=False, w_act=None, sampler=None, coupled=None,
     ):
         """Non-mutating causal W-token verify using GPU `meta_arr` and `tau_table`, without mid-async_eval."""
-        assert self._b1_fast and self._kv_stacked
+        assert self._b1_fast and (self._kv_stacked or (self._b1_unpacked_full and self._ring_stacked))
+        unp_full = bool(self._b1_unpacked_full)
         tm = self.tm
         num_passes = tm.args.loop_config["num_passes"]
         assert not (tm.loopcd.enabled_for(num_passes) and tm.loopcd.mode != "hidden")
@@ -4000,6 +4159,9 @@ class BatchDecoder:
         return_h_out = not is_greedy
         use_dyn = w_act is not None
         r_key, f_key, s_b_r, s_b_f, cap_r, cap_f, _ = binfo
+        unp_scap = cap_f if unp_full else 0
+        unp_nsplits = int(f_key[1]) if unp_full else 0
+        is_meta8 = bool(use_stage or unp_full)
         tap_set = set(tap_visits) if tap_visits is not None else set()
         tap_tuple = (
             tuple(sorted(tap_set, key=lambda k: (0, k) if isinstance(k, int) else (1, str(k))))
@@ -4010,25 +4172,29 @@ class BatchDecoder:
         tau_size = max(4096, ((int(tau_cap) + 4095) // 4096) * 4096)
         conv_flat = [x for cs in self.conv for x in cs]
         kst_r = self._kv_ring_st if use_stage else []
-        kst_f = self._kv_full_st if use_stage else []
+        kst_f = self._b1_full_unp_st if unp_full else (self._kv_full_st if use_stage else [])
+        kv_f_arg = [] if unp_full else self._kv_full
         wa_in = [w_act] if use_dyn else []
 
         if num_passes == 1 and self.nv == 24:
             (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
                 W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
                 use_tau_table=True, tau_size=tau_size, use_walk=compile_walk, use_stage=use_stage, use_dyn=use_dyn,
-                return_h_out=return_h_out,
+                return_h_out=return_h_out, unp_full=unp_full, unp_scap=unp_scap, unp_nsplits=unp_nsplits,
             )
             ttbl0 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs0]
             ttbl1 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs1]
             ttbl2 = [_get_tau_table(layers_seq[v], tau_size) for v in fvs2]
+            unp0 = self._unp_chunk_inputs(fvs0, unp_scap, unp_nsplits) if unp_full else []
+            unp1 = self._unp_chunk_inputs(fvs1, unp_scap, unp_nsplits) if unp_full else []
+            unp2 = self._unp_chunk_inputs(fvs2, unp_scap, unp_nsplits) if unp_full else []
 
-            o0 = fn0(tokens, [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl0, wa_in, [], *conv_flat[:24])
-            o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl1, wa_in, [], *conv_flat[24:56])
-            o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl2, wa_in, [tokens, par_arr, dr_pos] if compile_walk else [], *conv_flat[56:])
+            o0 = fn0(tokens, [], self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl0, wa_in, [], unp0, *conv_flat[:24])
+            o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl1, wa_in, [], unp1, *conv_flat[24:56])
+            o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta, depths_arr, meta_r, meta_f, ttbl2, wa_in, [tokens, par_arr, dr_pos] if compile_walk else [], unp2, *conv_flat[56:])
             ret, kv_news, conv_ws, tap_buf = self._unpack_cw_outputs(
                 o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None,
-                use_walk=compile_walk, use_stage=use_stage,
+                use_walk=compile_walk, use_stage=is_meta8,
             )
             if return_h_out:
                 if coupled is not None and use_walk:
@@ -4053,14 +4219,15 @@ class BatchDecoder:
         chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
             W, max_depth, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
             use_tau_table=True, tau_size=tau_size, use_walk=compile_walk, use_stage=use_stage, use_dyn=use_dyn,
-            return_h_out=return_h_out,
+            return_h_out=return_h_out, unp_full=unp_full, unp_scap=unp_scap, unp_nsplits=unp_nsplits,
         )
         outs_all = []
         fn0, v0, v1, nbs_pre, fvs0, tks0 = chunks[0]
         ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in fvs0]
+        unp0 = self._unp_chunk_inputs(fvs0, unp_scap, unp_nsplits) if unp_full else []
         o_pre = fn0(
-            tokens, [], [], [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
-            depths_arr, meta_r, meta_f, ttbl, wa_in, [], *conv_flat[4 * v0 : 4 * v1],
+            tokens, [], [], [], self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta,
+            depths_arr, meta_r, meta_f, ttbl, wa_in, [], unp0, *conv_flat[4 * v0 : 4 * v1],
         )
         outs_all.append((o_pre, v1 - v0, 1 + nbs_pre, tks0))
         h_pre = o_pre[0]
@@ -4070,16 +4237,17 @@ class BatchDecoder:
         for p in range(num_passes):
             fn_p, pv0, pv1, nbs_p, pfvs, ptks = chunks[1 + p]
             ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in pfvs]
+            unp_p = self._unp_chunk_inputs(pfvs, unp_scap, unp_nsplits) if unp_full else []
             if p == 0:
                 o_p = fn_p(
-                    h_pre, bs_pre, [], [], self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
-                    depths_arr, meta_r, meta_f, ttbl, wa_in, [], *conv_flat[4 * pv0 : 4 * pv1],
+                    h_pre, bs_pre, [], [], self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta,
+                    depths_arr, meta_r, meta_f, ttbl, wa_in, [], unp_p, *conv_flat[4 * pv0 : 4 * pv1],
                 )
             else:
                 o_p = fn_p(
                     o_prev[0], o_prev[1 : 1 + n_bs_core], h_pre, bs_pre,
-                    self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
-                    depths_arr, meta_r, meta_f, ttbl, wa_in, [], *conv_flat[4 * pv0 : 4 * pv1],
+                    self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta,
+                    depths_arr, meta_r, meta_f, ttbl, wa_in, [], unp_p, *conv_flat[4 * pv0 : 4 * pv1],
                 )
             outs_all.append((o_p, pv1 - pv0, 1 + nbs_p, ptks))
             o_prev = o_p
@@ -4087,13 +4255,14 @@ class BatchDecoder:
                 ref_o = o_p
         fn_c, cv0, cv1, _, cfvs, ctks = chunks[-1]
         ttbl = [_get_tau_table(layers_seq[v], tau_size) for v in cfvs]
+        unp_c = self._unp_chunk_inputs(cfvs, unp_scap, unp_nsplits) if unp_full else []
         h_aux = ref_o[0] if cd_on else []
         bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
-        head_c = (12 if use_stage else 11) if compile_walk else 1
+        head_c = (12 if is_meta8 else 11) if compile_walk else 1
         o_c = fn_c(
             o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
-            self._kv_ring, self._kv_full, kst_r, kst_f, conv_anc, tree_meta,
-            depths_arr, meta_r, meta_f, ttbl, wa_in, [tokens, par_arr, dr_pos] if compile_walk else [],
+            self._kv_ring, kv_f_arg, kst_r, kst_f, conv_anc, tree_meta,
+            depths_arr, meta_r, meta_f, ttbl, wa_in, [tokens, par_arr, dr_pos] if compile_walk else [], unp_c,
             *conv_flat[4 * cv0 : 4 * cv1],
         )
         outs_all.append((o_c, cv1 - cv0, head_c, ctks))
@@ -4131,7 +4300,7 @@ class BatchDecoder:
     def _get_cw_compiled_loop(
         self, W, max_depth, r_key, f_key, cap_r, cap_f, s_bounds_r, s_bounds_f, tap_tuple,
         use_tau_table=False, tau_size=0, use_walk=False, fuse_k1=None, use_stage=False, use_dyn=False,
-        return_h_out=False,
+        return_h_out=False, unp_full=False, unp_scap=0, unp_nsplits=0,
     ):
         if fuse_k1 is None:
             fuse_k1 = (not use_dyn) and (os.environ.get("LOOPLING_FUSE_COMB_K1", "0") not in ("0", ""))
@@ -4149,6 +4318,7 @@ class BatchDecoder:
         key = (
             "loop", W, md_key, r_key, f_key, cap_r, cap_f, tap_tuple,
             use_tau_table, tau_size, use_walk, fuse_k1, use_stage, use_dyn, num_passes, cd_key, return_h_out, sdpa_mid_cw,
+            unp_full, unp_scap, unp_nsplits,
             _env_compile_sig(),
         )
         ent = self._cw_compiled.get(key)
@@ -4171,12 +4341,13 @@ class BatchDecoder:
             t_in_chunk = frozenset(v for v in range(v0, v1) if v in tap_set)
             f_vs = [v for v in range(v0, v1) if not cw_meta[v][1]]
             f_pos = {v: i for i, v in enumerate(f_vs)}
+            n_f_chunk = len(f_vs)
 
             @mx.compile
             def fn(
                 h_in, bs_in, h_aux, bs_aux,
                 kv_r, kv_f, kv_st_r, kv_st_f,
-                ca_in, tm_in, dep_in, m_r, m_f, tau_luts, w_act_in, walk_in, *convs
+                ca_in, tm_in, dep_in, m_r, m_f, tau_luts, w_act_in, walk_in, unp_in, *convs
             ):
                 conv_local = [None] * nv
                 for j, v in enumerate(range(v0, v1)):
@@ -4220,6 +4391,10 @@ class BatchDecoder:
                     )
                     use_prev = prev_moe is not None
                     msg_v = None if msgs is None else msgs[j]
+                    unp_args = None
+                    if unp_full and not is_ring:
+                        fi_c = f_pos[v]
+                        unp_args = (unp_in[fi_c], unp_in[n_f_chunk + fi_c], kv_st_f, unp_in[2 * n_f_chunk + fi_c], unp_nsplits)
                     out_v, bs, kvn, cw, prev_w3, h_before_v = _layer_causal_w_body(
                         cw_meta, kv_vmap, kv_r, kv_f, kst_r_arg, kst_f_arg, conv_local,
                         layers_seq[v], v, h, bs, msg_v, W,
@@ -4230,7 +4405,7 @@ class BatchDecoder:
                         s_bounds=(s_bounds_r if is_ring else s_bounds_f),
                         conv_anc=ca_in, tree_meta=tm_in,
                         prev_moe=prev_moe, skip_combine=skip_v, emit_h=use_prev,
-                        use_stage=use_stage, w_act=wa,
+                        use_stage=use_stage, w_act=wa, unp_full_args=unp_args,
                     )
                     if v in t_in_chunk:
                         taps_out.append(h_before_v)
@@ -4353,6 +4528,11 @@ class BatchDecoder:
             safe, binfo = self._cw_safe_bounds(max_d)
             if safe:
                 r_key, f_key, m_r, m_f, s_b_r, s_b_f, end0_f, cap_r, cap_f = binfo
+                unp_full = bool(self._b1_unpacked_full)
+                unp_scap = cap_f if unp_full else 0
+                unp_nsplits = int(f_key[1]) if unp_full else 0
+                kv_f_arg = [] if unp_full else self._kv_full
+                kst_f_arg = self._b1_full_unp_st if unp_full else []
                 tap_set = set(tap_visits) if tap_visits is not None else set()
                 tap_tuple = tuple(sorted(tap_set, key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))) if tap_visits is not None else None
                 layers_seq = tm.layer_visits
@@ -4360,17 +4540,20 @@ class BatchDecoder:
                 if num_passes == 1 and self.nv == 24:
                     (fn0, nv0, nbs0, fvs0, tks0), (fn1, nv1, nbs1, fvs1, tks1), (fn2, nv2, _, fvs2, tks2), _, _ = self._get_cw_compiled(
                         W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-                        return_h_out=want_h,
+                        return_h_out=want_h, unp_full=unp_full, unp_scap=unp_scap, unp_nsplits=unp_nsplits,
                     )
                     tluts0 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
                     tluts1 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs1]
                     tluts2 = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs2]
+                    unp0 = self._unp_chunk_inputs(fvs0, unp_scap, unp_nsplits) if unp_full else []
+                    unp1 = self._unp_chunk_inputs(fvs1, unp_scap, unp_nsplits) if unp_full else []
+                    unp2 = self._unp_chunk_inputs(fvs2, unp_scap, unp_nsplits) if unp_full else []
 
-                    o0 = fn0(tokens, [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts0, [], [], *conv_flat[:24])
+                    o0 = fn0(tokens, [], self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta, depths_arr, m_r, m_f, tluts0, [], [], unp0, *conv_flat[:24])
                     mx.async_eval(o0[0])
-                    o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts1, [], [], *conv_flat[24:56])
+                    o1 = fn1(o0[0], o0[1 : 1 + nbs0], self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta, depths_arr, m_r, m_f, tluts1, [], [], unp1, *conv_flat[24:56])
                     mx.async_eval(o1[0])
-                    o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta, depths_arr, m_r, m_f, tluts2, [], [], *conv_flat[56:])
+                    o2 = fn2(o1[0], o1[1 : 1 + nbs1], self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta, depths_arr, m_r, m_f, tluts2, [], [], unp2, *conv_flat[56:])
                     ret, kv_news, conv_ws, tap_buf = self._unpack_cw_outputs(o0, o1, o2, nv0, nv1, nv2, nbs0, nbs1, tks0, tks1, tks2, tap_visits is not None)
                     if not return_h_out and want_h:
                         ret = self._sample_verify_tokens(ret, sampler)
@@ -4378,15 +4561,16 @@ class BatchDecoder:
 
                 chunks, pre_n, n_bs_core, cd_on, ref_pass, blend_bs = self._get_cw_compiled_loop(
                     W, max_d, r_key, f_key, cap_r, cap_f, s_b_r, s_b_f, tap_tuple,
-                    return_h_out=want_h,
+                    return_h_out=want_h, unp_full=unp_full, unp_scap=unp_scap, unp_nsplits=unp_nsplits,
                 )
                 outs_all = []
                 # Prelude
                 fn0, v0, v1, nbs_pre, fvs0, tks0 = chunks[0]
                 tluts = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in fvs0]
+                unp0 = self._unp_chunk_inputs(fvs0, unp_scap, unp_nsplits) if unp_full else []
                 o_pre = fn0(
-                    tokens, [], [], [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
-                    depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * v0 : 4 * v1],
+                    tokens, [], [], [], self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta,
+                    depths_arr, m_r, m_f, tluts, [], [], unp0, *conv_flat[4 * v0 : 4 * v1],
                 )
                 mx.async_eval(o_pre[0])
                 outs_all.append((o_pre, v1 - v0, nbs_pre, tks0))
@@ -4397,16 +4581,17 @@ class BatchDecoder:
                 for p in range(num_passes):
                     fn_p, pv0, pv1, nbs_p, pfvs, ptks = chunks[1 + p]
                     tluts = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in pfvs]
+                    unp_p = self._unp_chunk_inputs(pfvs, unp_scap, unp_nsplits) if unp_full else []
                     if p == 0:
                         o_p = fn_p(
-                            h_pre, bs_pre, [], [], self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
-                            depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * pv0 : 4 * pv1],
+                            h_pre, bs_pre, [], [], self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta,
+                            depths_arr, m_r, m_f, tluts, [], [], unp_p, *conv_flat[4 * pv0 : 4 * pv1],
                         )
                     else:
                         o_p = fn_p(
                             o_prev[0], o_prev[1 : 1 + n_bs_core], h_pre, bs_pre,
-                            self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
-                            depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * pv0 : 4 * pv1],
+                            self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta,
+                            depths_arr, m_r, m_f, tluts, [], [], unp_p, *conv_flat[4 * pv0 : 4 * pv1],
                         )
                     mx.async_eval(o_p[0])
                     outs_all.append((o_p, pv1 - pv0, nbs_p, ptks))
@@ -4416,12 +4601,13 @@ class BatchDecoder:
                 # Coda
                 fn_c, cv0, cv1, _, cfvs, ctks = chunks[-1]
                 tluts = [_get_tau_lut(layers_seq[v], end0_f, max_d) for v in cfvs]
+                unp_c = self._unp_chunk_inputs(cfvs, unp_scap, unp_nsplits) if unp_full else []
                 h_aux = ref_o[0] if cd_on else []
                 bs_aux = ref_o[1 : 1 + n_bs_core] if (cd_on and blend_bs) else []
                 o_c = fn_c(
                     o_prev[0], o_prev[1 : 1 + n_bs_core], h_aux, bs_aux,
-                    self._kv_ring, self._kv_full, [], [], conv_anc, tree_meta,
-                    depths_arr, m_r, m_f, tluts, [], [], *conv_flat[4 * cv0 : 4 * cv1],
+                    self._kv_ring, kv_f_arg, [], kst_f_arg, conv_anc, tree_meta,
+                    depths_arr, m_r, m_f, tluts, [], [], unp_c, *conv_flat[4 * cv0 : 4 * cv1],
                 )
                 outs_all.append((o_c, cv1 - cv0, 0, ctks))
                 kv_news, conv_ws = [], []
@@ -4520,6 +4706,45 @@ class BatchDecoder:
             next_toks = RH.softcap_argmax_rows(logits, text.final_logit_softcapping, text.unpadded_vocab_size)
         return next_toks, kv_news, conv_ws, tap_buf
 
+    def _commit_stacked_ring_w(self, kv_news, keep: int, p_idx) -> None:
+        """Commit `keep` ring-visit tokens into stacked `self._kv_ring` buffer."""
+        if not self._ring_visits:
+            return
+        buf = self._kv_ring
+        self._kv_ring = None
+        kv0 = self.caches[0][self._ring_visits[0]][0]
+        prev = kv0.offset
+        cap = buf.shape[3]
+        max_size = kv0.max_size
+        src = mx.stack(
+            [kv_news[v][:, :, :keep, :] for v in self._ring_visits]
+            if p_idx is None
+            else [kv_news[v][:, :, p_idx, :] for v in self._ring_visits],
+            axis=0,
+        )
+        idx = kv0._idx
+        if cap < max_size and prev + keep > cap:
+            target_cap = min(max_size, ((prev + keep + kv0.step - 1) // kv0.step) * kv0.step)
+            ext = mx.zeros((len(self._ring_visits), 2, buf.shape[2], target_cap - cap, buf.shape[4]), buf.dtype)
+            buf = mx.concatenate([buf, ext], axis=3)
+            idx = prev
+        slot0 = 0 if idx == max_size else idx
+        if slot0 + keep <= max_size:
+            buf = mx.slice_update(buf, src, FD._wpos(slot0), axes=(3,))
+        else:
+            n1 = max_size - slot0
+            buf = mx.slice_update(buf, src[:, :, :, :n1, :], FD._wpos(slot0), axes=(3,))
+            buf = mx.slice_update(buf, src[:, :, :, n1:, :], FD._wpos(0), axes=(3,))
+        new_off = prev + keep
+        new_idx = ((slot0 + keep - 1) % max_size) + 1
+        for v in self._ring_visits:
+            kv = self.caches[0][v][0]
+            kv.offset = new_off
+            kv._idx = new_idx
+        self._kv_ring = buf
+        self._kv_main_end_r = new_off
+        self._kv_main_slot_r = 0 if new_idx == max_size else new_idx
+
     def commit_w(self, kv_news, conv_ws, keep, path=None):
         """Commit `keep` verified tokens (contiguous 0..keep-1 or explicit node `path`) from verify_w."""
         if path is not None:
@@ -4531,53 +4756,22 @@ class BatchDecoder:
             p_idx = None
         if self._b1_unpacked_full:
             full_news = {}
+            ring_stacked = bool(self._ring_stacked)
             for v in range(self.nv):
                 kvn = kv_news[v] if p_idx is None else kv_news[v][:, :, p_idx, :]
                 if v in self._b1_full_unp_map:
                     full_news[v] = kvn
-                else:
+                elif not ring_stacked:
                     self.caches[0][v][0].commit_packed_w(kvn, keep, FD._wpos)
                 self.conv[v] = [w[last_node : last_node + 1] for w in conv_ws[v]]
+            if ring_stacked:
+                self._commit_stacked_ring_w(kv_news, keep, p_idx)
             self._commit_b1_full_unpacked(full_news, keep)
             return
         if self._ensure_stacked_kv():
             if self._kv_st_len > 0:
                 self.flush_kv_stage()
-            if self._ring_visits:
-                buf = self._kv_ring
-                self._kv_ring = None
-                kv0 = self.caches[0][self._ring_visits[0]][0]
-                prev = kv0.offset
-                cap = buf.shape[3]
-                max_size = kv0.max_size
-                src = mx.stack(
-                    [kv_news[v][:, :, :keep, :] for v in self._ring_visits]
-                    if p_idx is None
-                    else [kv_news[v][:, :, p_idx, :] for v in self._ring_visits],
-                    axis=0,
-                )
-                idx = kv0._idx
-                if cap < max_size and prev + keep > cap:
-                    target_cap = min(max_size, ((prev + keep + kv0.step - 1) // kv0.step) * kv0.step)
-                    ext = mx.zeros((len(self._ring_visits), 2, buf.shape[2], target_cap - cap, buf.shape[4]), buf.dtype)
-                    buf = mx.concatenate([buf, ext], axis=3)
-                    idx = prev
-                slot0 = 0 if idx == max_size else idx
-                if slot0 + keep <= max_size:
-                    buf = mx.slice_update(buf, src, FD._wpos(slot0), axes=(3,))
-                else:
-                    n1 = max_size - slot0
-                    buf = mx.slice_update(buf, src[:, :, :, :n1, :], FD._wpos(slot0), axes=(3,))
-                    buf = mx.slice_update(buf, src[:, :, :, n1:, :], FD._wpos(0), axes=(3,))
-                new_off = prev + keep
-                new_idx = ((slot0 + keep - 1) % max_size) + 1
-                for v in self._ring_visits:
-                    kv = self.caches[0][v][0]
-                    kv.offset = new_off
-                    kv._idx = new_idx
-                self._kv_ring = buf
-                self._kv_main_end_r = new_off
-                self._kv_main_slot_r = 0 if new_idx == max_size else new_idx
+            self._commit_stacked_ring_w(kv_news, keep, p_idx)
             if self._full_visits:
                 buf = self._kv_full
                 self._kv_full = None
@@ -4612,17 +4806,26 @@ class BatchDecoder:
             self.conv[v] = [w[last_node : last_node + 1] for w in conv_ws[v]]
 
     def commit_w_gpu(
-        self, kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, W, *, ring_may_wrap=True
+        self, kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, W, *,
+        ring_may_wrap=True, st_pos_old=None,
     ):
         """Commit verified tokens on GPU without CPU sync; assumes `ensure_gpu_cap` already holds capacity."""
-        assert self._kv_stacked and self._ring_visits and self._full_visits
+        assert (self._kv_stacked or (self._b1_unpacked_full and self._ring_stacked)) and self._ring_visits
         for v in range(self.nv):
             self.conv[v] = [w[last_slot] for w in conv_ws[v]]
 
-        buf_f = self._kv_full
-        self._kv_full = None
-        src_f = _gather_stack_kv_gpu([kv_news[v] for v in self._full_visits], path_pad, W)
-        self._kv_full = mx.slice_update(buf_f, src_f, end_f_old, axes=(3,))
+        if self._b1_unpacked_full:
+            assert st_pos_old is not None and self._b1_full_unp_st is not None
+            buf_st = self._b1_full_unp_st
+            self._b1_full_unp_st = None
+            src_f = _gather_stack_kv_gpu([kv_news[v] for v in self._b1_full_unp_visits], path_pad, W)
+            self._b1_full_unp_st = mx.slice_update(buf_st, src_f, st_pos_old, axes=(3,))
+        else:
+            assert self._full_visits
+            buf_f = self._kv_full
+            self._kv_full = None
+            src_f = _gather_stack_kv_gpu([kv_news[v] for v in self._full_visits], path_pad, W)
+            self._kv_full = mx.slice_update(buf_f, src_f, end_f_old, axes=(3,))
 
         buf_r = self._kv_ring
         self._kv_ring = None

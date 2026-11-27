@@ -1837,7 +1837,7 @@ def dflash2_exact_generate_step(
     def _snap_rb(slot_r_expr, w_slots: int, need_ring: bool = True):
         conv_bak = [list(cs) for cs in dec.conv]
         pos_bak = ring_bak = None
-        if need_ring and dec._kv_stacked and dec._kv_ring is not None and dec._ring_visits:
+        if need_ring and (dec._kv_stacked or getattr(dec, "_ring_stacked", False)) and dec._kv_ring is not None and dec._ring_visits:
             max_size_r = int(dec.caches[0][dec._ring_visits[0]][0].max_size)
             ar = _cw_ar_cache.get(w_slots)
             if ar is None:
@@ -1914,9 +1914,11 @@ def dflash2_exact_generate_step(
             costs.ema_ratio = 1.15
 
         lookup = None
+        p_list = list(full_prompt) if full_prompt is not None else prompt.tolist()
+        if len(p_list) > 32768:
+            p_list = p_list[-int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_MAX_PROMPT", "16384")) :]
         if use_lookup:
             lookup = LookupIndex()
-            p_list = list(full_prompt) if full_prompt is not None else prompt.tolist()
             lookup.append(p_list)
             lookup.set_prompt_end(len(p_list))
             lookup.append_one(y_tok)
@@ -2009,6 +2011,7 @@ def dflash2_exact_generate_step(
         pa_low_streak = 0
         pa_ar_burst = 0
         pa_ar_backoff = 16
+        coupled_ovf_streak = 0
         pa_packed = None
         pa_packed_w = 0
         pa_last_t = time.perf_counter()
@@ -2214,8 +2217,10 @@ def dflash2_exact_generate_step(
                                 _restore_kv_slices(*rb_c)
                             pa_packed = None
                             pa_packed_w = 0
-                            use_coupled = False
-                            pa_tree = True
+                            coupled_ovf_streak += 1
+                            if coupled_ovf_streak >= 4:
+                                use_coupled = False
+                                pa_tree = True
                             anchor, tok = ar_step(anchor, anchor_int)
                             anchor_int = tok
                             off_cpu = int(dec.caches[0][0][0].offset)
@@ -2227,6 +2232,7 @@ def dflash2_exact_generate_step(
                             yield tok, None, False
                             n += 1
                             continue
+                        coupled_ovf_streak = 0
                     else:
                         mx.eval(emitted_c, keep_arr_c)
                     now_t = time.perf_counter()
@@ -2570,7 +2576,11 @@ class _DFlash2C1Runner:
         self.lookup = state.lookup if self.use_lookup else None
         if self.lookup is not None:
             n_lp = len(self.lookup.tokens)
-            if n_lp < len(all_tokens):
+            if n_lp == 0 and len(all_tokens) > 32768:
+                tail_lim = int(os.environ.get("LOOPLING_DFLASH2_LOOKUP_MAX_PROMPT", "16384"))
+                self.lookup.append(all_tokens[-tail_lim:])
+                self.lookup.set_prompt_end(max(0, len(self.lookup.tokens) - 1))
+            elif n_lp < len(all_tokens):
                 self.lookup.append(all_tokens[n_lp:])
                 if self.lookup._prompt_end < 0 and len(all_tokens) >= 1:
                     self.lookup.set_prompt_end(len(all_tokens) - 1)
@@ -2599,8 +2609,9 @@ class _DFlash2C1Runner:
             and not (tm.loopcd.enabled_for(passes) and tm.loopcd.mode != "hidden")
         )
         self.off_cpu = int(dec.caches[0][0][0].offset)
-        # Context-aware W cap: at ctx >= 128K (or unpacked 1M full KV), QPS=4 (W=4) is the scalar ALU sweet spot.
-        self._is_long_ctx = bool(getattr(dec, "_b1_unpacked_full", False)) or (self.off_cpu >= 131072)
+        # Context-aware W cap: at ctx >= 256K (1M-scale SDPA), QPS=4 (W=4) is the scalar ALU sweet spot.
+        long_w_min = int(os.environ.get("LOOPLING_DFLASH2_LONG_W_MIN_CTX", "262144"))
+        self._is_long_ctx = self.off_cpu >= long_w_min
         if self._is_long_ctx:
             long_w = int(os.environ.get("LOOPLING_DFLASH2_LONG_W", "4"))
             self.W_cfg = max(2, min(self.W_cfg, long_w))
@@ -2627,6 +2638,7 @@ class _DFlash2C1Runner:
             and (std_samp is not None)
             and os.environ.get("LOOPLING_DFLASH2_COUPLED_SAMPLE", "1") not in ("0", "", "false", "False")
         )
+        self._coupled_ovf_streak = 0
         if self.use_coupled:
             _dt_env = os.environ.get("LOOPLING_DFLASH2_DRAFT_TEMP", "")
             self.draft_temp = float(_dt_env) if _dt_env else min(std_samp[0], 0.25)
@@ -2693,7 +2705,7 @@ class _DFlash2C1Runner:
         dec = self.dec
         conv_bak = [list(cs) for cs in dec.conv]
         pos_bak = ring_bak = None
-        if need_ring and dec._kv_stacked and dec._kv_ring is not None and dec._ring_visits:
+        if need_ring and (dec._kv_stacked or getattr(dec, "_ring_stacked", False)) and dec._kv_ring is not None and dec._ring_visits:
             max_size_r = int(dec.caches[0][dec._ring_visits[0]][0].max_size)
             ar = self._cw_ar_cache.get(w_slots)
             if ar is None:
@@ -2750,14 +2762,21 @@ class _DFlash2C1Runner:
         dr = self.dr
         hi_d = sum(item[7] for item in self.pa_queue)
         lo_d = len(self.pa_queue)
-        if self.n + hi_d + w_launch > self.max_tokens or not dec._kv_stacked or dr.ck[0] is None:
+        if self.n + hi_d + w_launch > self.max_tokens or dr.ck[0] is None:
+            return False, None
+        if dec._b1_unpacked_full:
+            if not getattr(dec, "_ring_stacked", False) or dec._b1_full_unp_st is None:
+                return False, None
+            if dec._b1_full_unp_len + hi_d + w_launch > int(dec._b1_full_unp_st.shape[3]):
+                return False, None
+        elif not dec._kv_stacked:
             return False, None
         ok_b, binfo = dec._cw_safe_bounds_range(self.off_cpu + lo_d, self.off_cpu + hi_d, w_launch - 1)
         if not ok_b:
             return False, None
         cap_r, cap_f, max_size_r = binfo[4], binfo[5], binfo[6]
         if (
-            self.off_cpu + hi_d + w_launch > cap_f
+            (not dec._b1_unpacked_full and self.off_cpu + hi_d + w_launch > cap_f)
             or (cap_r < max_size_r and self.off_cpu + hi_d + w_launch > cap_r)
             or dr.n + hi_d + w_launch + dr.block > int(dr.ck[0].shape[2])
         ):
@@ -2821,10 +2840,11 @@ class _DFlash2C1Runner:
         ovf_c = None
         if self.use_coupled:
             walk_res, ovf_c = walk_res
+        st_pos_old = walk_res[11] if len(walk_res) >= 12 else None
         (
             path_pad, emitted, keep_arr, last_slot, anc_nxt,
             slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
-        ) = walk_res
+        ) = walk_res[:11]
         # Always snapshot rollback metadata so C=1->C>=2 handoff or early stop is 100% exact.
         rb = self._snap_rb(slot_r_old, w_c, need_ring=ring_may_wrap)
         eval_a = [
@@ -2832,6 +2852,8 @@ class _DFlash2C1Runner:
             slot_r_old, end_f_old, dr_pos_old, meta_r_nxt, meta_f_nxt, dr_pos_nxt,
             *kv_news,
         ]
+        if st_pos_old is not None:
+            eval_a.append(st_pos_old)
         if ovf_c is not None:
             eval_a.append(ovf_c)
         if rb is not None and rb[2] is not None:
@@ -2843,7 +2865,7 @@ class _DFlash2C1Runner:
 
         dec.commit_w_gpu(
             kv_news, conv_ws, path_pad, keep_arr, last_slot, slot_r_old, end_f_old, w_c,
-            ring_may_wrap=ring_may_wrap,
+            ring_may_wrap=ring_may_wrap, st_pos_old=st_pos_old,
         )
         f_w = _feats_from_dict(tap_buf, self.tap_keys)
         f_pad = f_w[:, path_pad]
@@ -2875,20 +2897,25 @@ class _DFlash2C1Runner:
         dr = self.dr
         if self.deferred_feats:
             self._flush_deferred()
-            if not dec._kv_stacked:
+            if not dec._kv_stacked and not (dec._b1_unpacked_full and getattr(dec, "_ring_stacked", False)):
                 dec.ensure_gpu_cap(min(self.max_tokens - self.n + 16, 4096))
                 self.off_cpu = int(dec.caches[0][0][0].offset)
             dr._ensure_cap(dr.n + min(self.max_tokens - self.n + 32, 4096))
         while len(self.pa_queue) < self.pa_depth:
             qlen = len(self.pa_queue)
             w_l = self.pa_w_run
-            if not self.pa_queue and dec._kv_stacked and dec._full_visits:
+            if not self.pa_queue:
                 need_win = min(self.max_tokens - self.n + 16, 4096)
-                cap_f_now = int(dec._kv_full.shape[3])
                 cap_dr_now = 0 if dr.ck[0] is None else int(dr.ck[0].shape[2])
-                if self.off_cpu + w_l > cap_f_now:
-                    dec.ensure_gpu_cap(need_win)
-                    self.off_cpu = int(dec.caches[0][0][0].offset)
+                if dec._b1_unpacked_full and getattr(dec, "_ring_stacked", False) and dec._b1_full_unp_st is not None:
+                    if dec._b1_full_unp_len + w_l > int(dec._b1_full_unp_st.shape[3]):
+                        dec.ensure_gpu_cap(need_win)
+                        self.off_cpu = int(dec.caches[0][0][0].offset)
+                elif dec._kv_stacked and dec._full_visits:
+                    cap_f_now = int(dec._kv_full.shape[3])
+                    if self.off_cpu + w_l > cap_f_now:
+                        dec.ensure_gpu_cap(need_win)
+                        self.off_cpu = int(dec.caches[0][0][0].offset)
                 if dr.n + w_l + dr.block > cap_dr_now:
                     dr._ensure_cap(dr.n + need_win + 16)
                 if self.off_cpu + w_l + 32 > self.tau_cap:
@@ -2979,11 +3006,14 @@ class _DFlash2C1Runner:
                         self._restore_kv_slices(*rb_c)
                     self.pa_packed = None
                     self.pa_packed_w = 0
-                    self.use_coupled = False
-                    self.pa_tree = True
+                    self._coupled_ovf_streak += 1
+                    if self._coupled_ovf_streak >= 4:
+                        self.use_coupled = False
+                        self.pa_tree = True
                     return self._ar_step()
             else:
                 mx.eval(emitted_c, keep_arr_c)
+            self._coupled_ovf_streak = 0
             keep = int(keep_arr_c.item())
             em = emitted_c.tolist()[:keep]
             if self.track_cache_rb:

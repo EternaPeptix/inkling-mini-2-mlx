@@ -681,6 +681,8 @@ def _infer_tool_parser(tokenizer):
             return "mistral"
         elif "<atem:function_calls>" in chat_template:
             return "muse_spark"
+        elif "<|content_invoke_tool_json|>" in chat_template:
+            return "inkling2"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
             return "json_tools"
 
@@ -689,6 +691,8 @@ def _infer_tool_parser(tokenizer):
     vocab = tokenizer.get_vocab()
     if _is_xtml_vocab(vocab):
         return "kimi_k3"
+    elif "<|content_invoke_tool_json|>" in vocab and "<|end_message|>" in vocab:
+        return "inkling2"
     elif "<|tool_call_start|>" in vocab and "<|tool_call_end|>" in vocab:
         return "pythonic"
 

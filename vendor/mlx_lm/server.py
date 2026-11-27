@@ -255,12 +255,17 @@ def process_message_content(
         elif content is None:
             message["content"] = ""
 
+        if message.get("reasoning") and not message.get("reasoning_content"):
+            message["reasoning_content"] = message["reasoning"]
+
         if tool_calls := message.get("tool_calls"):
             for tool_call in tool_calls:
                 if func := tool_call.get("function"):
-                    if args := func.get("arguments"):
-                        if isinstance(args, str):
-                            func["arguments"] = json.loads(args)
+                    args = func.get("arguments")
+                    if args is None:
+                        func["arguments"] = {}
+                    elif isinstance(args, str):
+                        func["arguments"] = json.loads(args) if args.strip() else {}
     return urls
 
 
@@ -1598,6 +1603,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.seed = self.body.get("seed", None)
         self.stop = self.body.get("stop", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        if (reasoning_effort := self.body.get("reasoning_effort")) is not None:
+            self.chat_template_kwargs = dict(self.chat_template_kwargs or {})
+            self.chat_template_kwargs.setdefault("reasoning_effort", reasoning_effort)
         try:
             self.validate_model_parameters()
         except ValueError as e:

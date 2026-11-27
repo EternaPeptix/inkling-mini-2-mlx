@@ -5,12 +5,13 @@
 https://huggingface.co/thinkingmachines/Inkling-2-Small
 """
 
-from mlx_lm.models.inkling2.config import ModelArgs
+from mlx_lm.models.inkling2.config import TOKENIZER_DEFAULTS, ModelArgs
 from mlx_lm.models.inkling2.model import Model
 
 __all__ = [
     "Model",
     "ModelArgs",
+    "TOKENIZER_DEFAULTS",
 ]
 
 import os as _os

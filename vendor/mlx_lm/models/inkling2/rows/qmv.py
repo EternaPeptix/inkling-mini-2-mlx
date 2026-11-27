@@ -802,8 +802,55 @@ def qmv_rows_multi(x, weights, group_size=64, bits=8):
     )
 
 
+_QMV1_META: dict = {}
+_QMV1_DT = [mx.bfloat16]
+
+
 def qmv_rows(x, w, scales, biases, group_size=64, bits=8):
     """(B, K) bf16 -> (B, N) bf16; row b bitwise == quantized_matmul(x[b].reshape(1,1,K), ...)."""
+    if (
+        group_size == _GS
+        and bits == _BITS
+        and x.ndim == 2
+        and x.dtype == mx.bfloat16
+        and not (
+            os.environ.get("LOOPLING_QMV_CFG")
+            or os.environ.get("LOOPLING_QMV_ROUT")
+            or os.environ.get("LOOPLING_QMV_RO")
+            or os.environ.get("LOOPLING_QMV_STG_X")
+            or os.environ.get("LOOPLING_QMV_BKT0")
+            or os.environ.get("LOOPLING_QMV_BKT1")
+            or os.environ.get("LOOPLING_QMV_BKT2")
+        )
+    ):
+        B, K = x.shape
+        N = w.shape[0]
+        if 1 <= B <= MAX_B and K % _K_ALIGN == 0 and K not in (64, 128) and w.shape[1] * 4 == K and scales.shape == (N, K // _GS) and biases.shape == (N, K // _GS) and scales.dtype == mx.bfloat16:
+            mkey = (B, K, N)
+            meta = _QMV1_META.get(mkey)
+            if meta is None:
+                rout = _use_rout(B, N, 1, pro=False)
+                f32x = _use_rout_f32x(B, N, 1, pro=False) if rout else False
+                ro = _use_ro(B, N, pro=False, rout=rout)
+                stg_x = _use_stg_x(B, N, rout, pro=False)
+                rps, nsg, rb, _ = _cfg(B, N=N, rout=rout, ro=ro)
+                tiles = (N + rps * nsg - 1) // (rps * nsg)
+                meta = _QMV1_META[mkey] = (
+                    _kernel(1, rout=rout, ro=ro, stg_x=stg_x, f32x=f32x),
+                    [("B", B), ("K", K), ("RPS", rps), ("NSG", nsg), ("RB", rb), ("N0", N)],
+                    (((B + rb - 1) // rb) * 32, nsg * tiles, 1),
+                    (32, nsg, 1),
+                    [(B, N)],
+                )
+            kern, tmpl, grid, tg, shapes = meta
+            return kern(
+                inputs=[x, w, scales, biases],
+                template=tmpl,
+                grid=grid,
+                threadgroup=tg,
+                output_shapes=shapes,
+                output_dtypes=_QMV1_DT,
+            )[0]
     return qmv_rows_multi(x, [(w, scales, biases)], group_size, bits)[0]
 
 

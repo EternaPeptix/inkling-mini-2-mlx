@@ -40,15 +40,13 @@ struct RowMask {
   int S, end, idx, rot, R, window;
   // returns use_key; v = mask value (as the bf16 float mask would hold it) when use_key
   METAL_FUNC bool at(int i, thread float& v) const {
-    int kp;
+    int m = i;
     if (rot) {
-      int m = i - idx;
+      m = i - idx;
       if (m < 0) m += S;
-      kp = m + (end - S);
-    } else {
-      kp = i + (end - S);
     }
-    int dist = (end - 1) - kp;
+    int kp = m + (end - S);
+    int dist = (S - 1) - m;
     bool visible = (dist >= 0) && (kp >= 0);
     if (window > 0) visible = visible && (dist < window);
     if (!visible) return false;
@@ -191,7 +189,36 @@ METAL_FUNC void sdpa1_head_v32(
       max_score = sink;
       sum_exp_score = 1;
     }
-    for (int i = vg; i < N; i += BN) {
+    int i = vg;
+    if constexpr (D == 128) {
+      constexpr int TK = (NS >= 32) ? 2 : 4;
+      for (; i + (TK - 1) * BN < N; i += TK * BN) {
+        bfloat4 kr[TK], vr[TK];
+        for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(kp + t * inner_k_stride))[0]);
+        for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(vp + t * inner_v_stride))[0]);
+        float fm_r[TK];
+        bool u_r[TK];
+        for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+        for (int t = 0; t < TK; t++) {
+          if (u_r[t]) {
+            U score = 0;
+            score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+            score = simd_sum(score);
+            score += static_cast<U>(fm_r[t]);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            o[0] = o[0] * factor + exp_score * vr[t].x; o[1] = o[1] * factor + exp_score * vr[t].y;
+            o[2] = o[2] * factor + exp_score * vr[t].z; o[3] = o[3] * factor + exp_score * vr[t].w;
+          }
+        }
+        kp += TK * inner_k_stride;
+        vp += TK * inner_v_stride;
+      }
+    }
+    for (; i < N; i += BN) {
       float fm = 0;
       bool use_key = msk.at(i, fm);
       if (use_key) {
@@ -328,11 +355,15 @@ METAL_FUNC void sdpa2_block(
       for (int t = 0; t < TK; t++) {
         v_reg[t] = as_type<bfloat4>(((const device uint2*)(values + t * stride_v_tok))[0]);
       }
+      float fm_reg[TK];
+      bool use_reg[TK];
       for (int t = 0; t < TK; t++) {
-        int ii = i + t * blocks;
-        float fm = 0;
-        bool use_key = msk.at(ii, fm);
-        if (use_key) {
+        fm_reg[t] = 0;
+        use_reg[t] = msk.at(i + t * blocks, fm_reg[t]);
+      }
+      for (int t = 0; t < TK; t++) {
+        if (use_reg[t]) {
+          float fm = fm_reg[t];
           U score = 0;
           score += q[0] * static_cast<U>(k_reg[t].x);
           score += q[1] * static_cast<U>(k_reg[t].y);
@@ -463,31 +494,56 @@ METAL_FUNC void sdpa2_reduce(
   out += simd_gid * elem_per_thread;
   U sum_exp_score = 0.0;
   U max_score = Limits<U>::finite_min;
-  for (int b = 0; b < blocks / BN; ++b) {
-    max_score = max(max_score, maxs[simd_lid + BN * b]);
-  }
-  max_score = simd_max(max_score);
-  for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
-    sum_exp_score += factor * sums[simd_lid + BN * b];
-  }
-  sum_exp_score = simd_sum(sum_exp_score);
-  for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_gid] - max_score);
-    if constexpr (D == 128) {
-      bfloat4 pb = as_type<bfloat4>(((const device uint2*)partials)[0]);
-      o[0] += factor * static_cast<U>(pb.x);
-      o[1] += factor * static_cast<U>(pb.y);
-      o[2] += factor * static_cast<U>(pb.z);
-      o[3] += factor * static_cast<U>(pb.w);
-    } else {
-      for (int i = 0; i < elem_per_thread; i++) {
-        o[i] += factor * static_cast<U>(partials[i]);
-      }
+  if (D == 128 && blocks == 128) {
+    bfloat4 pv[4];
+    float mv[4];
+    for (int b = 0; b < 4; ++b) {
+      pv[b] = as_type<bfloat4>(((const device uint2*)(partials + (size_t)b * BN * D))[0]);
+      mv[b] = maxs[simd_gid + BN * b];
     }
-    maxs += BN;
-    sums += BN;
-    partials += BN * D;
+    for (int b = 0; b < 4; ++b) {
+      max_score = max(max_score, maxs[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
+    for (int b = 0; b < 4; ++b) {
+      U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+      sum_exp_score += factor * sums[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+    for (int b = 0; b < 4; ++b) {
+      U factor = fast::exp(mv[b] - max_score);
+      o[0] += factor * static_cast<U>(pv[b].x);
+      o[1] += factor * static_cast<U>(pv[b].y);
+      o[2] += factor * static_cast<U>(pv[b].z);
+      o[3] += factor * static_cast<U>(pv[b].w);
+    }
+  } else {
+    for (int b = 0; b < blocks / BN; ++b) {
+      max_score = max(max_score, maxs[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
+    for (int b = 0; b < blocks / BN; ++b) {
+      U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+      sum_exp_score += factor * sums[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+    for (int b = 0; b < blocks / BN; ++b) {
+      U factor = fast::exp(maxs[simd_gid] - max_score);
+      if constexpr (D == 128) {
+        bfloat4 pb = as_type<bfloat4>(((const device uint2*)partials)[0]);
+        o[0] += factor * static_cast<U>(pb.x);
+        o[1] += factor * static_cast<U>(pb.y);
+        o[2] += factor * static_cast<U>(pb.z);
+        o[3] += factor * static_cast<U>(pb.w);
+      } else {
+        for (int i = 0; i < elem_per_thread; i++) {
+          o[i] += factor * static_cast<U>(partials[i]);
+        }
+      }
+      maxs += BN;
+      sums += BN;
+      partials += BN * D;
+    }
   }
   for (int i = 0; i < elem_per_thread; i++) {
     outputs[(i * BD + simd_lid) * BN + simd_gid] = o[i];
@@ -1372,7 +1428,55 @@ METAL_FUNC void sdpa1_head_v32_causal(
       max_score = sink;
       sum_exp_score = 1;
     }
-    for (int i = vg; i < N; i += BN) {
+    int i = vg;
+    if constexpr (!HAS_STAGE) {
+      if (!rot) {
+        const int n_fast = min(N, S0);
+        constexpr int TK = (NS >= 32) ? 2 : 4;
+        for (; i + (TK - 1) * BN < n_fast; i += TK * BN) {
+          bfloat4 kr[TK], vr[TK];
+          for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(K + (size_t)(i + t * BN) * D + loff))[0]);
+          for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(V + (size_t)(i + t * BN) * D + loff))[0]);
+          float fm_r[TK];
+          bool u_r[TK];
+          for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+          for (int t = 0; t < TK; t++) {
+            if (u_r[t]) {
+              U score = 0;
+              score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+              score = simd_sum(score);
+              score += static_cast<U>(fm_r[t]);
+              U new_max = max(max_score, score);
+              U factor = fast::exp(max_score - new_max);
+              U exp_score = fast::exp(score - new_max);
+              max_score = new_max;
+              sum_exp_score = sum_exp_score * factor + exp_score;
+              o0 = o0 * factor + exp_score * vr[t].x; o1 = o1 * factor + exp_score * vr[t].y;
+              o2 = o2 * factor + exp_score * vr[t].z; o3 = o3 * factor + exp_score * vr[t].w;
+            }
+          }
+        }
+        for (; i < n_fast; i += BN) {
+          float fm = 0;
+          if (msk.at(i, fm)) {
+            bfloat4 kb = as_type<bfloat4>(((const device uint2*)(K + (size_t)i * D + loff))[0]);
+            bfloat4 vb = as_type<bfloat4>(((const device uint2*)(V + (size_t)i * D + loff))[0]);
+            U score = 0;
+            score += q[0] * kb.x; score += q[1] * kb.y; score += q[2] * kb.z; score += q[3] * kb.w;
+            score = simd_sum(score);
+            score += static_cast<U>(fm);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            o0 = o0 * factor + exp_score * vb.x; o1 = o1 * factor + exp_score * vb.y;
+            o2 = o2 * factor + exp_score * vb.z; o3 = o3 * factor + exp_score * vb.w;
+          }
+        }
+      }
+    }
+    for (; i < N; i += BN) {
       float fm = 0;
       if (msk.at(i, fm)) {
         int d = rot ? (i - slot0 + (i < slot0 ? max_size : 0)) : (i - S0);
@@ -1535,59 +1639,97 @@ METAL_FUNC void sdpa2_block_causal(
     sum_exp_score = 1;
   }
   int i = block_idx;
-  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
-    bfloat4 k_reg[TK];
-    bfloat4 v_reg[TK];
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      int d = rot ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
-      bool is_new = (d >= 0 && d <= db);
-      const device T* kp;
-      if (is_new) {
-        kp = Knew + (size_t)anc[d] * D + loff;
-      } else if constexpr (HAS_STAGE) {
-        int ds = rot ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
-        kp = ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D) : (K + (size_t)ii * D)) + loff;
-      } else {
-        kp = K + (size_t)ii * D + loff;
+  const bool mod_ok = (!rot || (max_size & (blocks - 1)) == 0);
+  const bool fast_clean = (!HAS_STAGE) && mod_ok && (((block_idx - (rot ? slot0 : S0)) & (blocks - 1)) > db);
+  if (fast_clean) {
+    const int stride_tok = blocks * D;
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+      const device T* kbase = K + (size_t)i * D + loff;
+      const device T* vbase = V + (size_t)i * D + loff;
+      bfloat4 k_reg[TK];
+      bfloat4 v_reg[TK];
+      for (int t = 0; t < TK; t++) k_reg[t] = as_type<bfloat4>(((const device uint2*)(kbase + (size_t)t * stride_tok))[0]);
+      for (int t = 0; t < TK; t++) v_reg[t] = as_type<bfloat4>(((const device uint2*)(vbase + (size_t)t * stride_tok))[0]);
+      float fm_reg[TK];
+      bool use_reg[TK];
+      for (int t = 0; t < TK; t++) { fm_reg[t] = 0; use_reg[t] = msk.at(i + t * blocks, fm_reg[t]); }
+      for (int t = 0; t < TK; t++) {
+        if (use_reg[t]) {
+          U score = 0;
+          score += q[0] * static_cast<U>(k_reg[t].x);
+          score += q[1] * static_cast<U>(k_reg[t].y);
+          score += q[2] * static_cast<U>(k_reg[t].z);
+          score += q[3] * static_cast<U>(k_reg[t].w);
+          score = simd_sum(score);
+          score += static_cast<U>(fm_reg[t]);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
+          o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
+          o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
+          o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+        }
       }
-      k_reg[t] = as_type<bfloat4>(((const device uint2*)kp)[0]);
     }
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      int d = rot ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
-      bool is_new = (d >= 0 && d <= db);
-      const device T* vp;
-      if (is_new) {
-        vp = Vnew + (size_t)anc[d] * D + loff;
-      } else if constexpr (HAS_STAGE) {
-        int ds = rot ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
-        vp = ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D) : (V + (size_t)ii * D)) + loff;
-      } else {
-        vp = V + (size_t)ii * D + loff;
+  } else {
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+      bfloat4 k_reg[TK];
+      bfloat4 v_reg[TK];
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        int d = rot ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
+        bool is_new = (d >= 0 && d <= db);
+        const device T* kp;
+        if (is_new) {
+          kp = Knew + (size_t)anc[d] * D + loff;
+        } else if constexpr (HAS_STAGE) {
+          int ds = rot ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+          kp = ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D) : (K + (size_t)ii * D)) + loff;
+        } else {
+          kp = K + (size_t)ii * D + loff;
+        }
+        k_reg[t] = as_type<bfloat4>(((const device uint2*)kp)[0]);
       }
-      v_reg[t] = as_type<bfloat4>(((const device uint2*)vp)[0]);
-    }
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      float fm = 0;
-      if (msk.at(ii, fm)) {
-        U score = 0;
-        score += q[0] * static_cast<U>(k_reg[t].x);
-        score += q[1] * static_cast<U>(k_reg[t].y);
-        score += q[2] * static_cast<U>(k_reg[t].z);
-        score += q[3] * static_cast<U>(k_reg[t].w);
-        score = simd_sum(score);
-        score += static_cast<U>(fm);
-        U new_max = max(max_score, score);
-        U factor = fast::exp(max_score - new_max);
-        U exp_score = fast::exp(score - new_max);
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-        o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
-        o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
-        o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
-        o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        int d = rot ? (ii - slot0 + (ii < slot0 ? max_size : 0)) : (ii - S0);
+        bool is_new = (d >= 0 && d <= db);
+        const device T* vp;
+        if (is_new) {
+          vp = Vnew + (size_t)anc[d] * D + loff;
+        } else if constexpr (HAS_STAGE) {
+          int ds = rot ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+          vp = ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D) : (V + (size_t)ii * D)) + loff;
+        } else {
+          vp = V + (size_t)ii * D + loff;
+        }
+        v_reg[t] = as_type<bfloat4>(((const device uint2*)vp)[0]);
+      }
+      float fm_reg[TK];
+      bool use_reg[TK];
+      for (int t = 0; t < TK; t++) { fm_reg[t] = 0; use_reg[t] = msk.at(i + t * blocks, fm_reg[t]); }
+      for (int t = 0; t < TK; t++) {
+        if (use_reg[t]) {
+          U score = 0;
+          score += q[0] * static_cast<U>(k_reg[t].x);
+          score += q[1] * static_cast<U>(k_reg[t].y);
+          score += q[2] * static_cast<U>(k_reg[t].z);
+          score += q[3] * static_cast<U>(k_reg[t].w);
+          score = simd_sum(score);
+          score += static_cast<U>(fm_reg[t]);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
+          o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
+          o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
+          o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+        }
       }
     }
   }
@@ -2867,6 +3009,30 @@ METAL_FUNC void sdpa1_head_v32_staged(
     int i = vg;
     if (!rot_wrap) {
       const int n_fast = min(N, slot_main);
+      constexpr int TK = (NS >= 32) ? 2 : 4;
+      for (; i + (TK - 1) * BN < n_fast; i += TK * BN) {
+        bfloat4 kr[TK], vr[TK];
+        for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+        for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+        float fm_r[TK];
+        bool u_r[TK];
+        for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+        for (int t = 0; t < TK; t++) {
+          if (u_r[t]) {
+            U score = 0;
+            score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+            score = simd_sum(score);
+            score += static_cast<U>(fm_r[t]);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            o[0] = o[0] * factor + exp_score * vr[t].x; o[1] = o[1] * factor + exp_score * vr[t].y;
+            o[2] = o[2] * factor + exp_score * vr[t].z; o[3] = o[3] * factor + exp_score * vr[t].w;
+          }
+        }
+      }
       for (; i < n_fast; i += BN) {
         float fm = 0;
         if (msk.at(i, fm)) {
@@ -3045,10 +3211,15 @@ METAL_FUNC void sdpa2_block_staged(
     for (int t = 0; t < TK; t++) {
       v_reg[t] = as_type<bfloat4>(((const device uint2*)(values + t * stride_v_tok))[0]);
     }
+    float fm_reg[TK];
+    bool use_reg[TK];
     for (int t = 0; t < TK; t++) {
-      int ii = ii_base + t * blocks;
-      float fm = 0;
-      if (msk.at(ii, fm)) {
+      fm_reg[t] = 0;
+      use_reg[t] = msk.at(ii_base + t * blocks, fm_reg[t]);
+    }
+    for (int t = 0; t < TK; t++) {
+      if (use_reg[t]) {
+        float fm = fm_reg[t];
         U score = 0;
         score += q[0] * static_cast<U>(k_reg[t].x);
         score += q[1] * static_cast<U>(k_reg[t].y);
@@ -3069,42 +3240,72 @@ METAL_FUNC void sdpa2_block_staged(
     }
   };
 
-  for (; i <= dirty_lo && i + (TK - 1) * blocks < N; i += blocks * TK) {
-    run_ds_chunk(i);
-  }
-  for (; i + (TK - 1) * blocks < slot_main; i += blocks * TK) {
-    run_main_chunk(i);
-  }
-  for (; i < dirty_end && i + (TK - 1) * blocks < N; i += blocks * TK) {
-    run_ds_chunk(i);
-  }
-  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
-    run_main_chunk(i);
-  }
-  for (; i < N; i += blocks) {
-    float fm = 0;
-    if (msk.at(i, fm)) {
-      int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
-      const device T* kp = (ds == st_len) ? (Knew + loff) : ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D + loff) : (K_main + (size_t)i * D + loff));
-      const device T* vp = (ds == st_len) ? (Vnew + loff) : ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D + loff) : (V_main + (size_t)i * D + loff));
-      bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
-      bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
-      U score = 0;
-      score += q[0] * kb.x;
-      score += q[1] * kb.y;
-      score += q[2] * kb.z;
-      score += q[3] * kb.w;
-      score = simd_sum(score);
-      score += fm;
-      U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
-      U exp_score = fast::exp(score - new_max);
-      max_score = new_max;
-      sum_exp_score = sum_exp_score * factor + exp_score;
-      o[0] = o[0] * factor + exp_score * vb.x;
-      o[1] = o[1] * factor + exp_score * vb.y;
-      o[2] = o[2] * factor + exp_score * vb.z;
-      o[3] = o[3] * factor + exp_score * vb.w;
+  const bool fast_clean = (!rot_wrap || (max_size & (blocks - 1)) == 0) && (((block_idx - slot_main) & (blocks - 1)) > st_len);
+  if (fast_clean) {
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+      run_main_chunk(i);
+    }
+    for (; i < N; i += blocks) {
+      float fm = 0;
+      if (msk.at(i, fm)) {
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)i * D + loff))[0]);
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)i * D + loff))[0]);
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += fm;
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      }
+    }
+  } else {
+    for (; i <= dirty_lo && i + (TK - 1) * blocks < N; i += blocks * TK) {
+      run_ds_chunk(i);
+    }
+    for (; i + (TK - 1) * blocks < slot_main; i += blocks * TK) {
+      run_main_chunk(i);
+    }
+    for (; i < dirty_end && i + (TK - 1) * blocks < N; i += blocks * TK) {
+      run_ds_chunk(i);
+    }
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+      run_main_chunk(i);
+    }
+    for (; i < N; i += blocks) {
+      float fm = 0;
+      if (msk.at(i, fm)) {
+        int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
+        const device T* kp = (ds == st_len) ? (Knew + loff) : ((ds >= 0 && ds < st_len) ? (Kst + (size_t)ds * D + loff) : (K_main + (size_t)i * D + loff));
+        const device T* vp = (ds == st_len) ? (Vnew + loff) : ((ds >= 0 && ds < st_len) ? (Vst + (size_t)ds * D + loff) : (V_main + (size_t)i * D + loff));
+        bfloat4 kb = as_type<bfloat4>(((const device uint2*)kp)[0]);
+        bfloat4 vb = as_type<bfloat4>(((const device uint2*)vp)[0]);
+        U score = 0;
+        score += q[0] * kb.x;
+        score += q[1] * kb.y;
+        score += q[2] * kb.z;
+        score += q[3] * kb.w;
+        score = simd_sum(score);
+        score += fm;
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        o[0] = o[0] * factor + exp_score * vb.x;
+        o[1] = o[1] * factor + exp_score * vb.y;
+        o[2] = o[2] * factor + exp_score * vb.z;
+        o[3] = o[3] * factor + exp_score * vb.w;
+      }
     }
   }
   if (simd_lid == 0) {
@@ -3301,6 +3502,7 @@ _STAGED_S2_SRC = r"""
 """
 
 
+
 _staged_kernels: dict = {}
 _STAGED_META_CACHE: dict = {}
 _ST_INFO_CACHE: dict = {}
@@ -3431,8 +3633,10 @@ def sdpa_rows_staged(
             ns2_env = os.environ.get("LOOPLING_SDPA2_STAGED_NS", "")
             if ns2_env and ns2_env != "0":
                 ns = int(ns2_env)
-            elif B >= 8:
+            elif B > 20:
                 ns = min(32, 8 * gqa)
+            elif B >= 4:
+                ns = min(32, 4 * gqa)
             else:
                 ns = gqa
             tgpk = (blocks * gqa + ns - 1) // ns
@@ -3440,7 +3644,8 @@ def sdpa_rows_staged(
             tmpl = [
                 ("T", mx.bfloat16), ("PBT", pb.dtype), ("NROWS", bc), ("ST_NROWS", st_nrows), ("B_OFF", b0),
                 ("MW", _SMW), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("BLOCKS", blocks), ("R", R),
-                ("WIN", int(window)), ("NS", ns), ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
+                ("WIN", int(window)), ("NS", ns),
+                ("SINK_OFF", int(sink_off)), ("SINK_STRIDE", int(sink_stride)),
             ]
             partials, sums, maxs = s1_2p(
                 inputs=ins,
@@ -3484,10 +3689,18 @@ def sdpa_rows_staged(
 
     # Metal 31-buffer cap: s1_mix binds 12+2*bc <= 31 => bc <= 9; s1_short/s1_2p bind <= 11+2*bc <= 31 => bc <= 10.
     is_mix = (max(Ss) >= _TWO_PASS_N) and (min(Ss) < _TWO_PASS_N)
-    if B <= (9 if is_mix else MAX_ROWS):
+    is_all2 = (not is_mix) and (min(Ss) >= _TWO_PASS_N)
+    max_bc = 9 if is_mix else MAX_ROWS
+    step_env = os.environ.get("LOOPLING_SDPA_STAGED_CHUNK", "")
+    if step_env and step_env != "0":
+        step = int(step_env)
+    elif is_all2 and B > 8:
+        step = 4
+    else:
+        step = 8
+    step = max(1, min(max_bc, step))
+    if B <= (step if is_all2 else max_bc):
         return _run_chunk(0, B)
-    step = int(os.environ.get("LOOPLING_SDPA_STAGED_CHUNK", "8") or "8")
-    step = max(1, min(9 if is_mix else MAX_ROWS, step))
     outs = [_run_chunk(b0, min(B, b0 + step)) for b0 in range(0, B, step)]
     return mx.concatenate(outs, axis=0)
 
@@ -3528,7 +3741,53 @@ METAL_FUNC void sdpa1_head_v32_multi_causal(
       max_score = sink;
       sum_exp_score = 1;
     }
-    for (int i = vg; i < N; i += BN) {
+    int i = vg;
+    if (!rot_wrap) {
+      const int n_fast = min(N, slot_main);
+      constexpr int TK = (NS >= 32) ? 2 : 4;
+      for (; i + (TK - 1) * BN < n_fast; i += TK * BN) {
+        bfloat4 kr[TK], vr[TK];
+        for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)(i + t * BN) * D + loff))[0]);
+        for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)(i + t * BN) * D + loff))[0]);
+        float fm_r[TK];
+        bool u_r[TK];
+        for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+        for (int t = 0; t < TK; t++) {
+          if (u_r[t]) {
+            U score = 0;
+            score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+            score = simd_sum(score);
+            score += static_cast<U>(fm_r[t]);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            o[0] = o[0] * factor + exp_score * vr[t].x; o[1] = o[1] * factor + exp_score * vr[t].y;
+            o[2] = o[2] * factor + exp_score * vr[t].z; o[3] = o[3] * factor + exp_score * vr[t].w;
+          }
+        }
+      }
+      for (; i < n_fast; i += BN) {
+        float fm = 0;
+        if (msk.at(i, fm)) {
+          bfloat4 kb = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)i * D + loff))[0]);
+          bfloat4 vb = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)i * D + loff))[0]);
+          U score = 0;
+          score += q[0] * kb.x; score += q[1] * kb.y; score += q[2] * kb.z; score += q[3] * kb.w;
+          score = simd_sum(score);
+          score += static_cast<U>(fm);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * vb.x; o[1] = o[1] * factor + exp_score * vb.y;
+          o[2] = o[2] * factor + exp_score * vb.z; o[3] = o[3] * factor + exp_score * vb.w;
+        }
+      }
+    }
+    for (; i < N; i += BN) {
       float fm = 0;
       if (msk.at(i, fm)) {
         int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
@@ -3631,47 +3890,81 @@ METAL_FUNC void sdpa2_block_multi_causal(
     sum_exp_score = 1;
   }
   int i = block_idx;
-  for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
-    bfloat4 k_reg[TK];
-    bfloat4 v_reg[TK];
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
-      const device T* kp;
-      if (ds >= st_len && ds <= st_len + dd) kp = Knew + (size_t)(ds - st_len) * D + loff;
-      else if (ds >= 0 && ds < st_len) kp = Kst + (size_t)ds * D + loff;
-      else kp = K_main + (size_t)ii * D + loff;
-      k_reg[t] = as_type<bfloat4>(((const device uint2*)kp)[0]);
+  const bool fast_clean = (!rot_wrap || (max_size & (blocks - 1)) == 0) && (((block_idx - slot_main) & (blocks - 1)) > (st_len + dd));
+  if (fast_clean) {
+    const int stride_tok = blocks * D;
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+      const device T* kbase = K_main + (size_t)i * D + loff;
+      const device T* vbase = V_main + (size_t)i * D + loff;
+      bfloat4 k_reg[TK], v_reg[TK];
+      for (int t = 0; t < TK; t++) k_reg[t] = as_type<bfloat4>(((const device uint2*)(kbase + (size_t)t * stride_tok))[0]);
+      for (int t = 0; t < TK; t++) v_reg[t] = as_type<bfloat4>(((const device uint2*)(vbase + (size_t)t * stride_tok))[0]);
+      float fm_r[TK];
+      bool u_r[TK];
+      for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * blocks, fm_r[t]); }
+      for (int t = 0; t < TK; t++) {
+        if (u_r[t]) {
+          U score = 0;
+          score += q[0] * static_cast<U>(k_reg[t].x); score += q[1] * static_cast<U>(k_reg[t].y);
+          score += q[2] * static_cast<U>(k_reg[t].z); score += q[3] * static_cast<U>(k_reg[t].w);
+          score = simd_sum(score);
+          score += static_cast<U>(fm_r[t]);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
+          o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
+          o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
+          o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+        }
+      }
     }
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
-      const device T* vp;
-      if (ds >= st_len && ds <= st_len + dd) vp = Vnew + (size_t)(ds - st_len) * D + loff;
-      else if (ds >= 0 && ds < st_len) vp = Vst + (size_t)ds * D + loff;
-      else vp = V_main + (size_t)ii * D + loff;
-      v_reg[t] = as_type<bfloat4>(((const device uint2*)vp)[0]);
-    }
-    for (int t = 0; t < TK; t++) {
-      int ii = i + t * blocks;
-      float fm = 0;
-      if (msk.at(ii, fm)) {
-        U score = 0;
-        score += q[0] * static_cast<U>(k_reg[t].x);
-        score += q[1] * static_cast<U>(k_reg[t].y);
-        score += q[2] * static_cast<U>(k_reg[t].z);
-        score += q[3] * static_cast<U>(k_reg[t].w);
-        score = simd_sum(score);
-        score += static_cast<U>(fm);
-        U new_max = max(max_score, score);
-        U factor = fast::exp(max_score - new_max);
-        U exp_score = fast::exp(score - new_max);
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-        o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
-        o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
-        o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
-        o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+  } else {
+    for (; i + (TK - 1) * blocks < N; i += blocks * TK) {
+      bfloat4 k_reg[TK];
+      bfloat4 v_reg[TK];
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+        const device T* kp;
+        if (ds >= st_len && ds <= st_len + dd) kp = Knew + (size_t)(ds - st_len) * D + loff;
+        else if (ds >= 0 && ds < st_len) kp = Kst + (size_t)ds * D + loff;
+        else kp = K_main + (size_t)ii * D + loff;
+        k_reg[t] = as_type<bfloat4>(((const device uint2*)kp)[0]);
+      }
+      for (int t = 0; t < TK; t++) {
+        int ii = i + t * blocks;
+        int ds = rot_wrap ? (ii - slot_main + (ii < slot_main ? max_size : 0)) : (ii - slot_main);
+        const device T* vp;
+        if (ds >= st_len && ds <= st_len + dd) vp = Vnew + (size_t)(ds - st_len) * D + loff;
+        else if (ds >= 0 && ds < st_len) vp = Vst + (size_t)ds * D + loff;
+        else vp = V_main + (size_t)ii * D + loff;
+        v_reg[t] = as_type<bfloat4>(((const device uint2*)vp)[0]);
+      }
+      float fm_r[TK];
+      bool u_r[TK];
+      for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * blocks, fm_r[t]); }
+      for (int t = 0; t < TK; t++) {
+        if (u_r[t]) {
+          U score = 0;
+          score += q[0] * static_cast<U>(k_reg[t].x);
+          score += q[1] * static_cast<U>(k_reg[t].y);
+          score += q[2] * static_cast<U>(k_reg[t].z);
+          score += q[3] * static_cast<U>(k_reg[t].w);
+          score = simd_sum(score);
+          score += static_cast<U>(fm_r[t]);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * static_cast<U>(v_reg[t].x);
+          o[1] = o[1] * factor + exp_score * static_cast<U>(v_reg[t].y);
+          o[2] = o[2] * factor + exp_score * static_cast<U>(v_reg[t].z);
+          o[3] = o[3] * factor + exp_score * static_cast<U>(v_reg[t].w);
+        }
       }
     }
   }
@@ -4249,15 +4542,13 @@ struct RowMaskTG {
   const threadgroup bfloat16_t* pb;
   int S, end, idx, rot, R, window;
   METAL_FUNC bool at(int i, thread float& v) const {
-    int kp;
+    int m = i;
     if (rot) {
-      int m = i - idx;
+      m = i - idx;
       if (m < 0) m += S;
-      kp = m + (end - S);
-    } else {
-      kp = i + (end - S);
     }
-    int dist = (end - 1) - kp;
+    int kp = m + (end - S);
+    int dist = (S - 1) - m;
     bool visible = (dist >= 0) && (kp >= 0);
     if (window > 0) visible = visible && (dist < window);
     if (!visible) return false;
@@ -4267,7 +4558,7 @@ struct RowMaskTG {
   }
 };
 
-template <int D, int NS>
+template <int D, int NS, int TK = 1>
 METAL_FUNC void sdpa1_head_v32_mid(
     const threadgroup bfloat16_t* q_s,
     const device bfloat16_t* K_main,
@@ -4311,7 +4602,54 @@ METAL_FUNC void sdpa1_head_v32_mid(
       max_score = sink;
       sum_exp_score = 1;
     }
-    for (int i = vg; i < N; i += BN) {
+    int i = vg;
+    if (!rot_wrap) {
+      const int n_fast = min(N, slot_main);
+      if constexpr (TK > 1) {
+        for (; i + (TK - 1) * BN < n_fast; i += TK * BN) {
+          bfloat4 kr[TK], vr[TK];
+          for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+          for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+          float fm_r[TK];
+          bool u_r[TK];
+          for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+          for (int t = 0; t < TK; t++) {
+            if (u_r[t]) {
+              U score = 0;
+              score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+              score = simd_sum(score);
+              score += static_cast<U>(fm_r[t]);
+              U new_max = max(max_score, score);
+              U factor = fast::exp(max_score - new_max);
+              U exp_score = fast::exp(score - new_max);
+              max_score = new_max;
+              sum_exp_score = sum_exp_score * factor + exp_score;
+              o[0] = o[0] * factor + exp_score * vr[t].x; o[1] = o[1] * factor + exp_score * vr[t].y;
+              o[2] = o[2] * factor + exp_score * vr[t].z; o[3] = o[3] * factor + exp_score * vr[t].w;
+            }
+          }
+        }
+      }
+      for (; i < n_fast; i += BN) {
+        float fm = 0;
+        if (msk.at(i, fm)) {
+          bfloat4 kb = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)i * 128 + loff))[0]);
+          bfloat4 vb = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)i * 128 + loff))[0]);
+          U score = 0;
+          score += q[0] * kb.x; score += q[1] * kb.y; score += q[2] * kb.z; score += q[3] * kb.w;
+          score = simd_sum(score);
+          score += static_cast<U>(fm);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o[0] = o[0] * factor + exp_score * vb.x; o[1] = o[1] * factor + exp_score * vb.y;
+          o[2] = o[2] * factor + exp_score * vb.z; o[3] = o[3] * factor + exp_score * vb.w;
+        }
+      }
+    }
+    for (; i < N; i += BN) {
       float fm = 0;
       if (msk.at(i, fm)) {
         int ds = rot_wrap ? (i - slot_main + (i < slot_main ? max_size : 0)) : (i - slot_main);
@@ -4560,7 +4898,7 @@ def _sdpa_mid_source(full, thr_q, thr_k, thr_r, eps_v):
     msk.S = S; msk.end = meta[1]; msk.idx = meta[2]; msk.rot = meta[3];
     msk.R = R; msk.window = WIN;
     float sink = float(qkv[SINK_OFF + h]);
-    sdpa1_head_v32_mid<D, NS>(
+    sdpa1_head_v32_mid<D, NS, TK>(
         q_s, K, V, knew_s, vnew_s, qkv + GATE_OFF + (size_t)h * D, out + (size_t)h * D,
         S, scale[0], sink, msk, slot_main, rot_wrap, max_size,
         outputs, max_scores, sum_exp_scores, simd_gid, simd_lid);
@@ -4636,7 +4974,9 @@ def sdpa_mid_b1(
             ensure_row_contiguous=True,
         )
     ns = _SDPA_MID_NS
-    tkey = ("b1", full, Hq, Hkv, R, int(window), ns, tuple(qkv_lay))
+    tk_env = os.environ.get("LOOPLING_SDPA_MID_TK", "")
+    tk = int(tk_env) if (tk_env and tk_env != "0") else 2
+    tkey = ("b1", full, Hq, Hkv, R, int(window), ns, tk, tuple(qkv_lay))
     tmpl = _sdpa_mid_tmpl_cache.get(tkey)
     if tmpl is None:
         if len(_sdpa_mid_tmpl_cache) >= 512:
@@ -4644,7 +4984,7 @@ def sdpa_mid_b1(
         gqa = Hq // Hkv
         offs = {item[0]: item[1] for item in qkv_lay}
         tmpl = [
-            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("R", R), ("WIN", int(window)), ("NS", ns),
+            ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa), ("R", R), ("WIN", int(window)), ("NS", ns), ("TK", tk),
             ("OFF_Q", offs["q_proj"]), ("OFF_R", offs["r_proj"]),
             ("OFF_K", offs["k_proj"]), ("OFF_V", offs["v_proj"]),
             ("GATE_OFF", offs["gate"]), ("SINK_OFF", offs["sinks"]),
@@ -4664,7 +5004,7 @@ def sdpa_mid_b1(
 
 # =============================================================================================== Batched (B=1..8) Fused K5 MID+REL + K8 SDPA (S < 1024)
 _SDPA_MID_BATCH_HEADER = _SDPA_MID_HEADER + r"""
-template <int D, int NS, int OPASS = 1>
+template <int D, int NS, int OPASS = 1, int TK = 1>
 METAL_FUNC void sdpa1_head_v32_mid_staged(
     const threadgroup bfloat16_t* q_s,
     const device bfloat16_t* K_main,
@@ -4714,6 +5054,31 @@ METAL_FUNC void sdpa1_head_v32_mid_staged(
     int i = vg;
     if (!rot_wrap) {
       const int n_fast = min(N, slot_main);
+      if constexpr (TK > 1) {
+        for (; i + (TK - 1) * BN < n_fast; i += TK * BN) {
+          bfloat4 kr[TK], vr[TK];
+          for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+          for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+          float fm_r[TK];
+          bool u_r[TK];
+          for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+          for (int t = 0; t < TK; t++) {
+            if (u_r[t]) {
+              U score = 0;
+              score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+              score = simd_sum(score);
+              score += static_cast<U>(fm_r[t]);
+              U new_max = max(max_score, score);
+              U factor = fast::exp(max_score - new_max);
+              U exp_score = fast::exp(score - new_max);
+              max_score = new_max;
+              sum_exp_score = sum_exp_score * factor + exp_score;
+              o0 = o0 * factor + exp_score * vr[t].x; o1 = o1 * factor + exp_score * vr[t].y;
+              o2 = o2 * factor + exp_score * vr[t].z; o3 = o3 * factor + exp_score * vr[t].w;
+            }
+          }
+        }
+      }
       for (; i < n_fast; i += BN) {
         float fm = 0;
         if (msk.at(i, fm)) {
@@ -4874,7 +5239,7 @@ def _sdpa_mid_batch_source(full, thr_q, thr_k, thr_r, eps_v, scale_lit, kv_selec
       float dy[4] = {float(dyp.x), float(dyp.y), float(dyp.z), float(dyp.w)};""" if full else ""
     return f"""
     constexpr int D = 128;
-    constexpr int P_SG = (OPASS == 1 && NS >= 8) ? 5 : 4;
+    constexpr int P_SG = (OPASS == 1) ? ((NS - 3 > 13) ? 13 : ((NS - 3 < 1) ? 1 : (NS - 3))) : 4;
     threadgroup float outputs[(OPASS == 1 ? 4 : 1) * 1024];
     threadgroup float max_scores[32];
     threadgroup float sum_exp_scores[32];
@@ -5001,7 +5366,7 @@ def _sdpa_mid_batch_source(full, thr_q, thr_k, thr_r, eps_v, scale_lit, kv_selec
         simdgroup_bfloat8x8 ma0, ma1;
         simdgroup_load(ma0, rel_tile + 0, 16);
         simdgroup_load(ma1, rel_tile + 8, 16);
-        threadgroup float* st = outputs + ((P_SG > 4) ? 512u : 384u) + (uint)p * 128u;
+        threadgroup float* st = outputs + (128u + (uint)P_SG * 64u) + (uint)p * 128u;
         for (int n0 = p * 16; n0 < n_pb16; n0 += P_SG * 16) {{
           const device bfloat16_t* Bm = rw + n0;
           simdgroup_bfloat8x8 mb00, mb10, mb01, mb11;
@@ -5046,7 +5411,7 @@ def _sdpa_mid_batch_source(full, thr_q, thr_k, thr_r, eps_v, scale_lit, kv_selec
     msk.S = S; msk.end = meta[gb * MW + 1]; msk.idx = meta[gb * MW + 2]; msk.rot = meta[gb * MW + 3];
     msk.R = R; msk.window = WIN;
     float sink = float(static_cast<bfloat16_t>(qkv[SINK_OFF + (size_t)gb * SINK_STRIDE + h]));
-    sdpa1_head_v32_mid_staged<D, NS, OPASS>(
+    sdpa1_head_v32_mid_staged<D, NS, OPASS, TK>(
         q_s, K + (size_t)kvh * kcap * D, V + (size_t)kvh * vcap * D, Kst, Vst,
         knew_s, vnew_s, qkv + GATE_OFF + (size_t)gb * GATE_STRIDE + (size_t)h * D,
         out + (size_t)t * D, S, {scale_lit}, sink, msk, slot_main, rot_wrap, max_size, st_len,
@@ -5134,8 +5499,10 @@ def sdpa_mid_rows_staged(
                 header=_SDPA_MID_BATCH_HEADER,
                 ensure_row_contiguous=False,
             )
-        ns = _SDPA_MID_BATCH_NS_ENV or (32 if bc <= 2 else 8)
-        tkey = ("b", bc, st_nrows, b0, full, Hq, Hkv, R, int(window), ns, opass, qkv_lay_t)
+        ns = _SDPA_MID_BATCH_NS_ENV or (32 if bc <= 2 else (16 if bc <= 4 else 8))
+        tk_env = os.environ.get("LOOPLING_SDPA_MID_TK", "")
+        tk = int(tk_env) if (tk_env and tk_env != "0") else (2 if ns >= 32 else 4)
+        tkey = ("b", bc, st_nrows, b0, full, Hq, Hkv, R, int(window), ns, opass, tk, qkv_lay_t)
         tmpl = _sdpa_mid_tmpl_cache.get(tkey)
         if tmpl is None:
             if len(_sdpa_mid_tmpl_cache) >= 1024:
@@ -5145,7 +5512,7 @@ def sdpa_mid_rows_staged(
             tmpl = [
                 ("NROWS", bc), ("ST_NROWS", st_nrows), ("B_OFF", b0),
                 ("MW", _SMW), ("HQ", Hq), ("HKV", Hkv), ("GQA", gqa),
-                ("R", R), ("WIN", int(window)), ("NS", ns), ("OPASS", opass),
+                ("R", R), ("WIN", int(window)), ("NS", ns), ("OPASS", opass), ("TK", tk),
                 ("OFF_Q", offs["q_proj"][0]), ("STR_Q", offs["q_proj"][1]),
                 ("OFF_R", offs["r_proj"][0]), ("STR_R", offs["r_proj"][1]),
                 ("OFF_K", offs["k_proj"][0]), ("STR_K", offs["k_proj"][1]),
@@ -5228,7 +5595,53 @@ METAL_FUNC void sdpa1_head_v32_mid_causal(
       max_score = sink;
       sum_exp_score = 1;
     }
-    for (int i = vg; i < N; i += BN) {
+    int i = vg;
+    if (!rot) {
+      const int n_fast = min(N, S0);
+      constexpr int TK = (NS >= 32) ? 2 : 4;
+      for (; i + (TK - 1) * BN < n_fast; i += TK * BN) {
+        bfloat4 kr[TK], vr[TK];
+        for (int t = 0; t < TK; t++) kr[t] = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+        for (int t = 0; t < TK; t++) vr[t] = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)(i + t * BN) * 128 + loff))[0]);
+        float fm_r[TK];
+        bool u_r[TK];
+        for (int t = 0; t < TK; t++) { fm_r[t] = 0; u_r[t] = msk.at(i + t * BN, fm_r[t]); }
+        for (int t = 0; t < TK; t++) {
+          if (u_r[t]) {
+            U score = 0;
+            score += q[0] * kr[t].x; score += q[1] * kr[t].y; score += q[2] * kr[t].z; score += q[3] * kr[t].w;
+            score = simd_sum(score);
+            score += static_cast<U>(fm_r[t]);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            o0 = o0 * factor + exp_score * vr[t].x; o1 = o1 * factor + exp_score * vr[t].y;
+            o2 = o2 * factor + exp_score * vr[t].z; o3 = o3 * factor + exp_score * vr[t].w;
+          }
+        }
+      }
+      for (; i < n_fast; i += BN) {
+        float fm = 0;
+        if (msk.at(i, fm)) {
+          bfloat4 kb = as_type<bfloat4>(((const device uint2*)(K_main + (size_t)i * 128 + loff))[0]);
+          bfloat4 vb = as_type<bfloat4>(((const device uint2*)(V_main + (size_t)i * 128 + loff))[0]);
+          U score = 0;
+          score += q[0] * kb.x; score += q[1] * kb.y; score += q[2] * kb.z; score += q[3] * kb.w;
+          score = simd_sum(score);
+          score += static_cast<U>(fm);
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+          o0 = o0 * factor + exp_score * vb.x; o1 = o1 * factor + exp_score * vb.y;
+          o2 = o2 * factor + exp_score * vb.z; o3 = o3 * factor + exp_score * vb.w;
+        }
+      }
+    }
+    for (; i < N; i += BN) {
       float fm = 0;
       if (msk.at(i, fm)) {
         int d = rot ? (i - slot0 + (i < slot0 ? max_size : 0)) : (i - S0);

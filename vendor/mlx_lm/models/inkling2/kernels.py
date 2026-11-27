@@ -410,9 +410,10 @@ _RELATIVE_ATTENTION_FAST_SOURCE = """
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const int batch = threadgroup_position_in_grid.z;
-    const int head = threadgroup_position_in_grid.y;
+    const int head = SWAP_GRID ? int(threadgroup_position_in_grid.x) : int(threadgroup_position_in_grid.y);
+    const int q_idx = SWAP_GRID ? int(threadgroup_position_in_grid.y) : int(threadgroup_position_in_grid.x);
     const int kv_head = head / (HQ / HKV);
-    const int q0 = (sizes[2] - 1 - int(threadgroup_position_in_grid.x)) * BQ;
+    const int q0 = (sizes[2] - 1 - q_idx) * BQ;
     const int start = key_start[batch];
     const float qscale = scale * LOG2E;
 
@@ -709,6 +710,7 @@ _relative_attention_fast_kernel = mx.fast.metal_kernel(
     ensure_row_contiguous=False,
 )
 _DUMMY_REL_PROJ = mx.zeros((16, 24), dtype=mx.bfloat16)
+_REL_SWAP_GRID = os.environ.get("LOOPLING_REL_SWAP_GRID", "1") not in ("0", "")
 
 
 def relative_attention(
@@ -737,6 +739,7 @@ def relative_attention(
         tg = qsg * 32
         r_ext = rel_proj.shape[1] if otf else rel.shape[-1]
         r_proj_in = rel_proj if otf else _DUMMY_REL_PROJ
+        swap_grid = int(_REL_SWAP_GRID and L >= 768 and (window > 0 or S <= 4096))
         return _relative_attention_fast_kernel(
             inputs=[
                 q,
@@ -761,8 +764,9 @@ def relative_attention(
                 ("TRANS_K", _REL_TRANS_K),
                 ("VEC_BIAS", _REL_VEC_BIAS),
                 ("OTF", int(otf)),
+                ("SWAP_GRID", swap_grid),
             ],
-            grid=(nq_tiles * tg, Hq, B),
+            grid=(Hq * tg, nq_tiles, B) if swap_grid else (nq_tiles * tg, Hq, B),
             threadgroup=(tg, 1, 1),
             output_shapes=[(B, L, Hq, D)],
             output_dtypes=[q.dtype],

@@ -259,11 +259,11 @@ def worker(mode, out_path, cs):
         runs = [run_static(model, encoded, c, max_tokens=64) for _ in range(2)]
         runs.sort(key=lambda r: r[0])
         tps, _ = runs[-1]
-        _, exact_seqs = run_static(model, encoded, c, max_tokens=64, b1_prefill=True)
+        tps_b1p, exact_seqs = run_static(model, encoded, c, max_tokens=64, b1_prefill=True)
         chk_n = min(c, len(refs))
         mm = sum(a != b for i in range(chk_n) for a, b in zip(exact_seqs[i], refs[i]))
-        results["static"][str(c)] = {"tps": tps, "mm": mm, "checked": chk_n}
-        print(f"[mode={mode}] C={c:2d}: {tps:7.2f} agg tok/s ({tps/c:6.2f}/stream), exact_mm_vs_c1={mm} (checked={chk_n})", flush=True)
+        results["static"][str(c)] = {"tps": tps, "tps_b1p": tps_b1p, "mm": mm, "checked": chk_n}
+        print(f"[mode={mode}] C={c:2d}: {tps:7.2f} agg tok/s (pure_dec={tps_b1p:7.2f}, {tps/c:6.2f}/stream), exact_mm_vs_c1={mm} (checked={chk_n})", flush=True)
 
     dyn_seqs, res_toks, cold_toks = run_dynamic(model, encoded)
     dyn_mm = sum(a != b for i in range(6) for a, b in zip(dyn_seqs[i], refs[i][: len(dyn_seqs[i])]))
@@ -314,9 +314,10 @@ def main():
     for ci in cs:
         c = str(ci)
         t0, t1 = r0["static"][c]["tps"], r1["static"][c]["tps"]
+        t1_pure = r1["static"][c].get("tps_b1p", 0.0)
         mm0, mm1 = r0["static"][c]["mm"], r1["static"][c]["mm"]
         print(
-            f"C={ci:2d}: orig={t0:7.2f} tok/s (mm={mm0:3d}) -> bd={t1:7.2f} tok/s ({t1/t0:.2f}x, exact_mm_vs_c1={mm1})",
+            f"C={ci:2d}: orig={t0:7.2f} tok/s (mm={mm0:3d}) -> bd={t1:7.2f} tok/s (pure_dec={t1_pure:7.2f}, {t1/t0:.2f}x, exact_mm_vs_c1={mm1})",
             flush=True,
         )
         assert mm1 == 0, f"BatchDecoder C={c} mismatch vs C=1: {mm1}"

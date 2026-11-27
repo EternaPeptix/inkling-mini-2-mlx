@@ -1602,6 +1602,7 @@ class GenerationBatch:
         max_tokens: List[int],
         need_logprobs: Optional[List[bool]] = None,
         df2_states: Optional[List[Any]] = None,
+        per_caches: Optional[List[List[Any]]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1639,17 +1640,21 @@ class GenerationBatch:
             _SERVER_BATCHDECODE
             and 1 <= len(self.uids) <= 32
             and _is_inkling2_model(self.model)
-            and self.prompt_cache
-            and not any(c.empty() for c in self.prompt_cache)
+            and (per_caches is not None or (self.prompt_cache and not any(c.empty() for c in self.prompt_cache)))
         ):
-            lps = [c.left_padding for c in self.prompt_cache if getattr(c, "left_padding", None) is not None]
-            if lps:
-                mx.eval(lps)
-            per_caches = [
-                [c.extract(i) for c in self.prompt_cache] for i in range(len(self.uids))
-            ]
+            if per_caches is None:
+                lps = [c.left_padding for c in self.prompt_cache if getattr(c, "left_padding", None) is not None]
+                if lps:
+                    mx.eval(lps)
+                per_caches = [
+                    [c.extract(i) for c in self.prompt_cache] for i in range(len(self.uids))
+                ]
             if _inkling2_bd_caches_ok(self.model, per_caches):
                 self._activate_bd(per_caches)
+            elif not self.prompt_cache and per_caches:
+                self.prompt_cache = _merge_caches(per_caches)
+        elif not self.prompt_cache and per_caches:
+            self.prompt_cache = _merge_caches(per_caches)
 
         if self.uids:
             self._step()
@@ -1706,8 +1711,20 @@ class GenerationBatch:
                 and _is_inkling2_model(self.model)
             )
         ):
+            if self._bd is not None and batch._bd is not None:
+                pend = []
+                for gb in (self, batch):
+                    if gb._next_tokens is not None:
+                        pend.append(gb._next_tokens)
+                        pend.extend(lp for lp in gb._next_logprobs if lp is not None)
+                if pend:
+                    mx.eval(*pend)
             all_caches = self._extract_all_caches() + batch._extract_all_caches()
             self.uids.extend(batch.uids)
+            if self._bd is not None:
+                self._bd.release_stage()
+            if batch._bd is not None:
+                batch._bd.release_stage()
             self._bd = None
             batch._bd = None
             if _inkling2_bd_caches_ok(self.model, all_caches):
@@ -1864,6 +1881,7 @@ class GenerationBatch:
         if self._bd is not None:
             self._flush_bd()
             kept = [self._bd.caches[idx] for idx in keep]
+            self._bd.release_stage()
             self._bd = None
             if not kept:
                 self.prompt_cache = []
@@ -2021,6 +2039,7 @@ class GenerationBatch:
 
         if len(keep) < C:
             if not keep and self._bd is not None:
+                self._bd.release_stage()
                 self._bd = None
                 self.prompt_cache = []
             self.filter(keep)
@@ -2093,6 +2112,7 @@ class GenerationBatch:
 
         if len(keep) < len(self.uids):
             if not keep and self._bd is not None:
+                self._bd.release_stage()
                 self._bd = None
                 self.prompt_cache = []
             self.filter(keep)
@@ -2180,6 +2200,12 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
+        inner = getattr(self.model, "model", None)
+        tm = getattr(inner, "language_model", None) if inner is not None else None
+        if tm is not None:
+            pool = getattr(tm, "_bd_stage_pool", None)
+            if pool:
+                pool.clear()
         if self._old_wired_limit is not None:
             mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
@@ -2451,6 +2477,52 @@ class BatchGenerator:
             self._generation_batch.extend(gen_batch)
 
         _split_ready()
+
+        # Direct-admit already-prefilled 1-token sequences (e.g. prefix-cache hits) without
+        # round-tripping through PromptProcessingBatch merge/extract or prefill_batch_size chunking.
+        if (
+            len(self._prompt_batch) == 0
+            and self._unprocessed_sequences
+            and len(self._generation_batch) < self.completion_batch_size
+        ):
+            cap_ready = self.completion_batch_size - len(self._generation_batch)
+            ready_seqs = []
+            while (
+                len(ready_seqs) < cap_ready
+                and self._unprocessed_sequences
+                and len(self._unprocessed_sequences[0][1]) == 1
+                and len(self._unprocessed_sequences[0][1][0]) == 1
+            ):
+                ready_seqs.append(self._unprocessed_sequences.popleft())
+            if ready_seqs:
+                r_uids = [s[0] for s in ready_seqs]
+                r_last = mx.array([s[1][0][0] for s in ready_seqs])
+                r_caches = [s[3] for s in ready_seqs]
+                r_toks = [s[4] for s in ready_seqs]
+                r_samps = [s[5] for s in ready_seqs]
+                r_lps = [s[6] for s in ready_seqs]
+                r_max = [s[2] for s in ready_seqs]
+                r_stops = [s[7] for s in ready_seqs]
+                r_nlp = [s[8] for s in ready_seqs]
+                gen_batch = GenerationBatch(
+                    self.model,
+                    r_uids,
+                    r_last,
+                    [],
+                    r_toks,
+                    r_samps,
+                    self.sampler,
+                    r_lps,
+                    r_stops,
+                    r_max,
+                    r_nlp,
+                    per_caches=r_caches,
+                )
+                for uid in r_uids:
+                    prompt_responses.append(
+                        PromptProcessingBatch.Response(uid, (1, 1), True, True)
+                    )
+                self._generation_batch.extend(gen_batch)
 
         # Admit pending sequences into newly freed prompt slots
         n = min(

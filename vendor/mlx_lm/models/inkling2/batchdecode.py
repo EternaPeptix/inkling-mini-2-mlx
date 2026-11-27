@@ -25,6 +25,7 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.inkling2 import fastdecode as FD
@@ -290,39 +291,224 @@ def _batch_cache_ok(caches, nv) -> bool:
     return True
 
 
+class _ScapOnly:
+    __slots__ = ("scap",)
+
+    def __init__(self, scap: int):
+        self.scap = scap
+
+
+def _tm_weight_sig(tm):
+    return tuple(id(v) for _, v in tree_flatten(tm.parameters()))
+
+
+_COMPILE_ENV_KEYS = (
+    "MOE_AUTO_ROUTE", "MOE_TILE_MIN_B", "MOE_TILE_TMAX", "MOE_TILE_NSG", "MOE_TILE_ROWS",
+    "MOE_TILE_SORTED_MIN_B",
+    "MOE_ROWS_GU", "MOE_ROWS_DN", "MOE_NSG_GU", "MOE_NSG_DN", "MOE_BALLOT_SCAN",
+    "MOE_ROUTER_FUSE", "MOE_ROUTER_TM1", "MOE_FP8_LUT", "MOE_TMAX_CAP",
+    "LOOPLING_SDPA2_STAGED_NS", "LOOPLING_SDPA_MID_BATCH_OPASS", "LOOPLING_SDPA_MID_BATCH",
+    "LOOPLING_FUSE_K3B_QKV", "LOOPLING_FUSE_K3B_QKV_MAX_B",
+    "LOOPLING_FUSE_K3B_MLP", "LOOPLING_FUSE_K3B_MLP_MAX_B",
+)
+
+
+def _env_compile_sig():
+    return tuple(os.environ.get(k) for k in _COMPILE_ENV_KEYS)
+
+
+def _layer_batch_body(
+    batch_meta,
+    layer,
+    v,
+    h,
+    bs,
+    msg,
+    stage,
+    step_metas,
+    step_Ss,
+    full_offs,
+    st_len,
+    kv_news,
+    tau_cache,
+    conv_list,
+    prev_moe=None,
+    skip_combine=False,
+    tau_override=None,
+    st_info_arr=None,
+    stage_buf=None,
+    ks_v=None,
+    vs_v=None,
+):
+    a, sliding, op_m, rel_proj, scale, window = batch_meta[id(layer)]
+    cs = conv_list[v]
+    if prev_moe is not None:
+        r1 = RL.k1_from_down_batch_layer(layer, prev_moe, bs, msg, emit_h=True)
+        h = r1["h"]
+        conv_list[v - 1][3] = r1["w3"]
+    else:
+        r1 = RL.k1_pre_layer(layer, h, bs, msg)
+    nr = r1["normed_residual"]
+    if msg is None:
+        qkv_flat, qkv_lay = RP.qkv_rows(a, r1["q_in"], r1["k_in"], r1["v_in"], flat=True)
+    elif (
+        os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
+        and int(r1["s_q"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
+    ):
+        qkv_flat, qkv_lay = RP.qkv_msg_rows(layer, r1, msg, flat=True)
+    else:
+        gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
+        mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), msg, (0, 1, 2), r1["qkv_gate_in"])
+        q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
+        qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
+    if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
+        gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
+        gate_stride, sink_stride = qkv_lay[2][2], qkv_lay[3][2]
+    else:
+        dm = {item[0]: (item[1], item[2]) for item in qkv_lay}
+        gate_off, gate_stride = dm["gate"]
+        sink_off, sink_stride = dm["sinks"]
+    tau_1d = None
+    if not sliding:
+        if tau_override is not None:
+            tau_1d = tau_override
+        else:
+            oarr, max_p = full_offs if full_offs is not None else stage.full_off_for_visit(v, st_len)
+            tkey = (id(stage), -1 if full_offs is not None else v, a.log_scaling_alpha, a.log_scaling_n_floor)
+            tau_1d = tau_cache.get(tkey)
+            if tau_1d is None:
+                tau_1d = _get_tau_table(layer, max_p)[oarr]
+                tau_cache[tkey] = tau_1d
+    rel_w_bf = FD._rel_w_bf(rel_proj)
+    if (
+        os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
+        and max(step_Ss[v]) < RS._TWO_PASS_N
+    ):
+        attn_out, kv_new, w0, w1 = RS.sdpa_mid_rows_staged(
+            layer, qkv_flat, qkv_lay,
+            stage.ks_main[v] if ks_v is None else ks_v,
+            stage.vs_main[v] if vs_v is None else vs_v,
+            stage.buf if stage_buf is None else stage_buf,
+            cs[0], cs[1], rel_w_bf,
+            scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
+            meta_arr=step_metas[v], Ss=step_Ss[v], st_info_arr=st_info_arr, tau=tau_1d,
+        )
+        kv_news[v] = kv_new
+    else:
+        q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
+            layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv_b=True
+        )
+        kv_news[v] = kv_new
+        sdpa_kw = dict(
+            scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
+            meta_arr=step_metas[v], Ss=step_Ss[v],
+        )
+        if st_info_arr is not None:
+            sdpa_kw["st_info_arr"] = st_info_arr
+        attn_out = RS.sdpa_rows_staged(
+            q,
+            stage.ks_main[v] if ks_v is None else ks_v,
+            stage.vs_main[v] if vs_v is None else vs_v,
+            stage.buf if stage_buf is None else stage_buf,
+            kv_new, pb, qkv_flat,
+            gate_off, gate_stride, sink_off, sink_stride, None,
+            **sdpa_kw,
+        )
+    op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
+    r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False)
+    if layer.is_block_boundary:
+        bs = [nr] if bs is None else (bs + [nr])
+    if msg is None:
+        x_mlp, mlp_mixed = r10["mlp_x"], None
+    elif (
+        os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
+        and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
+    ):
+        x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
+    else:
+        mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), msg, (3,), (r10["mlp_gate_in"],))
+        (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
+        mlp_mixed = None
+    e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, skip_combine=skip_combine, mlp_mixed=mlp_mixed)
+    if skip_combine and "down" in e:
+        conv_list[v] = [w0, w1, r10["w2"], None]
+        return None, bs, e
+    conv_list[v] = [w0, w1, r10["w2"], e["w3"]]
+    return e["out"], bs, None
+
+
 class _BatchKVStage:
     """Ping-pong KV staging buffers over unpacked per-stream KVCache/RotatingKVCache objects."""
 
-    def __init__(self, caches, scap=None):
+    def __init__(self, caches, scap=None, pool=None):
         self.caches = caches
         self.C = len(caches)
         self.nv = len(caches[0])
         self.scap = int(_BATCH_KV_STAGE_CAP if scap is None else scap)
+        self._pool = pool
         self.st_len = 0
         self._meta_cache = {}
         self._off_arr_cache = {}
+        to_eval = []
         for v in range(self.nv):
             for b in range(self.C):
                 kv = caches[b][v][0]
                 if kv._packed is not None:
                     kv.unpack_b1()
-                if hasattr(kv, "_idx") and kv._keys is not None and kv._keys.shape[2] > kv.max_size:
+                if kv._keys is None:
+                    continue
+                is_rot = hasattr(kv, "_idx")
+                if is_rot and kv._keys.shape[2] > kv.max_size:
                     t = kv._keys.shape[2] - kv.max_size
                     kv._keys = kv._trim(t, kv._keys)
                     kv._values = kv._trim(t, kv._values)
                     kv._idx = kv.max_size
-                    mx.eval(kv._keys, kv._values)
+                    to_eval.append(kv._keys)
+                    to_eval.append(kv._values)
+                cap = int(kv._keys.shape[2])
+                step = int(getattr(kv, "step", 256))
+                target = ((max(cap, 1) + step - 1) // step) * step
+                if is_rot:
+                    target = min(target, int(kv.max_size))
+                if cap < target:
+                    add = target - cap
+                    kv._keys = mx.concatenate(
+                        [kv._keys, mx.zeros((1, kv._keys.shape[1], add, kv._keys.shape[3]), kv._keys.dtype)],
+                        axis=2,
+                    )
+                    kv._values = mx.concatenate(
+                        [kv._values, mx.zeros((1, kv._values.shape[1], add, kv._values.shape[3]), kv._values.dtype)],
+                        axis=2,
+                    )
+                    to_eval.append(kv._keys)
+                    to_eval.append(kv._values)
+        if to_eval:
+            mx.eval(to_eval)
         Hkv = caches[0][0][0]._keys.shape[1]
         shp = (self.nv, self.C, 2, Hkv, self.scap, 128)
-        self._bufs = [mx.zeros(shp, mx.bfloat16), mx.zeros(shp, mx.bfloat16)]
+        self._shp = shp
+        reused = pool.pop(shp, None) if pool is not None else None
+        if reused is not None:
+            self._bufs = reused
+        else:
+            self._bufs = [mx.zeros(shp, mx.bfloat16), mx.zeros(shp, mx.bfloat16)]
+            mx.eval(self._bufs[0], self._bufs[1])
         self._active = 0
         self.buf = self._bufs[0]
         self._prev_step = None
         self.st_len = 0
         self.st_lens = [0] * self.C
         self._verify_meta_cache = {}
-        mx.eval(self._bufs[0], self._bufs[1])
         self._refresh_meta()
+
+    def release(self):
+        if self._pool is not None and self._bufs is not None and self._bufs[0] is not None and self._bufs[1] is not None:
+            if len(self._pool) >= 4 and self._shp not in self._pool:
+                self._pool.pop(next(iter(self._pool)))
+            self._pool[self._shp] = self._bufs
+        self._bufs = None
+        self.buf = None
+        self._prev_step = None
 
     def _refresh_meta(self):
         self.ks_main = []
@@ -895,20 +1081,39 @@ class BatchDecoder:
                     for j in range(self._n_coda)
                 ]
             if self._batch_fast:
-                self._stage_main = _BatchKVStage(caches)
+                pool = getattr(self.tm, "_bd_stage_pool", None)
+                if pool is None:
+                    pool = self.tm._bd_stage_pool = {}
+                self._stage_main = _BatchKVStage(caches, pool=pool)
                 if self._ref_caches is not None:
                     self._stage_ref = _BatchKVStage(self._ref_caches)
-                self._batch_meta = {
-                    id(layer): (
-                        layer["self_attn"],
-                        "input_layernorm" in layer,
-                        layer["self_attn"]["o_proj"],
-                        layer["self_attn"]["rel_logits_proj"],
-                        layer["self_attn"].scaling,
-                        layer["self_attn"].sliding_window or 0,
-                    )
-                    for layer in self.tm.layers
-                }
+                wsig = _tm_weight_sig(self.tm)
+                shared = getattr(self.tm, "_bd_shared_cache", None)
+                if shared is not None and shared[0] == wsig:
+                    self._batch_compiled = shared[1]
+                    self._batch_meta = shared[2]
+                else:
+                    bmeta = {
+                        id(layer): (
+                            layer["self_attn"],
+                            "input_layernorm" in layer,
+                            layer["self_attn"]["o_proj"],
+                            layer["self_attn"]["rel_logits_proj"],
+                            layer["self_attn"].scaling,
+                            layer["self_attn"].sliding_window or 0,
+                        )
+                        for layer in self.tm.layers
+                    }
+                    bcomp = {}
+                    self.tm._bd_shared_cache = (wsig, bcomp, bmeta)
+                    self._batch_compiled = bcomp
+                    self._batch_meta = bmeta
+
+    def release_stage(self):
+        if self._stage_main is not None:
+            self._stage_main.release()
+        if self._stage_ref is not None:
+            self._stage_ref.release()
 
     def _flush_b1_pending(self, caches=None, pending=None):
         """Commit any deferred B=1 kv_new tensors (from RS.sdpa_mid_b1) into packed KV caches."""
@@ -1523,101 +1728,11 @@ class BatchDecoder:
         ks_v=None,
         vs_v=None,
     ):
-        a, sliding, op_m, rel_proj, scale, window = self._batch_meta[id(layer)]
-        cs = conv_list[v]
-        if prev_moe is not None:
-            r1 = RL.k1_from_down_batch_layer(layer, prev_moe, bs, msg, emit_h=True)
-            h = r1["h"]
-            conv_list[v - 1][3] = r1["w3"]
-        else:
-            r1 = RL.k1_pre_layer(layer, h, bs, msg)
-        nr = r1["normed_residual"]
-        if msg is None:
-            qkv_flat, qkv_lay = RP.qkv_rows(a, r1["q_in"], r1["k_in"], r1["v_in"], flat=True)
-        elif (
-            os.environ.get("LOOPLING_FUSE_K3B_QKV", "1") not in ("0", "")
-            and int(r1["s_q"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_QKV_MAX_B", "4"))
-        ):
-            qkv_flat, qkv_lay = RP.qkv_msg_rows(layer, r1, msg, flat=True)
-        else:
-            gs = (layer["q_message_gate"], layer["k_message_gate"], layer["v_message_gate"])
-            mixed = RV._gates(gs, (r1["s_q"], r1["s_k"], r1["s_v"]), msg, (0, 1, 2), r1["qkv_gate_in"])
-            q_in, k_in, v_in = RL.k3b_norm_layer(layer, mixed)
-            qkv_flat, qkv_lay = RP.qkv_rows(a, q_in, k_in, v_in, flat=True)
-        if qkv_lay[2][0] == "gate" and qkv_lay[3][0] == "sinks":
-            gate_off, sink_off = qkv_lay[2][1], qkv_lay[3][1]
-            gate_stride, sink_stride = qkv_lay[2][2], qkv_lay[3][2]
-        else:
-            dm = {item[0]: (item[1], item[2]) for item in qkv_lay}
-            gate_off, gate_stride = dm["gate"]
-            sink_off, sink_stride = dm["sinks"]
-        tau_1d = None
-        if not sliding:
-            if tau_override is not None:
-                tau_1d = tau_override
-            else:
-                oarr, max_p = full_offs if full_offs is not None else stage.full_off_for_visit(v, st_len)
-                tkey = (id(stage), -1 if full_offs is not None else v, a.log_scaling_alpha, a.log_scaling_n_floor)
-                tau_1d = tau_cache.get(tkey)
-                if tau_1d is None:
-                    tau_1d = _get_tau_table(layer, max_p)[oarr]
-                    tau_cache[tkey] = tau_1d
-        rel_w_bf = FD._rel_w_bf(rel_proj)
-        if (
-            os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
-            and max(step_Ss[v]) < RS._TWO_PASS_N
-        ):
-            attn_out, kv_new, w0, w1 = RS.sdpa_mid_rows_staged(
-                layer, qkv_flat, qkv_lay,
-                stage.ks_main[v] if ks_v is None else ks_v,
-                stage.vs_main[v] if vs_v is None else vs_v,
-                stage.buf if stage_buf is None else stage_buf,
-                cs[0], cs[1], rel_w_bf,
-                scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
-                meta_arr=step_metas[v], Ss=step_Ss[v], st_info_arr=st_info_arr, tau=tau_1d,
-            )
-            kv_news[v] = kv_new
-        else:
-            q, kv_new, pb, w0, w1 = RM.mid_rows_flat(
-                layer, qkv_flat, qkv_lay, cs[0], cs[1], tau=tau_1d, rel_w=rel_w_bf, packed_kv_b=True
-            )
-            kv_news[v] = kv_new
-            sdpa_kw = dict(
-                scale=scale, window=window, kv_layer_idx=v, st_len=st_len, scap=stage.scap,
-                meta_arr=step_metas[v], Ss=step_Ss[v],
-            )
-            if st_info_arr is not None:
-                sdpa_kw["st_info_arr"] = st_info_arr
-            attn_out = RS.sdpa_rows_staged(
-                q,
-                stage.ks_main[v] if ks_v is None else ks_v,
-                stage.vs_main[v] if vs_v is None else vs_v,
-                stage.buf if stage_buf is None else stage_buf,
-                kv_new, pb, qkv_flat,
-                gate_off, gate_stride, sink_off, sink_stride, None,
-                **sdpa_kw,
-            )
-        op = RQ.qmv_rows(attn_out, op_m["weight"], op_m["scales"], op_m["biases"])
-        r10 = RL.k10_post_layer(layer, op, h, nr, bs, cs[2], msg, debug=False)
-        if layer.is_block_boundary:
-            bs = [nr] if bs is None else (bs + [nr])
-        if msg is None:
-            x_mlp, mlp_mixed = r10["mlp_x"], None
-        elif (
-            os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
-            and int(r10["mlp_src"].shape[0]) <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
-        ):
-            x_mlp, mlp_mixed = None, RP.mlp_msg_part(layer, r10, msg)
-        else:
-            mixed = RV._gates((layer["mlp_message_gate"],), (r10["mlp_src"],), msg, (3,), (r10["mlp_gate_in"],))
-            (x_mlp,) = RL.k3b_norm_layer(layer, mixed, mlp=True)
-            mlp_mixed = None
-        e = RMo.moe_rows(layer, x_mlp, r10["residual"], cs[3], route=RV.ROUTE, skip_combine=skip_combine, mlp_mixed=mlp_mixed)
-        if skip_combine and "down" in e:
-            conv_list[v] = [w0, w1, r10["w2"], None]
-            return None, bs, e
-        conv_list[v] = [w0, w1, r10["w2"], e["w3"]]
-        return e["out"], bs, None
+        return _layer_batch_body(
+            self._batch_meta, layer, v, h, bs, msg, stage, step_metas, step_Ss, full_offs,
+            st_len, kv_news, tau_cache, conv_list, prev_moe=prev_moe, skip_combine=skip_combine,
+            tau_override=tau_override, st_info_arr=st_info_arr, stage_buf=stage_buf, ks_v=ks_v, vs_v=vs_v,
+        )
 
     def _layer_batch_causal_w(
         self,
@@ -2126,11 +2241,12 @@ class BatchDecoder:
             os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
             and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
         )
-        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid))
+        key = (self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid), _env_compile_sig())
         ent = self._batch_compiled.get(key)
         if ent is not None:
             return ent
         tm = self.tm
+        batch_meta = self._batch_meta
         layers_seq = tm.layer_visits
         core = tm.args.loop_core
         cfg = tm.loopcd
@@ -2143,11 +2259,11 @@ class BatchDecoder:
         n_core = core.stop - core.start
         n_bs_core = pre_n + sum(1 for v in range(core.start, core.stop) if layers_seq[v].is_block_boundary)
         use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
-        stage = self._stage_main
+        stage_scap = _ScapOnly(scap)
 
         def make_chunk(v0, v1, *, is_first=False, is_last=False, use_msg=False, apply_cd=False):
             n_v = v1 - v0
-            f_vs = [v for v in range(v0, v1) if not self._batch_meta[id(layers_seq[v])][1]]
+            f_vs = [v for v in range(v0, v1) if not batch_meta[id(layers_seq[v])][1]]
             f_pos = {v: i for i, v in enumerate(f_vs)}
             ss_slice = [step_Ss[v] for v in range(v0, v1)]
 
@@ -2203,9 +2319,9 @@ class BatchDecoder:
                     tau_v = taus_in[f_pos[v]] if v in f_pos else None
                     ks_v = ks_flat[j * C : (j + 1) * C]
                     vs_v = vs_flat[j * C : (j + 1) * C]
-                    h, bs, prev_moe = self._layer_batch(
-                        layer, v, h, bs, msg_v,
-                        stage, metas_map, ss_map, None, 0, kv_news,
+                    h, bs, prev_moe = _layer_batch_body(
+                        batch_meta, layer, v, h, bs, msg_v,
+                        stage_scap, metas_map, ss_map, None, 0, kv_news,
                         {}, conv_local, prev_moe=prev_moe, skip_combine=(fuse_ck1 and next_gpar1),
                         tau_override=tau_v, st_info_arr=st_infos_in[j], stage_buf=stage_buf,
                         ks_v=ks_v, vs_v=vs_v,
@@ -2238,11 +2354,12 @@ class BatchDecoder:
             os.environ.get("LOOPLING_FUSE_K3B_MLP", "1") not in ("0", "")
             and self.C <= int(os.environ.get("LOOPLING_FUSE_K3B_MLP_MAX_B", "2"))
         )
-        key = ("one", self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid))
+        key = ("one", self.C, regime_sig, num_passes, cd_key, fuse_ck1, fuse_k3b, fuse_mlp, scap, bool(sdpa_mid), _env_compile_sig())
         ent = self._batch_compiled.get(key)
         if ent is not None:
             return ent
         tm = self.tm
+        batch_meta = self._batch_meta
         layers_seq = tm.layer_visits
         core = tm.args.loop_core
         cfg = tm.loopcd
@@ -2255,8 +2372,8 @@ class BatchDecoder:
         pre_n = sum(1 for v in range(0, core.start) if layers_seq[v].is_block_boundary)
         n_core = core.stop - core.start
         use_batch_msg = L._use_kernels() and getattr(tm, "message_input", None) is not None
-        stage = self._stage_main
-        f_vs = [v for v in range(nv) if not self._batch_meta[id(layers_seq[v])][1]]
+        stage_scap = _ScapOnly(scap)
+        f_vs = [v for v in range(nv) if not batch_meta[id(layers_seq[v])][1]]
         f_pos = {v: i for i, v in enumerate(f_vs)}
         ss_all = list(step_Ss)
         ranges = [(0, core.start, False, False)]
@@ -2309,9 +2426,9 @@ class BatchDecoder:
                     tau_v = taus_in[f_pos[v]] if v in f_pos else None
                     ks_v = ks_flat[v * C : (v + 1) * C]
                     vs_v = vs_flat[v * C : (v + 1) * C]
-                    h, bs, prev_moe = self._layer_batch(
-                        layer, v, h, bs, msg_v,
-                        stage, metas_in, ss_all, None, 0, kv_news,
+                    h, bs, prev_moe = _layer_batch_body(
+                        batch_meta, layer, v, h, bs, msg_v,
+                        stage_scap, metas_in, ss_all, None, 0, kv_news,
                         {}, conv_local, prev_moe=prev_moe, skip_combine=(fuse_ck1 and next_gpar1),
                         tau_override=tau_v, st_info_arr=st_infos_in[v], stage_buf=stage_buf,
                         ks_v=ks_v, vs_v=vs_v,
@@ -2628,7 +2745,12 @@ class BatchDecoder:
             stage = self._stage_main
             sdpa_mid = os.environ.get("LOOPLING_SDPA_MID_BATCH", "1") not in ("0", "")
             regime_sig = tuple(
-                (max(Ss) >= RS._TWO_PASS_N, min(Ss) >= RS._TWO_PASS_N, sum(1 for s in Ss if s >= RS._TWO_PASS_N))
+                (
+                    max(Ss) >= RS._TWO_PASS_N,
+                    min(Ss) >= RS._TWO_PASS_N,
+                    sum(1 for s in Ss if s >= RS._TWO_PASS_N),
+                    RS._blocks(max(Ss), 3) if max(Ss) >= RS._TWO_PASS_N else 0,
+                )
                 for Ss in step_Ss
             )
             cd_key = self._loopcd_cd_key(cfg, ref_pass, force_hidden=True) if (use_cd and cfg.mode == "hidden") else None

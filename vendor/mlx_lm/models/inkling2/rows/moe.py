@@ -1728,18 +1728,29 @@ def _down_gather_src(has_grp, has_w_act=False, has_stg=False, use_ballot=False):
     return _CONSTS_STAGED + scan + loop
 
 
-def _combine_conv_src(dbg, scale_lit):
+def _combine_conv_src(dbg, scale_lit, has_inv=False):
+    inv_decl = (
+        "    threadgroup uint inv_s[8];\n"
+        "    if (lid < 8) { ww[lid] = wts[b * 8 + lid]; inv_s[lid] = inv_order[b * 8 + lid]; }"
+        if has_inv
+        else "    if (lid < 8) ww[lid] = wts[b * 8 + lid];"
+    )
+    ev_load = (
+        "        ev[j] = float(down[(size_t)inv_s[j] * CC + c]);"
+        if has_inv
+        else "        ev[j] = float(down[(b * 8 + j) * CC + c]);"
+    )
     s = r"""
     uint b = threadgroup_position_in_grid.y;
     uint c = thread_position_in_grid.x;
     uint lid = thread_position_in_threadgroup.x;
     threadgroup float ww[8];
-    if (lid < 8) ww[lid] = wts[b * 8 + lid];
+""" + inv_decl + r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (c >= CC) return;
     float ev[8], wv[8];
     for (int j = 0; j < 8; j++) {
-        ev[j] = float(down[(b * 8 + j) * CC + c]);
+""" + ev_load + r"""
         wv[j] = ww[j];
     }
     bfloat16_t moe = bfloat16_t(glue_moe_combine8(ev, wv));
@@ -2409,17 +2420,43 @@ _ROUTE_TILE_SRC = r"""
     }
 """
 
+_ROUTE_TILE_INV_SRC = _ROUTE_TILE_SRC.replace(
+    "        pair_list[pos] = p;",
+    "        pair_list[pos] = p;\n        inv_order[p] = pos;",
+)
+
 _rt_kernel = None
+_rt_inv_kernel = None
 
 
-def route_tile_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0, tmax=4):
+def route_tile_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0, tmax=4, want_inv=False):
     """K11t: fused route + counting-sort + tile_meta worklist for 1 <= B <= 32, E == 128."""
-    global _rt_kernel
+    global _rt_kernel, _rt_inv_kernel
     B = int(logits.shape[0])
     if B < 1 or B > 32 or logits.shape != (B, 128) or logits.dtype != mx.float32:
         raise ValueError("route_tile_rows: logits must be (B,128) f32, B in 1..32")
     if bias.dtype != mx.float32:
         bias = bias.astype(mx.float32)
+    P = B * 8
+    max_tiles = min(P, (P + (tmax - 1) * 128) // tmax)
+    if want_inv:
+        if _rt_inv_kernel is None:
+            _rt_inv_kernel = mx.fast.metal_kernel(
+                name="moe_route_tile_inv",
+                input_names=["logits", "bias", "eps", "rscale"],
+                output_names=["inds_o", "wts_o", "pair_list", "exp_off", "tile_meta", "inv_order"],
+                source=_ROUTE_TILE_INV_SRC,
+                header=HEADER,
+                ensure_row_contiguous=True,
+            )
+        return list(_rt_inv_kernel(
+            inputs=[logits, bias, scalar(score_eps), scalar(route_scale)],
+            template=[("BB", B), ("BM", tmax), ("MAX_TILES", max_tiles)],
+            grid=(256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(B, 8), (B, 8), (P,), (129,), (max_tiles,), (P,)],
+            output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32, mx.uint32, mx.uint32],
+        ))
     if _rt_kernel is None:
         _rt_kernel = mx.fast.metal_kernel(
             name="moe_route_tile",
@@ -2429,8 +2466,6 @@ def route_tile_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0, tmax=4):
             header=HEADER,
             ensure_row_contiguous=True,
         )
-    P = B * 8
-    max_tiles = min(P, (P + (tmax - 1) * 128) // tmax)
     return list(_rt_kernel(
         inputs=[logits, bias, scalar(score_eps), scalar(route_scale)],
         template=[("BB", B), ("BM", tmax), ("MAX_TILES", max_tiles)],
@@ -2441,8 +2476,9 @@ def route_tile_rows(logits, bias, *, score_eps=1e-20, route_scale=1.0, tmax=4):
     ))
 
 
-def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
-    xoff_expr = "(pq >> 3)" if is_gu else "pq"
+def _tiled_moe_src(is_gu, dbg, gc="", uc="", sorted_io=False):
+    xoff_expr = "(pq >> 3)" if is_gu else ("slot" if sorted_io else "pq")
+    out_idx = "slot" if sorted_io else "pq"
     if is_gu:
         dbg_s = (
             "if constexpr (ROWS == 4) { ((device uint2*)(gu + (size_t)pq * NN + (size_t)out_row))[0] = "
@@ -2463,32 +2499,32 @@ def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
                     bfloat2 ov = bfloat2(
                         bfloat16_t(glue_swiglu(gv[0], gv[1], {gc}, {uc})),
                         bfloat16_t(glue_swiglu(gv[2], gv[3], {gc}, {uc})));
-                    ((device uint*)(sw + (size_t)pq * (NN / 2) + (size_t)(out_row / 2)))[0] = as_type<uint>(ov);
+                    ((device uint*)(sw + (size_t){out_idx} * (NN / 2) + (size_t)(out_row / 2)))[0] = as_type<uint>(ov);
                 }} else {{
                     #pragma unroll
                     for (int pair = 0; pair < ROWS / 2; pair++) {{
-                        sw[(size_t)pq * (NN / 2) + out_row / 2 + pair] = bfloat16_t(glue_swiglu(gv[2 * pair], gv[2 * pair + 1], {gc}, {uc}));
+                        sw[(size_t){out_idx} * (NN / 2) + out_row / 2 + pair] = bfloat16_t(glue_swiglu(gv[2 * pair], gv[2 * pair + 1], {gc}, {uc}));
                     }}
                 }}
                 {dbg_s}
             }}"""
     else:
-        emit_code = """
+        emit_code = f"""
             T ov[ROWS];
             #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
+            for (int r = 0; r < ROWS; r++) {{
                 U v = simd_sum(res[r]);
                 if constexpr (HGS) ov[r] = static_cast<T>(v * inv_scale_enc);
                 else ov[r] = static_cast<T>(v);
-            }
-            if (lane == 0) {
-                if constexpr (ROWS == 4) {
-                    ((device uint2*)(down + (size_t)pq * NN + (size_t)out_row))[0] = as_type<uint2>(bfloat4(ov[0], ov[1], ov[2], ov[3]));
-                } else {
+            }}
+            if (lane == 0) {{
+                if constexpr (ROWS == 4) {{
+                    ((device uint2*)(down + (size_t){out_idx} * NN + (size_t)out_row))[0] = as_type<uint2>(bfloat4(ov[0], ov[1], ov[2], ov[3]));
+                }} else {{
                     #pragma unroll
-                    for (int r = 0; r < ROWS; r++) down[(size_t)pq * NN + out_row + r] = ov[r];
-                }
-            }"""
+                    for (int r = 0; r < ROWS; r++) down[(size_t){out_idx} * NN + out_row + r] = ov[r];
+                }}
+            }}"""
 
     def k_step_one():
         return """
@@ -2549,90 +2585,178 @@ def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
                 }
             }"""
 
-    def k_step_multi():
-        return """
-            if constexpr (VPT == 8) {
-                thread uint4 x4[TMAX];
+    def k_step_multi(k_fixed=None):
+        nt = str(k_fixed) if k_fixed is not None else "TMAX"
+        cond = "" if k_fixed is not None else "if (t < nb) "
+        cond_b = "" if k_fixed is not None else "if (t < nb) "
+        return f"""
+            if constexpr (VPT == 8) {{
+                thread uint4 x4[{nt}];
                 #pragma unroll
-                for (int t = 0; t < TMAX; t++) {
-                    if (TMAX == 2 || t < nb) x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
-                }
-                if constexpr (BITS == 4) {
+                for (int t = 0; t < {nt}; t++) {{
+                    {cond}x4[t] = ((const device uint4*)(x + xo[t] + k_off))[0];
+                }}
+                if constexpr (BITS == 4) {{
                     thread uint32_t wr[ROWS];
                     thread uint8_t sr[ROWS];
                     #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
+                    for (int r = 0; r < ROWS; r++) {{
                         wr[r] = ((const device uint32_t*)(ws + r * in_w))[0];
                         sr[r] = (sc + r * in_g)[0];
-                    }
+                    }}
                     #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
+                    for (int r = 0; r < ROWS; r++) {{
                         thread U wv[8];
                         dequant_u32_fp4_8(wr[r], wv);
                         U sv = moe_dequant_scale<GS>(sr[r]);
                         #pragma unroll
-                        for (int t = 0; t < TMAX; t++) {
-                            if (TMAX == 2 || t < nb) result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
-                        }
-                    }
-                } else {
+                        for (int t = 0; t < {nt}; t++) {{
+                            {cond}result[t][r] += dot_vals_bf16_u4val<4>(x4[t], wv, sv);
+                        }}
+                    }}
+                }} else {{
                     thread uint2 wr[ROWS];
                     thread uint8_t sr[ROWS];
                     #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
+                    for (int r = 0; r < ROWS; r++) {{
                         wr[r] = ((const device uint2*)(ws + r * in_w))[0];
                         sr[r] = (sc + r * in_g)[0];
-                    }
+                    }}
                     #pragma unroll
-                    for (int r = 0; r < ROWS; r++) {
+                    for (int r = 0; r < ROWS; r++) {{
                         thread U wv[8];
                         dequant_u2_fp8_8(wr[r], wv);
                         U sv = moe_dequant_scale<GS>(sr[r]);
                         #pragma unroll
-                        for (int t = 0; t < TMAX; t++) {
-                            if (TMAX == 2 || t < nb) result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
-                        }
-                    }
-                }
-            } else if constexpr (VPT == 4) {
-                thread uint2 x2[TMAX];
+                        for (int t = 0; t < {nt}; t++) {{
+                            {cond}result[t][r] += dot_vals_bf16_u4val<8>(x4[t], wv, sv);
+                        }}
+                    }}
+                }}
+            }} else if constexpr (VPT == 4) {{
+                thread uint2 x2[{nt}];
                 #pragma unroll
-                for (int t = 0; t < TMAX; t++) {
-                    if (t < nb) x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
-                }
+                for (int t = 0; t < {nt}; t++) {{
+                    {cond_b}x2[t] = ((const device uint2*)(x + xo[t] + k_off))[0];
+                }}
                 #pragma unroll
-                for (int r = 0; r < ROWS; r++) {
+                for (int r = 0; r < ROWS; r++) {{
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
                     U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     #pragma unroll
-                    for (int t = 0; t < TMAX; t++) {
-                        if (t < nb) result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
-                    }
-                }
-            } else {
-                thread T xb[TMAX][VPT];
+                    for (int t = 0; t < {nt}; t++) {{
+                        {cond_b}result[t][r] += dot_vals_bf16_u2val<BITS>(x2[t], wv, sv);
+                    }}
+                }}
+            }} else {{
+                thread T xb[{nt}][VPT];
                 #pragma unroll
-                for (int t = 0; t < TMAX; t++) {
-                    if (t < nb) {
+                for (int t = 0; t < {nt}; t++) {{
+                    {cond_b}{{
                         const device T* xp = x + xo[t] + k_off;
                         for (int i = 0; i < VPT; i++) xb[t][i] = xp[i];
-                    }
-                }
+                    }}
+                }}
                 #pragma unroll
-                for (int r = 0; r < ROWS; r++) {
+                for (int r = 0; r < ROWS; r++) {{
                     thread U wv[VPT];
                     dequant_vals<BITS, VPT>(ws + r * in_w, wv);
                     U sv = moe_dequant_scale<GS>((sc + r * in_g)[0]);
                     #pragma unroll
-                    for (int t = 0; t < TMAX; t++) {
-                        if (t < nb) result[t][r] += dot_vals_bf16<BITS, VPT>(xb[t], wv, sv);
-                    }
-                }
-            }"""
+                    for (int t = 0; t < {nt}; t++) {{
+                        {cond_b}result[t][r] += dot_vals_bf16<BITS, VPT>(xb[t], wv, sv);
+                    }}
+                }}
+            }}"""
 
     s_one = k_step_one()
-    s_mul = k_step_multi()
+    one_head = (
+        "        const uint slot = m_base;\n"
+        if (sorted_io and not is_gu)
+        else (
+            "        const uint pq = pair_list[m_base];\n        const uint slot = m_base;\n"
+            if sorted_io
+            else "        const uint pq = pair_list[m_base];\n"
+        )
+    )
+    mul_setup = (
+        """                uint slot = m_base + uint(t);
+                pqs[t] = slot;
+                xo[t] = (uint)({xoff_expr}) * (uint)KK + lane * (uint)VPT;""".format(xoff_expr=xoff_expr)
+        if (sorted_io and not is_gu)
+        else """                uint pq = pair_list[m_base + uint(t)];
+                pqs[t] = pq;
+                xo[t] = (uint)({xoff_expr}) * (uint)KK + lane * (uint)VPT;""".format(xoff_expr=xoff_expr)
+    )
+    mul_emit_head = (
+        "                const uint slot = pqs[t];"
+        if (sorted_io and not is_gu)
+        else (
+            "                const uint slot = m_base + uint(t);"
+            if (sorted_io and not dbg)
+            else (
+                "                const uint pq = pqs[t];\n                const uint slot = m_base + uint(t);"
+                if sorted_io
+                else "                const uint pq = pqs[t];"
+            )
+        )
+    )
+
+    def multi_block(k_fixed=None):
+        nt = str(k_fixed) if k_fixed is not None else "TMAX"
+        s_m = k_step_multi(k_fixed)
+        setup_body = (
+            f"""            {{
+{mul_setup}
+            }}"""
+            if k_fixed is not None
+            else f"""            if (t < nb) {{
+{mul_setup}
+            }} else {{
+                pqs[t] = 0u;
+                xo[t] = 0u;
+            }}"""
+        )
+        emit_guard = "" if k_fixed is not None else "if (t < nb) "
+        return f"""        uint pqs[{nt}];
+        uint xo[{nt}];
+        #pragma unroll
+        for (int t = 0; t < {nt}; t++) {{
+{setup_body}
+        }}
+        thread U result[{nt}][ROWS];
+        #pragma unroll
+        for (int t = 0; t < {nt}; t++)
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) result[t][r] = 0.0f;
+        for (int it = 0; it < NFULL; it++) {{
+            const uint k_off = (uint)it * (uint)BLOCK;
+{s_m}
+            ws += BLOCK * 4 / PF;
+            sc += BLOCK / GS;
+        }}
+        if constexpr (HAS_TAIL) {{
+            if (tail_on) {{
+                const uint k_off = (uint)NFULL * (uint)BLOCK;
+{s_m}
+            }}
+        }}
+        #pragma unroll
+        for (int t = 0; t < {nt}; t++) {{
+            {emit_guard}{{
+{mul_emit_head}
+                thread U res[ROWS];
+                #pragma unroll
+                for (int r = 0; r < ROWS; r++) res[r] = result[t][r];
+{emit_code}
+            }}
+        }}"""
+
+    blk2 = multi_block(2)
+    blk3 = multi_block(3)
+    blk4 = multi_block(4)
+    blkg = multi_block(None)
     return f"""
     constexpr int PF = 32 / BITS;
     constexpr int PPT = FAST ? 2 : 1;
@@ -2667,8 +2791,7 @@ def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
     if constexpr (HGS) inv_scale_enc = gsc[e] / (F8E4M3_MAX * F4E2M1_MAX);
 
     if (nb == 1) {{
-        const uint pq = pair_list[m_base];
-        const long xo = (long)({xoff_expr}) * KK + (long)lane * VPT;
+{one_head}        const long xo = (long)({xoff_expr}) * KK + (long)lane * VPT;
         thread U res[ROWS];
         #pragma unroll
         for (int r = 0; r < ROWS; r++) res[r] = 0.0f;
@@ -2685,46 +2808,15 @@ def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
             }}
         }}
 {emit_code}
-    }} else {{
-        uint pqs[TMAX];
-        uint xo[TMAX];
-        #pragma unroll
-        for (int t = 0; t < TMAX; t++) {{
-            if (t < nb) {{
-                uint pq = pair_list[m_base + uint(t)];
-                pqs[t] = pq;
-                xo[t] = (uint)({xoff_expr}) * (uint)KK + lane * (uint)VPT;
-            }} else {{
-                pqs[t] = 0u;
-                xo[t] = 0u;
-            }}
-        }}
-        thread U result[TMAX][ROWS];
-        #pragma unroll
-        for (int t = 0; t < TMAX; t++)
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) result[t][r] = 0.0f;
-        for (int it = 0; it < NFULL; it++) {{
-            const uint k_off = (uint)it * (uint)BLOCK;
-{s_mul}
-            ws += BLOCK * 4 / PF;
-            sc += BLOCK / GS;
-        }}
-        if constexpr (HAS_TAIL) {{
-            if (tail_on) {{
-                const uint k_off = (uint)NFULL * (uint)BLOCK;
-{s_mul}
-            }}
-        }}
-        #pragma unroll
-        for (int t = 0; t < TMAX; t++) {{
-            if (TMAX == 2 || t < nb) {{
-                const uint pq = pqs[t];
-                thread U res[ROWS];
-                #pragma unroll
-                for (int r = 0; r < ROWS; r++) res[r] = result[t][r];
-{emit_code}
-            }}
+    }} else if (nb == 2) {{
+{blk2}
+    }} else if constexpr (TMAX >= 3) {{
+        if (nb == 3) {{
+{blk3}
+        }} else if constexpr (TMAX == 4) {{
+{blk4}
+        }} else if constexpr (TMAX >= 5) {{
+{blkg}
         }}
     }}
 """
@@ -2732,13 +2824,22 @@ def _tiled_moe_src(is_gu, dbg, gc="", uc=""):
 
 def _tile_cfg(N, B):
     tmax_env = os.environ.get("MOE_TILE_TMAX")
-    tmax = int(tmax_env) if tmax_env else (2 if B <= 20 else 3)
+    if tmax_env:
+        tmax = int(tmax_env)
+    elif B <= 16:
+        tmax = 2
+    elif B <= 24:
+        tmax = 3
+    else:
+        tmax = 4
     rows = int(os.environ.get("MOE_TILE_ROWS", "4"))
     nsg_env = os.environ.get("MOE_TILE_NSG")
     if nsg_env:
         nsg = int(nsg_env)
+    elif 17 <= B <= 24:
+        nsg = 4
     else:
-        nsg = (8 if (N % (rows * 8) == 0) else 4) if B <= 20 else 4
+        nsg = 8 if (N % (rows * 8) == 0) else 4
     if rows % 2 != 0 or N % (rows * nsg) != 0:
         rows = 2
         nsg = 4
@@ -2771,19 +2872,20 @@ def gateup_rows(logits, bias, x, w, scales, global_scale, *, mode, group_size, b
             rt = route_tile_rows(logits, bias, score_eps=score_eps, route_scale=route_scale, tmax=tmax_t)
             inds_arr, wts_arr = rt[0], rt[1]
             tile = (rt[2], rt[3], rt[4], tmax_t)
-        pair_list, exp_off, tile_meta, tmax_t = tile
+        pair_list, exp_off, tile_meta, tmax_t = tile[:4]
+        sorted_io = (len(tile) == 5 and not debug)
         max_tiles = int(tile_meta.shape[0])
         gsc = (global_scale if global_scale.dtype == mx.float32 else global_scale.astype(mx.float32)) if hgs else _ZERO_F32
-        key = ("gu_tile", debug, gate_softcap, up_softcap)
+        key = ("gu_tile", debug, sorted_io, gate_softcap, up_softcap)
         k = _kernels.get(key)
         if k is None:
             gc, uc = flit(gate_softcap), flit(up_softcap)
             outs = ["sw"] + (["gu"] if debug else [])
             k = _kernels[key] = mx.fast.metal_kernel(
-                name="moe_gu_tile_%d_%s_%s" % (debug, gc.replace(".", "p"), uc.replace(".", "p")),
+                name="moe_gu_tile_%d_%d_%s_%s" % (debug, int(sorted_io), gc.replace(".", "p"), uc.replace(".", "p")),
                 input_names=["w", "scales", "gsc", "x", "pair_list", "exp_off", "tile_meta"],
                 output_names=outs,
-                source=_tiled_moe_src(True, debug, gc, uc),
+                source=_tiled_moe_src(True, debug, gc, uc, sorted_io=sorted_io),
                 header=HEADER,
                 ensure_row_contiguous=True,
             )
@@ -2971,21 +3073,25 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
     gsc = (global_scale if global_scale.dtype == mx.float32 else global_scale.astype(mx.float32)) if hgs else _ZERO_F32
 
     if dm == "split":
+        inv_order = None
         if tile is not None:
-            pair_list, exp_off, tile_meta, tmax_t = tile
+            pair_list, exp_off, tile_meta, tmax_t = tile[:4]
+            inv_order = tile[4] if (len(tile) == 5 and not debug and not causal and not skip_combine) else None
+            sorted_io = inv_order is not None
             _, rows_t, nsg_t = _tile_cfg(C, B)
             if rows is not None and C % (rows * nsg_t) == 0:
                 rows_t = rows
             if nsg is not None and C % (rows_t * nsg) == 0:
                 nsg_t = nsg
             max_tiles = int(tile_meta.shape[0])
-            kt = _kernels.get("dn_tile")
+            kt_key = ("dn_tile", sorted_io)
+            kt = _kernels.get(kt_key)
             if kt is None:
-                kt = _kernels["dn_tile"] = mx.fast.metal_kernel(
-                    name="moe_dn_tile",
+                kt = _kernels[kt_key] = mx.fast.metal_kernel(
+                    name="moe_dn_tile_%d" % int(sorted_io),
                     input_names=["w", "scales", "gsc", "x", "pair_list", "exp_off", "tile_meta"],
                     output_names=["down"],
-                    source=_tiled_moe_src(False, False),
+                    source=_tiled_moe_src(False, False, sorted_io=sorted_io),
                     header=HEADER,
                     ensure_row_contiguous=True,
                 )
@@ -3067,21 +3173,24 @@ def down_rows(sw, inds, wts, residual, cs3, conv_w, w, scales, global_scale, *, 
             return rc + ([down] if debug else [])
         if skip_combine and not debug:
             return [down]
-        kc = _kernels.get(("dn_comb3", debug, scale_lit))
+        has_inv = inv_order is not None
+        kc = _kernels.get(("dn_comb3", debug, scale_lit, has_inv))
         if kc is None:
             outs_c = ["out", "w3"] + (["moe_out", "pmc"] if debug else [])
-            kc = _kernels[("dn_comb3", debug, scale_lit)] = mx.fast.metal_kernel(
-                name="moe3_comb_conv_%d" % debug,
-                input_names=["down", "wts", "resid", "cs3", "cw"],
+            ins_c = ["down", "wts", "resid", "cs3", "cw"] + (["inv_order"] if has_inv else [])
+            kc = _kernels[("dn_comb3", debug, scale_lit, has_inv)] = mx.fast.metal_kernel(
+                name="moe3_comb_conv_%d_%d" % (debug, int(has_inv)),
+                input_names=ins_c,
                 output_names=outs_c,
-                source=_combine_conv_src(debug, scale_lit),
+                source=_combine_conv_src(debug, scale_lit, has_inv=has_inv),
                 header=HEADER,
                 ensure_row_contiguous=True,
             )
         shapes_c = [(B, C), (B, 3, C)] + ([(B, C), (B, C)] if debug else [])
         dts_c = [mx.bfloat16, mx.float32] + ([mx.bfloat16] * 2 if debug else [])
+        args_c = [down, wts, residual, cs3, conv_w] + ([inv_order] if has_inv else [])
         rc = list(kc(
-            inputs=[down, wts, residual, cs3, conv_w],
+            inputs=args_c,
             template=[("CC", C)],
             grid=(((C + 255) // 256) * 256, B, 1),
             threadgroup=(256, 1, 1),
@@ -3155,14 +3264,21 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
 
     grp = None
     tile = None
+    sorted_io = (
+        route == "tile"
+        and B >= int(os.environ.get("MOE_TILE_SORTED_MIN_B", "21"))
+        and not debug
+        and not causal
+        and not skip_combine
+    )
     if mlp_mixed is not None:
         m_mix, m_part, m_lw, m_eps = mlp_mixed
         logits, x = router_from_mixed_rows(m_mix, m_part, m_lw, w_gate, eps_ln=m_eps)
         if route == "tile":
             tmax_t, _, _ = _tile_cfg(gu["weight"].shape[1], B)
-            rt = route_tile_rows(logits, bias, route_scale=rscale, tmax=tmax_t)
+            rt = route_tile_rows(logits, bias, route_scale=rscale, tmax=tmax_t, want_inv=sorted_io)
             inds_arr, wts_arr = rt[0], rt[1]
-            tile = (rt[2], rt[3], rt[4], tmax_t)
+            tile = (rt[2], rt[3], rt[4], tmax_t, rt[5]) if sorted_io else (rt[2], rt[3], rt[4], tmax_t)
             r = gateup_rows(logits, bias, x, gu["weight"], gu["scales"], gu.get("global_scale"),
                             mode=gu.mode, group_size=gu.group_size, bits=gu.bits, route_scale=rscale,
                             gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route="tile", inds=inds_arr, wts=wts_arr,
@@ -3186,9 +3302,9 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
     elif route == "tile":
         logits = router_rows(x, w_gate)
         tmax_t, _, _ = _tile_cfg(gu["weight"].shape[1], B)
-        rt = route_tile_rows(logits, bias, route_scale=rscale, tmax=tmax_t)
+        rt = route_tile_rows(logits, bias, route_scale=rscale, tmax=tmax_t, want_inv=sorted_io)
         inds_arr, wts_arr = rt[0], rt[1]
-        tile = (rt[2], rt[3], rt[4], tmax_t)
+        tile = (rt[2], rt[3], rt[4], tmax_t, rt[5]) if sorted_io else (rt[2], rt[3], rt[4], tmax_t)
         r = gateup_rows(logits, bias, x, gu["weight"], gu["scales"], gu.get("global_scale"),
                         mode=gu.mode, group_size=gu.group_size, bits=gu.bits, route_scale=rscale,
                         gate_softcap=act.gate_softcap, up_softcap=act.up_softcap, route="tile", inds=inds_arr, wts=wts_arr,
@@ -3231,7 +3347,8 @@ def moe_rows(layer, x, residual, cs3, *, route="auto", debug=False, causal=False
                   tile=tile, causal=causal, conv_anc=conv_anc, skip_combine=skip_combine, rows=rows_dn, w_act=w_act)
     if skip_combine and not debug and len(o) == 1:
         return dict(router_logits=logits, expert_inds=inds, expert_w=wts, swiglu=sw, down=o[0], residual=residual, cs3=cs3, conv_w=cw)
-    res = dict(router_logits=logits, expert_inds=inds, expert_w=wts, swiglu=sw, out=o[0], w3=o[1])
+    sw_out = sw.reshape(B * 8, -1)[tile[4]].reshape(B, 8, -1) if sorted_io else sw
+    res = dict(router_logits=logits, expert_inds=inds, expert_w=wts, swiglu=sw_out, out=o[0], w3=o[1])
     if debug:
         res.update(gate_up=r[3], moe_out=o[2], post_mlp_conv=o[3], down=o[4])
     return res

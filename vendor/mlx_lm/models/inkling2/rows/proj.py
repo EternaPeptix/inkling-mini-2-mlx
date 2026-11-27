@@ -645,18 +645,12 @@ METAL_FUNC void rows_qmv_norm_sx(
   }
   const int nb = FULL ? RB : min(RB, B - int(b0));
   const device float* pp0 = part + (size_t(b0) * 3u + uint(gi)) * 36u;
-  constexpr bool ONE_INV = (RB <= NSG);
-  float inv_my = 0.0f;
-  thread float inv_arr[ONE_INV ? 1 : RB];
-  if constexpr (ONE_INV) {
-    if (int(simd_gid) < nb) {
-      inv_my = proj_inv_from_part_q(pp0 + size_t(simd_gid) * 108u, eps_ln, simd_lid);
-    }
-  } else {
-    _Pragma("clang loop unroll(full)")
-    for (int b = 0; b < RB; b++) {
-      inv_arr[b] = (FULL || b < nb) ? proj_inv_from_part_q(pp0 + size_t(b) * 108u, eps_ln, simd_lid) : 0.0f;
-    }
+  constexpr int MAX_SB = (RB + NSG - 1) / NSG;
+  thread float inv_my[MAX_SB];
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < MAX_SB; i++) {
+    int b = int(simd_gid) + i * NSG;
+    inv_my[i] = (b < nb) ? proj_inv_from_part_q(pp0 + size_t(b) * 108u, eps_ln, simd_lid) : 0.0f;
   }
   float result[RB][RPS];
   for (int b = 0; b < RB; b++)
@@ -666,47 +660,20 @@ METAL_FUNC void rows_qmv_norm_sx(
   biases += size_t(active ? out_row : 0) * 36u + (simd_lid >> 3);
   const device float* mp0 = mixed + (size_t(b0) * 3u + uint(gi)) * 2304u;
   y += size_t(b0) * N + out_row;
-  const uint tid = simd_gid * 32u + simd_lid;
-  const uint nthr = uint(NSG) * 32u;
 
   for (int k = 0; k < K; k += block_size) {
     const uint buf = uint(k >> 8) & 1u;
-    threadgroup bfloat16_t* sx = sx_all + buf * (RB * 256u);
+    threadgroup uint4* sx = ((threadgroup uint4*)sx_all) + buf * (RB * 32u);
     threadgroup float* sm_s = sm_all + buf * (RB * 32u);
-    if constexpr (ONE_INV) {
-      if (int(simd_gid) < nb) {
-        const uint b = simd_gid;
-        const uint l = simd_lid;
-        const device float* mp = mp0 + size_t(b) * (3u * 2304u) + k + l * 8u;
-        uint4 lwpk = ((const device uint4*)(ln_w + k + l * 8u))[0];
-        bfloat4 l0 = as_type<bfloat4>(lwpk.xy), l1 = as_type<bfloat4>(lwpk.zw);
+    uint4 lwpk = ((const device uint4*)(ln_w + k + simd_lid * 8u))[0];
+    bfloat4 l0 = as_type<bfloat4>(lwpk.xy), l1 = as_type<bfloat4>(lwpk.zw);
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < MAX_SB; i++) {
+      int b = int(simd_gid) + i * NSG;
+      if (b < nb) {
+        const device float* mp = mp0 + size_t(b) * (3u * 2304u) + k + simd_lid * 8u;
         float4 m0 = ((const device float4*)mp)[0], m1 = ((const device float4*)(mp + 4))[0];
-        bfloat4 b0v = bfloat4(
-            bfloat16_t(glue_rms_apply<float>(m0.x, inv_my, l0.x)),
-            bfloat16_t(glue_rms_apply<float>(m0.y, inv_my, l0.y)),
-            bfloat16_t(glue_rms_apply<float>(m0.z, inv_my, l0.z)),
-            bfloat16_t(glue_rms_apply<float>(m0.w, inv_my, l0.w)));
-        bfloat4 b1v = bfloat4(
-            bfloat16_t(glue_rms_apply<float>(m1.x, inv_my, l1.x)),
-            bfloat16_t(glue_rms_apply<float>(m1.y, inv_my, l1.y)),
-            bfloat16_t(glue_rms_apply<float>(m1.z, inv_my, l1.z)),
-            bfloat16_t(glue_rms_apply<float>(m1.w, inv_my, l1.w)));
-        uint2 u0 = as_type<uint2>(b0v), u1 = as_type<uint2>(b1v);
-        ((threadgroup uint4*)(sx + b * 256u + l * 8u))[0] = uint4(u0.x, u0.y, u1.x, u1.y);
-        float s = 0.0f;
-        s += float(b0v.x); s += float(b0v.y); s += float(b0v.z); s += float(b0v.w);
-        s += float(b1v.x); s += float(b1v.y); s += float(b1v.z); s += float(b1v.w);
-        sm_s[b * 32u + l] = s;
-      }
-    } else {
-      for (uint idx = tid; idx < uint(nb * 32); idx += nthr) {
-        uint b = idx >> 5;
-        uint l = idx & 31u;
-        const device float* mp = mp0 + size_t(b) * (3u * 2304u) + k + l * 8u;
-        uint4 lwpk = ((const device uint4*)(ln_w + k + l * 8u))[0];
-        bfloat4 l0 = as_type<bfloat4>(lwpk.xy), l1 = as_type<bfloat4>(lwpk.zw);
-        float4 m0 = ((const device float4*)mp)[0], m1 = ((const device float4*)(mp + 4))[0];
-        float iv = inv_arr[b];
+        float iv = inv_my[i];
         bfloat4 b0v = bfloat4(
             bfloat16_t(glue_rms_apply<float>(m0.x, iv, l0.x)),
             bfloat16_t(glue_rms_apply<float>(m0.y, iv, l0.y)),
@@ -718,39 +685,40 @@ METAL_FUNC void rows_qmv_norm_sx(
             bfloat16_t(glue_rms_apply<float>(m1.z, iv, l1.z)),
             bfloat16_t(glue_rms_apply<float>(m1.w, iv, l1.w)));
         uint2 u0 = as_type<uint2>(b0v), u1 = as_type<uint2>(b1v);
-        ((threadgroup uint4*)(sx + b * 256u + l * 8u))[0] = uint4(u0.x, u0.y, u1.x, u1.y);
+        sx[b * 32u + simd_lid] = uint4(u0.x, u0.y, u1.x, u1.y);
         float s = 0.0f;
         s += float(b0v.x); s += float(b0v.y); s += float(b0v.z); s += float(b0v.w);
         s += float(b1v.x); s += float(b1v.y); s += float(b1v.z); s += float(b1v.w);
-        sm_s[b * 32u + l] = s;
+        sm_s[b * 32u + simd_lid] = s;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (active) {
       thread uint2 wr[RPS];
-      thread float sc[RPS], bi[RPS];
+      thread bfloat16_t sc_bf[RPS], bi_bf[RPS];
       _Pragma("clang loop unroll(full)")
       for (int row = 0; row < RPS; row++) {
         int src = PR ? min(row, last_row) : row;
         wr[row] = ((const device uint2*)(ws + src * 2304))[0];
-        sc[row] = float(scales[src * 36]);
-        bi[row] = float(biases[src * 36]);
+        sc_bf[row] = scales[src * 36];
+        bi_bf[row] = biases[src * 36];
       }
       _Pragma("clang loop unroll(full)")
-      for (int row = 0; row < RPS; row++) {
-        float4 w0 = float4(as_type<uchar4>(wr[row].x));
-        float4 w1 = float4(as_type<uchar4>(wr[row].y));
-        float scr = sc[row], bir = bi[row];
-        _Pragma("clang loop unroll(full)")
-        for (int b = 0; b < RB; b++) {
-          if (FULL || b < nb) {
-            uint4 xpk = ((const threadgroup uint4*)(sx + b * 256u + simd_lid * 8u))[0];
-            bfloat4 x0 = as_type<bfloat4>(xpk.xy), x1 = as_type<bfloat4>(xpk.zw);
-            float smb = sm_s[b * 32u + simd_lid];
+      for (int b = 0; b < RB; b++) {
+        if (FULL || b < nb) {
+          uint4 xpk = sx[b * 32u + simd_lid];
+          bfloat4 x0 = as_type<bfloat4>(xpk.xy), x1 = as_type<bfloat4>(xpk.zw);
+          float xf0 = float(x0.x), xf1 = float(x0.y), xf2 = float(x0.z), xf3 = float(x0.w);
+          float xf4 = float(x1.x), xf5 = float(x1.y), xf6 = float(x1.z), xf7 = float(x1.w);
+          float smb = sm_s[b * 32u + simd_lid];
+          _Pragma("clang loop unroll(full)")
+          for (int row = 0; row < RPS; row++) {
+            float4 w0 = float4(as_type<uchar4>(wr[row].x));
+            float4 w1 = float4(as_type<uchar4>(wr[row].y));
             float accum = 0.0f;
-            accum += float(x0.x) * w0.x; accum += float(x0.y) * w0.y; accum += float(x0.z) * w0.z; accum += float(x0.w) * w0.w;
-            accum += float(x1.x) * w1.x; accum += float(x1.y) * w1.y; accum += float(x1.z) * w1.z; accum += float(x1.w) * w1.w;
-            result[b][row] += scr * accum + smb * bir;
+            accum += xf0 * w0.x; accum += xf1 * w0.y; accum += xf2 * w0.z; accum += xf3 * w0.w;
+            accum += xf4 * w1.x; accum += xf5 * w1.y; accum += xf6 * w1.z; accum += xf7 * w1.w;
+            result[b][row] += float(sc_bf[row]) * accum + smb * float(bi_bf[row]);
           }
         }
       }
@@ -856,7 +824,8 @@ def qkv_rows_from_mixed(a, mixed, part, ln_ws, *, eps_ln=1e-6, full=None, flat=F
         if B == 1:
             rps, nsg, rb = 4, 2, 1
         elif use_sx:
-            rps, nsg = 4, 4
+            rps = 4
+            nsg = 4
             rb = B if B <= 4 else (3 if (B % 3 == 0 and B % 4 != 0) else 4)
         elif B <= 3:
             rps, nsg, rb = 2, 4, B
@@ -1576,6 +1545,7 @@ _OPROJ_GSX_SRC = r"""
 """
 
 _oproj_gsx_k = None
+_OPROJ_GSX_META: dict = {}
 
 
 def _get_oproj_gsx():
@@ -1615,13 +1585,11 @@ def oproj_rows(attn_out, gate, w, scales, biases):
     K = gate.shape[-1]
     if attn_out.size != B * K or attn_out.dtype != mx.bfloat16 or gate.dtype != mx.bfloat16:
         raise ValueError("attn_out and gate must be bf16 with B*K elements")
-    a2 = attn_out.reshape(B, K)
-    g2 = gate.reshape(B, K)
+    a2 = attn_out if attn_out.ndim == 2 else attn_out.reshape(B, K)
+    g2 = gate if gate.ndim == 2 else gate.reshape(B, K)
     N = w.shape[0]
     if (
-        os.environ.get("LOOPLING_OPROJ_GSX", "1") not in ("0", "", "false", "False")
-        and not os.environ.get("LOOPLING_QMV_CFG")
-        and 1 <= B <= MAX_B
+        1 <= B <= MAX_B
         and K % _qmv._K_ALIGN == 0
         and K not in (64, 128)
         and w.shape[1] * 4 == K
@@ -1629,19 +1597,32 @@ def oproj_rows(attn_out, gate, w, scales, biases):
         and biases.shape == (N, K // 64)
         and scales.dtype == mx.bfloat16
         and biases.dtype == mx.bfloat16
+        and os.environ.get("LOOPLING_OPROJ_GSX", "1") not in ("0", "", "false", "False")
+        and not os.environ.get("LOOPLING_QMV_CFG")
     ):
-        rps, nsg, rb, packw, dbuf = _oproj_gsx_cfg(B)
-        tiles = (N + rps * nsg - 1) // (rps * nsg)
-        pr = (N % (rps * nsg)) != 0
-        return _get_oproj_gsx()(
+        mkey = (B, K, N)
+        meta = _OPROJ_GSX_META.get(mkey)
+        if meta is None:
+            rps, nsg, rb, packw, dbuf = _oproj_gsx_cfg(B)
+            tiles = (N + rps * nsg - 1) // (rps * nsg)
+            pr = (N % (rps * nsg)) != 0
+            meta = _OPROJ_GSX_META[mkey] = (
+                _get_oproj_gsx(),
+                [
+                    ("B", B), ("K", K), ("N", N), ("PR", pr),
+                    ("RPS", rps), ("NSG", nsg), ("RB", rb), ("PACKW", packw), ("DBUF", dbuf),
+                ],
+                (((B + rb - 1) // rb) * 32, nsg * tiles, 1),
+                (32, nsg, 1),
+                [(B, N)],
+            )
+        kern, tmpl, grid, tg, out_shp = meta
+        return kern(
             inputs=[a2, g2, w, scales, biases],
-            template=[
-                ("B", B), ("K", K), ("N", N), ("PR", pr),
-                ("RPS", rps), ("NSG", nsg), ("RB", rb), ("PACKW", packw), ("DBUF", dbuf),
-            ],
-            grid=(((B + rb - 1) // rb) * 32, nsg * tiles, 1),
-            threadgroup=(32, nsg, 1),
-            output_shapes=[(B, N)],
+            template=tmpl,
+            grid=grid,
+            threadgroup=tg,
+            output_shapes=out_shp,
             output_dtypes=_OUT_DT_BF,
         )[0]
     return _launch_q([a2], [(w, scales, biases)], gate=g2).reshape(B, N)
